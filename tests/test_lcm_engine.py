@@ -28,6 +28,197 @@ def engine(tmp_path):
     return e
 
 
+class TestEscalationStripReasoning:
+    """Regression tests for thinking-model reasoning-tag stripping in
+    escalation._call_llm_for_summary. Some thinking models (MiniMax-M2.7,
+    GLM-5.1, Qwen QwQ, DeepSeek R1) inline reasoning inside <think>...</think>
+    blocks within message.content; without stripping, the reasoning text gets
+    persisted as the summary node and confuses downstream lcm_expand_query."""
+
+    def _install_fake_auxiliary_client(self, monkeypatch, fake_call_llm):
+        """Install a minimal agent.auxiliary_client module for CI, where the
+        hermes-agent package is only stubbed enough for ContextEngine tests."""
+        import sys
+        import types
+
+        agent_mod = sys.modules.get("agent") or types.ModuleType("agent")
+        aux_mod = types.ModuleType("agent.auxiliary_client")
+        aux_mod.call_llm = fake_call_llm
+        agent_mod.auxiliary_client = aux_mod
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", aux_mod)
+        return aux_mod
+
+    def test_strip_reasoning_blocks_handles_each_supported_tag(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        cases = [
+            ("<think>internal reasoning</think>final summary", "final summary"),
+            ("<thinking>plan</thinking>actual content", "actual content"),
+            ("<reasoning>scratch</reasoning>output", "output"),
+            ("<thought>idea</thought>summary text", "summary text"),
+            ("<REASONING_SCRATCHPAD>foo</REASONING_SCRATCHPAD>bar", "bar"),
+            ("multi\n<think>line\nblock</think>\nrest", "multi\n\nrest"),
+            ("plain text without tags", "plain text without tags"),
+            ("", ""),
+        ]
+        for raw, expected in cases:
+            got = _strip_reasoning_blocks(raw)
+            assert got == expected, f"input={raw!r} expected={expected!r} got={got!r}"
+
+    def test_strip_reasoning_blocks_is_idempotent(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        once = _strip_reasoning_blocks("<think>foo</think>bar")
+        twice = _strip_reasoning_blocks(once)
+        assert once == twice == "bar"
+
+    def test_strip_reasoning_blocks_handles_multiple_blocks(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        raw = "<think>a</think>visible1<think>b</think>visible2"
+        assert _strip_reasoning_blocks(raw) == "visible1visible2"
+
+    def test_strip_reasoning_blocks_preserves_content_with_unrelated_angle_brackets(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        raw = "Decision: x < y, and config <foo> stays"
+        assert _strip_reasoning_blocks(raw) == raw
+
+    def test_call_llm_for_summary_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: when the auxiliary LLM returns reasoning-contaminated
+        content, _call_llm_for_summary returns the stripped summary text."""
+        import hermes_lcm.escalation as esc
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>The user asks me to compress this into bullet points. "
+            "I should focus on decisions, files, errors, current state...</think>"
+            "Summary: docker rollout completed. Auth migration pending review."
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        # Patch the import inside _call_llm_for_summary by providing the
+        # module the function imports from at call time.
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = esc._call_llm_for_summary(
+            prompt="please summarize",
+            max_tokens=200,
+            model="any",
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "Summary: docker rollout completed" in result
+
+
+    def test_synthesize_expansion_answer_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: lcm_expand_query routes through
+        tools._synthesize_expansion_answer, which is a separate LLM call path
+        from _call_llm_for_summary. Both must strip reasoning blocks before
+        returning, otherwise expand_query answers leak the model's internal
+        reasoning back to the caller."""
+        import hermes_lcm.tools as tools_mod
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>The user is asking what was discussed. Let me look at the "
+            "context blocks and synthesize an answer...</think>"
+            "We discussed the docker rollout plan and auth migration."
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = tools_mod._synthesize_expansion_answer(
+            prompt="What was discussed?",
+            context_blocks=[{"role": "user", "content": "ignored in fake"}],
+            model="any",
+            max_tokens=200,
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "We discussed the docker rollout plan" in result
+
+
+    def test_call_extraction_llm_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: pre-compaction extraction routes through
+        extraction._call_extraction_llm, the third LLM call path on top of
+        _call_llm_for_summary (escalation) and _synthesize_expansion_answer
+        (tools). All three must strip reasoning blocks before returning,
+        otherwise the daily extraction .md file ends up with the model's
+        internal reasoning instead of clean bullet points."""
+        import hermes_lcm.extraction as extr
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>Let me extract the relevant information from this "
+            "conversation segment. Decisions made: ... Let me format these "
+            "as clean bullet points.</think>"
+            "- Decision: ship docker rollout on 2026-07-22\n"
+            "- Action: Yvonne files FCC paperwork by 2026-06-30"
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = extr._call_extraction_llm(
+            prompt="extract decisions",
+            model="any",
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "Decision: ship docker rollout" in result
+
+
 class TestEngineABC:
     def test_is_context_engine(self, engine):
         assert isinstance(engine, ContextEngine)
