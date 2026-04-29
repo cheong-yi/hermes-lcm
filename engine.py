@@ -570,42 +570,65 @@ class LCMEngine(ContextEngine):
         kwargs: Dict[str, Any],
     ) -> None:
         previous_session_id = self._session_id
-        prior_state = self._lifecycle.get_by_session(old_session_id)
+        old_state = self._lifecycle.get_by_session(old_session_id)
+        source_session_id = old_session_id
+        source_state = old_state
+
+        if previous_session_id and previous_session_id != old_session_id:
+            bound_state = self._lifecycle.get_by_session(previous_session_id)
+            bound_is_current_conversation = bool(
+                bound_state
+                and bound_state.current_session_id == previous_session_id
+                and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+            )
+            bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+            if bound_is_current_conversation and bound_has_summary_nodes:
+                source_session_id = previous_session_id
+                source_state = bound_state
+                logger.warning(
+                    "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
+                    previous_session_id,
+                    old_session_id,
+                )
+            else:
+                source_session_id = ""
+                source_state = None
+
         conversation_id = (
             kwargs.get("conversation_id")
             or self._conversation_id
-            or (prior_state.conversation_id if prior_state else None)
+            or (source_state.conversation_id if source_state else None)
+            or source_session_id
             or old_session_id
             or session_id
         )
         frontier = max(
             int(self._last_compacted_store_id or 0),
-            int(prior_state.current_frontier_store_id if prior_state else 0),
+            int(source_state.current_frontier_store_id if source_state else 0),
         )
         can_reassign = bool(
-            old_session_id
+            source_session_id
             and session_id
-            and old_session_id != session_id
-            and (not previous_session_id or previous_session_id == old_session_id)
+            and source_session_id != session_id
         )
 
         if can_reassign:
             self._lifecycle.finalize_session(
                 conversation_id,
-                old_session_id,
+                source_session_id,
                 frontier_store_id=frontier,
             )
-            moved_messages = self._store.reassign_session_messages(old_session_id, session_id)
-            moved_nodes = self._dag.reassign_session_nodes(old_session_id, session_id)
+            moved_messages = self._store.reassign_session_messages(source_session_id, session_id)
+            moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
             moved_payloads = reassign_externalized_payloads(
-                old_session_id,
+                source_session_id,
                 session_id,
                 config=self._config,
                 hermes_home=self._hermes_home,
             )
             logger.debug(
                 "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
-                old_session_id,
+                source_session_id,
                 session_id,
                 moved_messages,
                 moved_nodes,
