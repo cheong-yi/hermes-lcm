@@ -709,6 +709,7 @@ class LCMEngine(ContextEngine):
         kwargs: Dict[str, Any],
     ) -> None:
         previous_session_id = self._session_id
+        requested_conversation_id = kwargs.get("conversation_id")
         old_state = self._lifecycle.get_by_session(old_session_id)
         source_session_id = old_session_id
         source_state = old_state
@@ -718,6 +719,10 @@ class LCMEngine(ContextEngine):
             bound_conversation_matches = bool(
                 bound_state
                 and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                and (
+                    not requested_conversation_id
+                    or bound_state.conversation_id == requested_conversation_id
+                )
             )
             bound_is_active_source = bool(
                 bound_state and bound_state.current_session_id == previous_session_id
