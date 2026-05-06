@@ -151,6 +151,10 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return max(1, _parse_int_value(value, default))
 
 
+_LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
+_LCM_GREP_HARD_LIMIT_CAP = 200
+
+
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
     content = content or ""
     content_offset = min(max(0, content_offset), len(content))
@@ -528,7 +532,16 @@ def _synthesize_expansion_answer(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Search raw messages + summaries in the active session with optional source filtering."""
+    """Search raw messages + summaries with optional cross-session scoping.
+
+    Default scope is the current session, preserving historical behavior and returning
+    both raw-message and summary-node hits. Callers may explicitly request
+    ``session_scope='all'`` (every session in the local LCM database) or
+    ``session_scope='session'`` (a single ``session_id``); broader scopes return
+    raw-message hits only and exist for bounded archive recovery over rows already
+    present in ``lcm.db``. ``limit`` is clamped to ``_LCM_GREP_HARD_LIMIT_CAP``
+    regardless of input.
+    """
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
@@ -537,26 +550,72 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if not query:
         return json.dumps({"error": "No query provided"})
 
-    limit = args.get("limit", 10)
+    raw_limit_arg = args.get("limit", 10)
+    parsed_limit = _parse_int_value(raw_limit_arg, 10)
+    if parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
+
     requested_session_scope = str(args.get("session_scope", "current")).lower()
-    session_scope = "current"
+    raw_session_id_arg = args.get("session_id")
+    explicit_session_id = (
+        str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
+    )
     source = str(args.get("source") or "").strip() or None
-    if requested_session_scope != "current":
-        logger.warning("Ignoring unsupported session_scope=%s for lcm_grep", requested_session_scope)
-    session_id = engine._session_id
-    results = []
+
+    if requested_session_scope == "current":
+        if explicit_session_id:
+            return json.dumps({
+                "error": "session_id is only valid with session_scope=session",
+            })
+        # MessageStore.search and SummaryDAG.search treat session_id="" as a
+        # literal scoped filter, so an unbound engine searching scope=current
+        # returns zero results rather than leaking cross-session matches.
+        search_session_id: str | None = engine._session_id
+        session_scope = "current"
+    elif requested_session_scope == "all":
+        if explicit_session_id:
+            return json.dumps({
+                "error": "session_id is not used with session_scope=all",
+            })
+        search_session_id = None
+        session_scope = "all"
+    elif requested_session_scope == "session":
+        if not explicit_session_id:
+            return json.dumps({
+                "error": "session_scope=session requires session_id",
+            })
+        search_session_id = explicit_session_id
+        session_scope = "session"
+    else:
+        # Preserve historical behavior for unknown scopes: route through the
+        # current-session path and report. The data-layer empty-string scoping
+        # contract keeps an unbound engine from leaking cross-session matches
+        # here too.
+        search_session_id = engine._session_id
+        session_scope = "current"
+        logger.warning(
+            "Ignoring unsupported session_scope=%s for lcm_grep",
+            requested_session_scope,
+        )
+
+    current_session_id = engine._session_id
+    has_current_session = bool(current_session_id)
+    results: list[Dict[str, Any]] = []
 
     try:
         msg_hits = engine._store.search(
             query,
-            session_id=session_id,
+            session_id=search_session_id,
             limit=source_limit,
             sort=sort,
             source=source,
         )
         for hit in msg_hits:
+            timestamp_value = hit.get("timestamp", 0) or 0
             results.append(
                 {
                     "type": "message",
@@ -565,8 +624,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "session_id": hit["session_id"],
                     "source": hit.get("source") or "",
                     "role": hit["role"],
+                    "timestamp": timestamp_value,
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
-                    "_sort_ts": hit.get("timestamp", 0),
+                    "from_current_session": has_current_session and hit["session_id"] == current_session_id,
+                    "_sort_ts": timestamp_value,
                     "_sort_rank": hit.get("search_rank"),
                     "_sort_directness": hit.get("_directness_score") or 0.0,
                 }
@@ -574,33 +635,40 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     except Exception as exc:
         logger.warning("Message search failed: %s", exc)
 
-    try:
-        node_hits = engine._dag.search(
-            query,
-            session_id=session_id,
-            limit=source_limit,
-            sort=sort,
-            source=source,
-        )
-        for node in node_hits:
-            results.append(
-                {
-                    "type": "summary",
-                    "depth": f"d{node.depth}",
-                    "node_id": node.node_id,
-                    "session_id": node.session_id,
-                    "snippet": node.summary[:300],
-                    "token_count": node.token_count,
-                    "expand_hint": node.expand_hint,
-                    "earliest_at": node.earliest_at,
-                    "latest_at": node.latest_at,
-                    "_sort_ts": node.latest_at or node.created_at,
-                    "_sort_rank": node.search_rank,
-                    "_sort_directness": node.search_directness or 0.0,
-                }
+    # Summary-node search is intentionally current-session only. Cross-session
+    # DAG expansion is deferred; returning summary hits without an expansion
+    # contract would push this tool toward a memory-system shape rather than
+    # a plugin-local archive search. Raw-message hits remain expandable across
+    # sessions via lcm_expand(store_id=...).
+    if session_scope == "current":
+        try:
+            node_hits = engine._dag.search(
+                query,
+                session_id=search_session_id,
+                limit=source_limit,
+                sort=sort,
+                source=source,
             )
-    except Exception as exc:
-        logger.warning("Node search failed: %s", exc)
+            for node in node_hits:
+                results.append(
+                    {
+                        "type": "summary",
+                        "depth": f"d{node.depth}",
+                        "node_id": node.node_id,
+                        "session_id": node.session_id,
+                        "snippet": node.summary[:300],
+                        "token_count": node.token_count,
+                        "expand_hint": node.expand_hint,
+                        "earliest_at": node.earliest_at,
+                        "latest_at": node.latest_at,
+                        "from_current_session": True,
+                        "_sort_ts": node.latest_at or node.created_at,
+                        "_sort_rank": node.search_rank,
+                        "_sort_directness": node.search_directness or 0.0,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Node search failed: %s", exc)
 
     if sort == "hybrid":
         max_message_directness = max(
@@ -617,17 +685,26 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         result.pop("_sort_rank", None)
         result.pop("_sort_directness", None)
         result.pop("_hybrid_summary_override", None)
-    response = {
+
+    response: Dict[str, Any] = {
         "query": query,
         "sort": sort,
         "session_scope": session_scope,
         "source": source,
+        "limit": limit,
         "total_results": len(results),
         "results": results[:limit],
     }
-    if requested_session_scope != "current":
+    if session_scope == "session":
+        response["session_id"] = explicit_session_id
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
         response["ignored_session_scope"] = requested_session_scope
-        response["scope_note"] = "lcm_grep is current-session only; use session_search for broad cross-session recall."
+        response["scope_note"] = (
+            "Unsupported session_scope; stayed on current. "
+            "Valid values: current, all, session."
+        )
     return json.dumps(response)
 
 
@@ -692,17 +769,51 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
 
 
 def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
-    """Expand a summary node to its source content."""
+    """Expand a summary node, externalized payload, or raw message to its content.
+
+    Mode selection (exactly one is required):
+    - ``externalized_ref``: open a stored externalized payload by ref filename (current session only)
+    - ``store_id``: fetch a single raw message by store_id; works across sessions
+    - ``node_id``: expand a summary node to its source content (current session only)
+
+    Only ``store_id`` mode is cross-session in this version. Cross-session DAG
+    expansion via ``node_id`` is intentionally not supported (it would require
+    descending session-bound source ids).
+    """
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
     externalized_ref = str(args.get("externalized_ref") or "").strip()
+    raw_store_id_arg = args.get("store_id")
+    raw_node_id_arg = args.get("node_id")
+
+    modes_provided: list[str] = []
+    if externalized_ref:
+        modes_provided.append("externalized_ref")
+    if raw_store_id_arg is not None:
+        modes_provided.append("store_id")
+    if raw_node_id_arg is not None:
+        modes_provided.append("node_id")
+
+    if len(modes_provided) > 1:
+        return json.dumps({
+            "error": (
+                "Provide only one of node_id, externalized_ref, store_id "
+                f"(got {', '.join(modes_provided)})"
+            ),
+        })
+    if not modes_provided:
+        return json.dumps({
+            "error": "node_id, externalized_ref, or store_id is required",
+        })
+
     max_tokens = _parse_positive_int(args.get("max_tokens", 4000), 4000)
     source_offset = _parse_non_negative_int(args.get("source_offset", 0), 0)
     source_limit_arg = args.get("source_limit")
     source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
+
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
@@ -727,9 +838,57 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             }
         )
 
-    node_id = args.get("node_id")
-    if node_id is None:
-        return json.dumps({"error": "node_id or externalized_ref is required"})
+    if raw_store_id_arg is not None:
+        try:
+            store_id = int(raw_store_id_arg)
+        except (TypeError, ValueError, OverflowError):
+            return json.dumps({"error": "store_id must be an integer"})
+        stored = engine._store.get(store_id)
+        if stored is None:
+            return json.dumps({"error": f"Message store_id {store_id} not found"})
+        transcript_content = stored.get("content", "") or ""
+        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
+        engine_session_id = engine._session_id
+        stored_session_id = stored.get("session_id", "")
+        result: Dict[str, Any] = {
+            "store_id": store_id,
+            "source_type": "raw_message",
+            "session_id": stored_session_id,
+            "source": stored.get("source") or "",
+            "role": stored.get("role"),
+            "timestamp": stored.get("timestamp", 0),
+            "tool_call_id": stored.get("tool_call_id") or "",
+            "from_current_session": bool(engine_session_id) and stored_session_id == engine_session_id,
+            "content": sliced["content"],
+            "content_chars": sliced["content_chars"],
+            "content_offset": sliced["content_offset"],
+            "content_returned_chars": sliced["content_returned_chars"],
+            "content_truncated": sliced["content_truncated"],
+            "next_content_offset": sliced["next_content_offset"],
+            "has_more": sliced["has_more"],
+        }
+        # Surface externalized-payload metadata when the row references one. Content
+        # is not hydrated by default, mirroring the existing _expand_message_sources
+        # default. Externalized lookup remains session-scoped (per the existing
+        # _get_externalized_payload contract); cross-session rows surface only the
+        # ref string, with a hint pointing at the same-session expansion path.
+        ref = extract_externalized_ref(transcript_content)
+        if ref:
+            result["externalized_ref"] = ref
+            if bool(engine_session_id) and stored_session_id == engine_session_id:
+                payload = _get_externalized_payload(engine, ref)
+                if payload is not None:
+                    payload_summary = dict(payload)
+                    payload_summary.pop("content", None)
+                    result["externalized"] = payload_summary
+            else:
+                result["externalized_note"] = (
+                    "Externalized payload metadata is session-scoped; "
+                    "cross-session ref is surfaced for traceability only and cannot be expanded in this version."
+                )
+        return json.dumps(result)
+
+    node_id = raw_node_id_arg
 
     node = _get_session_node(engine, node_id)
     if node is None:
