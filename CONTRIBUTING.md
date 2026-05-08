@@ -24,12 +24,14 @@ Typical branch names:
 
 ## Issues
 
-Use issues for:
+Use the GitHub issue forms for:
 
 - bugs
 - behavior regressions
 - architectural direction
 - follow-up work that should not be buried in PR comments
+
+Choose the bug/regression form for broken behavior, and the feature/design form for new behavior or architecture proposals.
 
 When filing a bug, include:
 
