@@ -1761,6 +1761,23 @@ class TestEngineABC:
         assert "store_messages" in status
         assert "dag_nodes" in status
 
+    def test_lcm_grep_ingests_live_history_before_search(self, engine):
+        engine.on_session_start("live-search", platform="telegram", context_length=200000)
+        messages = [
+            {"role": "user", "content": "needle phrase from resumed gateway turn"},
+        ]
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "\"needle phrase\"", "limit": 5},
+                messages=messages,
+            )
+        )
+
+        assert result["total_results"] >= 1
+        assert any("needle phrase" in item["snippet"] for item in result["results"])
+
     def test_compress_accepts_focus_topic(self, engine, monkeypatch):
         import importlib
 
