@@ -332,7 +332,10 @@ class LCMEngine(ContextEngine):
         self.base_url = ""
         self.api_key = ""
         self.provider = ""
+        self.api_mode = ""
         self.context_length = 0
+        self._context_length_source = ""
+        self._update_model_pending_session_start = False
         self.threshold_tokens = 0
         self.threshold_percent = self._config.context_threshold
         self.last_prompt_tokens = 0
@@ -369,6 +372,47 @@ class LCMEngine(ContextEngine):
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
         self._auxiliary_session_lock = threading.RLock()
+
+    def _set_context_length(self, context_length: Any, *, source: str) -> bool:
+        try:
+            parsed_context_length = int(context_length)
+        except (TypeError, ValueError):
+            logger.debug("LCM ignored invalid %s context_length: %r", source, context_length)
+            return False
+        if parsed_context_length <= 0:
+            logger.debug(
+                "LCM cleared non-positive %s context_length: %r",
+                source,
+                context_length,
+            )
+            self.context_length = 0
+            self._context_length_source = source
+            self.threshold_tokens = 0
+            return True
+        self.context_length = parsed_context_length
+        self._context_length_source = source
+        self.threshold_tokens = int(
+            parsed_context_length * self._config.context_threshold
+        )
+        return True
+
+    def _session_metadata_matches_active_runtime(
+        self,
+        kwargs: Dict[str, Any],
+        *,
+        ignore_empty_optional: bool = False,
+    ) -> bool:
+        if "model" in kwargs and str(kwargs.get("model") or "") != self.model:
+            return False
+        for key in ("provider", "base_url", "api_key", "api_mode"):
+            if key not in kwargs:
+                continue
+            incoming = str(kwargs.get(key) or "")
+            if ignore_empty_optional and not incoming:
+                continue
+            if incoming != str(getattr(self, key, "") or ""):
+                return False
+        return True
 
     @property
     def name(self) -> str:
@@ -1403,12 +1447,94 @@ class LCMEngine(ContextEngine):
             self._foreground_session_platform = self._session_platform
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
-        # Pick up context_length from kwargs if provided
+
+        update_model_is_authoritative = (
+            self._context_length_source == "update_model"
+            and self._update_model_pending_session_start
+        )
+
+        # Pick up context_length from kwargs if provided, but do not let stale
+        # session metadata undo the authoritative runtime update_model() call.
+        # Hermes Agent calls update_model() with the resolver output before it
+        # binds a fresh agent/session.  Older or buggy host paths can still pass
+        # a context_length copied from the previously bound runtime; treating
+        # that as authoritative makes /model switches keep compressing against
+        # the old model window.
         if "context_length" in kwargs:
-            self.context_length = kwargs["context_length"]
-            self.threshold_tokens = int(
-                self.context_length * self._config.context_threshold
+            incoming_context_length = kwargs["context_length"]
+            try:
+                parsed_context_length = int(incoming_context_length)
+            except (TypeError, ValueError):
+                logger.debug(
+                    "LCM ignored invalid session-start context_length: %r",
+                    incoming_context_length,
+                )
+                self._update_model_pending_session_start = False
+                return
+            if parsed_context_length <= 0:
+                if update_model_is_authoritative:
+                    if self._session_metadata_matches_active_runtime(
+                        kwargs,
+                        ignore_empty_optional=True,
+                    ):
+                        logger.debug(
+                            "LCM ignored missing session-start context_length=%r for model=%s; active update_model context_length=%s",
+                            incoming_context_length,
+                            self.model or str(kwargs.get("model") or ""),
+                            self.context_length,
+                        )
+                    else:
+                        logger.warning(
+                            "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                            str(kwargs.get("model") or ""),
+                            self.model,
+                        )
+                    self._update_model_pending_session_start = False
+                    return
+                self._set_context_length(parsed_context_length, source="session_start")
+                update_model_is_authoritative = False
+            else:
+                if (
+                    update_model_is_authoritative
+                    and parsed_context_length != self.context_length
+                ):
+                    logger.warning(
+                        "LCM ignored stale session-start context_length=%s for model=%s; active update_model context_length=%s",
+                        parsed_context_length,
+                        self.model or str(kwargs.get("model") or ""),
+                        self.context_length,
+                    )
+                    self._update_model_pending_session_start = False
+                    return
+                if update_model_is_authoritative:
+                    if not self._session_metadata_matches_active_runtime(kwargs):
+                        logger.warning(
+                            "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                            str(kwargs.get("model") or ""),
+                            self.model,
+                        )
+                        self._update_model_pending_session_start = False
+                        return
+                else:
+                    self._set_context_length(parsed_context_length, source="session_start")
+                    update_model_is_authoritative = False
+        if (
+            update_model_is_authoritative
+            and not self._session_metadata_matches_active_runtime(kwargs)
+        ):
+            logger.warning(
+                "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                str(kwargs.get("model") or ""),
+                self.model,
             )
+            self._update_model_pending_session_start = False
+            return
+        if "model" in kwargs:
+            self.model = str(kwargs.get("model") or "")
+        for key in ("base_url", "api_key", "provider", "api_mode"):
+            if key in kwargs:
+                setattr(self, key, str(kwargs.get(key) or ""))
+        self._update_model_pending_session_start = False
 
     def _continue_compression_boundary(
         self,
@@ -1937,8 +2063,13 @@ class LCMEngine(ContextEngine):
                 parent_session_id,
             )
             return
-        self.context_length = context_length
-        self.threshold_tokens = int(context_length * self._config.context_threshold)
+        self.model = str(model or "")
+        self.base_url = str(base_url or "")
+        self.api_key = str(api_key or "")
+        self.provider = str(provider or "")
+        self.api_mode = str(api_mode or "")
+        self._set_context_length(context_length, source="update_model")
+        self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
         self._session_match_keys = build_session_match_keys(

@@ -116,6 +116,374 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
 
+def test_update_model_updates_runtime_metadata_and_context_window(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        base_url="https://opencode.ai/zen/go",
+        api_key="test-key",
+        provider="opencode-go",
+        api_mode="anthropic_messages",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.base_url == "https://opencode.ai/zen/go"
+    assert engine.api_key == "test-key"
+    assert engine.provider == "opencode-go"
+    assert engine.api_mode == "anthropic_messages"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_overwrite_update_model_context_length_with_stale_metadata(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        provider="opencode-go",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="deepseek-v4-flash",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_overwrite_update_model_with_stale_runtime_identity(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        provider="opencode-go",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="minimax-m2.7",
+        provider="minimax",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.provider == "opencode-go"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_overwrite_update_model_identity_when_context_length_matches(engine):
+    engine.update_model(
+        model="new-model-same-window",
+        context_length=204_800,
+        base_url="https://new.example/v1",
+        api_key="new-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="old-model-same-window",
+        base_url="https://old.example/v1",
+        api_key="old-key",
+        provider="old-provider",
+        api_mode="anthropic_messages",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "new-model-same-window"
+    assert engine.base_url == "https://new.example/v1"
+    assert engine.api_key == "new-key"
+    assert engine.provider == "new-provider"
+    assert engine.api_mode == "chat_completions"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_clear_or_repopulate_update_model_identity_when_optional_fields_are_empty(engine):
+    engine.update_model(
+        model="new-model-same-window",
+        context_length=204_800,
+        base_url="https://new.example/v1",
+        api_key="new-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="new-model-same-window",
+        base_url="",
+        api_key="",
+        provider="new-provider",
+        api_mode="chat_completions",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.base_url == "https://new.example/v1"
+    assert engine.api_key == "new-key"
+
+    engine.update_model(
+        model="empty-endpoint-model",
+        context_length=204_800,
+        base_url="",
+        api_key="",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-3",
+        platform="telegram",
+        model="empty-endpoint-model",
+        base_url="https://old.example/v1",
+        api_key="old-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.base_url == ""
+    assert engine.api_key == ""
+
+
+def test_session_start_can_initialize_context_length_without_update_model(engine):
+    engine.model = ""
+    engine.context_length = 0
+    engine.threshold_tokens = 0
+    engine._context_length_source = ""
+
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="minimax-m2.7",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "minimax-m2.7"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+
+
+def test_session_start_clears_previous_session_context_window_when_new_window_is_missing(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="known-window-model",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens > 0
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="unknown-window-model",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "session_start"
+    assert not engine.should_compress(1_000_000)
+    assert not engine._critical_budget_pressure_reached(observed_tokens=1_000_000)
+
+
+def test_missing_session_start_context_length_does_not_clear_authoritative_update_model_window(engine):
+    engine.update_model(
+        model="resolver-window-model",
+        context_length=1_000_000,
+        provider="resolver-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="resolver-window-model",
+        provider="resolver-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "resolver-window-model"
+    assert engine.provider == "resolver-provider"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+    assert engine._context_length_source == "update_model"
+
+
+def test_missing_session_start_context_length_preserves_update_model_window_with_blank_optional_fields(engine):
+    engine.update_model(
+        model="resolver-window-model",
+        context_length=1_000_000,
+        base_url="https://resolver.example/v1",
+        api_key="resolver-key",
+        provider="resolver-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="resolver-window-model",
+        base_url="",
+        api_key="",
+        provider="resolver-provider",
+        api_mode="chat_completions",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "resolver-window-model"
+    assert engine.base_url == "https://resolver.example/v1"
+    assert engine.api_key == "resolver-key"
+    assert engine.provider == "resolver-provider"
+    assert engine.api_mode == "chat_completions"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+    assert engine._context_length_source == "update_model"
+
+
+def test_missing_session_start_context_length_clears_stale_update_model_window_for_new_runtime(engine):
+    engine.update_model(
+        model="previous-resolver-model",
+        context_length=1_000_000,
+        provider="previous-provider",
+    )
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-resolver-model",
+        provider="previous-provider",
+        context_length=1_000_000,
+        conversation_id="telegram:chat-1",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="session-only-model",
+        provider="session-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "session-only-model"
+    assert engine.provider == "session-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "session_start"
+
+
+def test_update_model_zero_window_ignores_stale_positive_session_metadata(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+    engine.update_model(
+        model="unknown-window-model",
+        context_length=0,
+        provider="unknown-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.provider == "unknown-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "update_model"
+
+
+def test_update_model_zero_window_ignores_stale_zero_session_metadata(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+    engine.update_model(
+        model="unknown-window-model",
+        context_length=0,
+        provider="unknown-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.provider == "unknown-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "update_model"
+
+
+def test_positive_session_start_context_length_replaces_consumed_update_model_window_for_new_runtime(engine):
+    engine.update_model(
+        model="previous-resolver-model",
+        context_length=1_000_000,
+        provider="previous-provider",
+    )
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-resolver-model",
+        provider="previous-provider",
+        context_length=1_000_000,
+        conversation_id="telegram:chat-1",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="session-only-model",
+        provider="session-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "session-only-model"
+    assert engine.provider == "session-provider"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+    assert engine._context_length_source == "session_start"
+
+
 def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
     from hermes_lcm import message_patterns as message_patterns_mod
 
