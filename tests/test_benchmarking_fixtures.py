@@ -5,6 +5,8 @@ import json
 import pytest
 
 from benchmarking.fixtures import load_fixture, make_synthetic_fixture
+from benchmarking.policies import load_policy
+from benchmarking.replay import run_replay
 
 
 def test_load_fixture_parses_canaries(tmp_path):
@@ -65,3 +67,16 @@ def test_committed_long_history_fixture_loads():
     assert fixture.name == "long_history_canaries"
     assert fixture.canaries
     assert fixture.messages[0]["role"] == "system"
+
+
+def test_committed_chatter_fixture_with_pressure_policy_compacts(tmp_path):
+    fixture = load_fixture("benchmarks/fixtures/repeated_compaction_chatter.json")
+    policy = load_policy("benchmarks/policies/pressure_smoke.yaml")
+
+    metrics = run_replay(fixture, policy, output_dir=tmp_path)
+
+    assert fixture.tags == ["compaction_chatter", "synthetic"]
+    assert policy.name == "pressure_smoke"
+    assert metrics.compaction_attempts == 1
+    assert metrics.compression_count >= 1
+    assert metrics.repeated_compaction_risk is True

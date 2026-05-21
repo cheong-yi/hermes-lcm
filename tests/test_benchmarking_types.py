@@ -57,13 +57,16 @@ def test_metrics_round_trips_with_failure_list():
     assert restored == metrics
 
 
-def test_builtin_policies_include_baseline_and_codex_candidate():
+def test_builtin_policies_include_baseline_codex_candidate_and_pressure_smoke():
     policies = {policy.name: policy for policy in builtin_policies()}
 
     assert policies["baseline_272k"].context_length == 272_000
     assert policies["baseline_272k"].fresh_tail_count == 64
     assert policies["codex_gpt_long_context_candidate"].leaf_chunk_tokens == 8_000
     assert policies["codex_gpt_long_context_candidate"].target_after_compaction == 0.55
+    assert policies["codex_gpt_long_context_candidate"].policy_version == "1"
+    assert policies["pressure_smoke"].context_length < 1_000
+    assert policies["pressure_smoke"].policy_version == "1"
 
 
 def test_load_policy_accepts_json_and_minimal_yaml(tmp_path):

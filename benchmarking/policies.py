@@ -42,7 +42,18 @@ def builtin_policies() -> list[LCMPolicy]:
             fresh_tail_count=24,
             leaf_chunk_tokens=8_000,
             target_after_compaction=0.55,
+            policy_version="1",
             notes="Initial deterministic GPT/Codex long-context candidate.",
+        ),
+        LCMPolicy(
+            name="pressure_smoke",
+            context_length=300,
+            context_threshold=0.30,
+            fresh_tail_count=2,
+            leaf_chunk_tokens=24,
+            target_after_compaction=0.55,
+            policy_version="1",
+            notes="Small deterministic pressure policy for benchmark chatter/headroom validation only.",
         ),
     ]
 

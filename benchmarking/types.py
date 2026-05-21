@@ -26,6 +26,7 @@ class LCMPolicy:
     dynamic_leaf_chunk_enabled: bool = False
     target_after_compaction: float | None = None
     min_turns_between_compactions: int = 0
+    policy_version: str = "1"
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,6 +49,7 @@ class LCMPolicy:
                 else float(data["target_after_compaction"])
             ),
             min_turns_between_compactions=int(data.get("min_turns_between_compactions", 0)),
+            policy_version=str(data.get("policy_version", "1")),
             notes=str(data.get("notes", "")),
         )
 
@@ -110,6 +112,16 @@ class ReplayMetrics:
     retrieval_canaries_found: int
     total_canaries: int
     failures: list[str] = field(default_factory=list)
+    policy_version: str = "1"
+    fixture_tags: list[str] = field(default_factory=list)
+    post_compaction_headroom_ratio: float = 0.0
+    fresh_tail_message_count: int = 0
+    fresh_tail_tokens: int = 0
+    fresh_tail_pressure_ratio: float = 0.0
+    estimated_next_turn_tokens: int = 0
+    repeated_compaction_risk: bool = False
+    active_canary_recall: float = 0.0
+    retrieval_canary_recall: float = 0.0
     database_path: str = ""
     hermes_home: str = ""
     active_message_count: int = 0
@@ -135,6 +147,16 @@ class ReplayMetrics:
             retrieval_canaries_found=int(data["retrieval_canaries_found"]),
             total_canaries=int(data["total_canaries"]),
             failures=[str(item) for item in data.get("failures", [])],
+            policy_version=str(data.get("policy_version", "1")),
+            fixture_tags=[str(item) for item in data.get("fixture_tags", [])],
+            post_compaction_headroom_ratio=float(data.get("post_compaction_headroom_ratio", 0.0)),
+            fresh_tail_message_count=int(data.get("fresh_tail_message_count", 0)),
+            fresh_tail_tokens=int(data.get("fresh_tail_tokens", 0)),
+            fresh_tail_pressure_ratio=float(data.get("fresh_tail_pressure_ratio", 0.0)),
+            estimated_next_turn_tokens=int(data.get("estimated_next_turn_tokens", 0)),
+            repeated_compaction_risk=_as_bool(data.get("repeated_compaction_risk", False)),
+            active_canary_recall=float(data.get("active_canary_recall", 0.0)),
+            retrieval_canary_recall=float(data.get("retrieval_canary_recall", 0.0)),
             database_path=str(data.get("database_path", "")),
             hermes_home=str(data.get("hermes_home", "")),
             active_message_count=int(data.get("active_message_count", 0)),

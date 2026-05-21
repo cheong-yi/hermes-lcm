@@ -112,3 +112,25 @@ def test_replay_retrieval_expands_raw_hits(tmp_path):
     assert metrics.retrieval_canaries_found == 1
     assert raw_metrics["retrieval_canaries_found"] == 1
     assert raw_metrics["database_path"] == metrics.database_path
+
+
+def test_replay_reports_headroom_fresh_tail_and_chatter_risk_metrics(tmp_path):
+    fixture = make_synthetic_fixture(
+        name="pressure_metrics",
+        message_pairs=8,
+        canary_count=2,
+        filler_words=80,
+    )
+
+    metrics = run_replay(fixture, _small_policy(), output_dir=tmp_path)
+    raw_metrics = json.loads((tmp_path / "pressure_metrics" / "metrics.json").read_text())
+
+    assert metrics.fresh_tail_message_count == 1
+    assert metrics.fresh_tail_tokens > 0
+    assert metrics.fresh_tail_pressure_ratio > 0
+    assert metrics.estimated_next_turn_tokens > 0
+    assert metrics.post_compaction_headroom_ratio == metrics.post_compaction_headroom_tokens / metrics.threshold_tokens
+    assert metrics.active_canary_recall == metrics.active_canaries_found / metrics.total_canaries
+    assert metrics.retrieval_canary_recall == 1.0
+    assert metrics.repeated_compaction_risk is True
+    assert raw_metrics["repeated_compaction_risk"] is True

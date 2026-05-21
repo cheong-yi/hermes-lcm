@@ -8,4 +8,5 @@ incremental_max_depth: 1
 dynamic_leaf_chunk_enabled: false
 target_after_compaction: null
 min_turns_between_compactions: 0
+policy_version: "1"
 notes: "Current long-context baseline: 64-message fresh tail, 20k leaf chunks."
