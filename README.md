@@ -189,8 +189,9 @@ environment variables:
 
 | Variable | Default | Use |
 |----------|---------|-----|
-| `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of the context window that triggers LCM compaction |
-| `LCM_FRESH_TAIL_COUNT` | `64` | Recent messages protected from compaction |
+| `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
+| `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
+| `LCM_INCREMENTAL_MAX_DEPTH` | `3` | Max DAG condensation depth (`-1` = unlimited, `0` = leaf only); enables hierarchical summarization |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
@@ -384,9 +385,10 @@ Common questions:
 
 **Should I leave the default threshold on a 1M-token model?**
 
-Not always. The default `0.75` means compaction may wait until roughly `750000`
-prompt tokens on a true 1M effective window. That can be intentional if you want
-maximum live context, but it is expensive and delays DAG construction.
+Not always. The default `0.35` means compaction starts around `350000` prompt
+tokens on a true 1M effective window. That leaves far more headroom for new
+content but compacts more aggressively, which can shorten recall of older
+details.
 
 **Should I change leaf chunk settings first?**
 
