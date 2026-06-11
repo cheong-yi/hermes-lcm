@@ -897,6 +897,7 @@ class LCMEngine(ContextEngine):
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
+        dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         critical_budget_pressure = self._critical_budget_pressure_reached(
             observed_tokens=observed_prompt_tokens,
@@ -934,6 +935,22 @@ class LCMEngine(ContextEngine):
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 break
+
+            candidate_start = leading_anchor_count
+            while (
+                candidate_start < fresh_tail_start
+                and self._is_replayed_context_scaffold_message(working_messages[candidate_start])
+            ):
+                candidate_start += 1
+            if candidate_start > leading_anchor_count:
+                dropped_replayed_scaffold_messages = True
+                working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
+                pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
+                n = len(working_messages)
+                fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+                if fresh_tail_start <= leading_anchor_count:
+                    noop_reason = "selected leaf chunk lacks raw store lineage"
+                    break
 
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
             if not candidate_raw:
@@ -1044,20 +1061,38 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
-            sanitized_messages = self._sanitize_active_context_messages(
-                working_messages,
-                insert_missing_tool_stubs=False,
-            )
+            if dropped_replayed_scaffold_messages:
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+                try:
+                    sanitized_messages = self._assemble_context(
+                        working_messages[0] if leading_anchor_count else None,
+                        working_messages[leading_anchor_count:],
+                        assembly_cap_override=recovery_assembly_cap,
+                    )
+                finally:
+                    self._pending_context_anchor_messages = None
+            else:
+                sanitized_messages = self._sanitize_active_context_messages(
+                    working_messages,
+                    insert_missing_tool_stubs=False,
+                )
             if sanitized_messages != working_messages:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
-                # context, keeping the old cursor could make the next appended
-                # messages look already ingested. This applies to content-only
-                # cleanup as well as dropped-message cleanup.
+                # or reassembled context, keeping the old cursor could make the
+                # next appended messages look already ingested. This applies to
+                # content-only cleanup as well as dropped-message cleanup.
                 self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "sanitized"
                 self._last_compression_noop_reason = ""
             else:
+                if dropped_replayed_scaffold_messages:
+                    # The active context changed even though no new leaf node was
+                    # written. Keep the cursor aligned with the returned context
+                    # so the next appended turn is ingested instead of skipped.
+                    self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
