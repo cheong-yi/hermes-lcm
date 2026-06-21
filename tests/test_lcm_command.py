@@ -13,6 +13,7 @@ import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
+from hermes_lcm.diagnostics import doctor_guidance_for_check
 from hermes_lcm.engine import LCMEngine
 
 
@@ -446,6 +447,7 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "plugin_version: 0.18.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
+    assert "triage_guidance:\n- none" in result
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
@@ -622,6 +624,139 @@ def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path
     assert "cleanup_candidates" in result
     assert "/lcm doctor clean" in result
     assert "/lcm backup" in result
+    assert "triage_guidance:" in result
+    assert "cleanup_candidates: backup-first cleanup" in result
+
+
+def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._dag.add_node(
+        SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary="tiny",
+            token_count=1,
+            source_token_count=500,
+            source_ids=[],
+            source_type="messages",
+            created_at=0,
+        )
+    )
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert guidance["payload_storage"]["action"] == "safe/ignore"
+    assert guidance["summary_quality"]["action"] == "inspect"
+    assert guidance["summary_quality"]["warning_only"] is True
+
+
+def test_lcm_doctor_payload_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "payload_storage",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+def test_lcm_doctor_lifecycle_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "lifecycle_fragmentation",
+        "status": "fail",
+        "detail": {"error": "lifecycle read error"},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+@pytest.mark.parametrize("check_name", ["orphaned_dag_nodes", "summary_quality"])
+def test_lcm_doctor_dag_failure_guidance_requires_inspection(check_name):
+    guidance = doctor_guidance_for_check({
+        "check": check_name,
+        "status": "fail",
+        "detail": "dag read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+def test_lcm_doctor_source_lineage_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert "safe to ignore" not in guidance["operator_action"]
+    assert "source-lineage" in guidance["operator_action"]
+    assert guidance["warning_only"] is False
+
+
+def test_lcm_doctor_source_lineage_warning_preserves_legacy_blank_source_guidance():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "warn",
+        "detail": {"legacy_blank_source_messages": 2},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "safe/ignore"
+    assert "legacy blank-source" in guidance["operator_action"]
+
+
+def test_lcm_doctor_tool_source_lineage_read_error_guidance_requires_inspection(engine, monkeypatch):
+    def fail_source_stats():
+        raise RuntimeError("sqlite read error")
+
+    monkeypatch.setattr(engine._store, "get_source_stats", fail_source_stats)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert doctor["overall"] == "unhealthy"
+    assert guidance["source_lineage_hygiene"]["action"] == "inspect"
+    assert "safe to ignore" not in guidance["source_lineage_hygiene"]["operator_action"]
+    assert "source-lineage" in guidance["source_lineage_hygiene"]["operator_action"]
+
+
+def test_lcm_doctor_command_lifecycle_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_lifecycle_stats(*_args, **_kwargs):
+        raise RuntimeError("lifecycle read error")
+
+    monkeypatch.setattr(engine._lifecycle, "get_fragmentation_stats", fail_lifecycle_stats)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "lifecycle_fragmentation: inspect —" in result
+    assert "lifecycle_fragmentation: inspect warning-only" not in result
+
+
+def test_lcm_doctor_command_payload_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_payload_scan(*_args, **_kwargs):
+        raise RuntimeError("payload read error")
+
+    monkeypatch.setattr(command_mod, "scan_sqlite_payload_risks", fail_payload_scan)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "payload_storage_error: payload read error" in result
+    assert "payload_storage: inspect —" in result
+    assert "payload_storage: inspect warning-only" not in result
 
 
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):

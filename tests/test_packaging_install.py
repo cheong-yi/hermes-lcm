@@ -1,5 +1,8 @@
 from pathlib import Path
 import importlib.util
+import logging
+import os
+import shutil
 import subprocess
 import sys
 
@@ -53,11 +56,115 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
 
     install_script = repo_root / "scripts" / "install.sh"
     update_script = repo_root / "scripts" / "update.sh"
+    validate_script = repo_root / "scripts" / "validate_release.sh"
 
     assert install_script.exists(), "scripts/install.sh should exist"
     assert update_script.exists(), "scripts/update.sh should exist"
+    assert validate_script.exists(), "scripts/validate_release.sh should exist"
     assert install_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
     assert update_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+    assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+
+
+def test_validate_release_routes_cache_artifacts_outside_checkout():
+    repo_root = Path(__file__).resolve().parent.parent
+    validate_script = (repo_root / "scripts" / "validate_release.sh").read_text(encoding="utf-8")
+
+    assert "PYTHONPYCACHEPREFIX=\"$OUTPUT_DIR/pycache\"" in validate_script
+    assert "PYTEST_ADDOPTS=\"-p no:cacheprovider" in validate_script
+    assert "dirty_start=\"$(git status --short" in validate_script
+    assert "dirty_end=\"$(git status --short" in validate_script
+    assert "validation changed git status" in validate_script
+    assert "run_pytest()" in validate_script
+    assert "ensure_agent_context_engine_importable()" in validate_script
+    assert "run_gate \"focused pytest\" run_pytest" in validate_script
+    assert "run_gate \"pytest full\" run_pytest" in validate_script
+    assert "run_low_fd_pytest" in validate_script
+    assert "ulimit -n 1024 &&" not in validate_script
+
+
+def test_validate_release_checks_committed_pr_diff_against_origin_main(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    source_script = repo_root / "scripts" / "validate_release.sh"
+    true_bin = shutil.which("true")
+    assert true_bin is not None
+
+    repo = tmp_path / "repo"
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(source_script, scripts_dir / "validate_release.sh")
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes-test@example.invalid")
+    (repo / "README.md").write_text("clean\n", encoding="utf-8")
+    git("add", "README.md", "scripts/validate_release.sh")
+    git("commit", "-m", "base")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-b", "feature")
+    (repo / "bad.txt").write_text("committed trailing whitespace  \n", encoding="utf-8")
+    git("add", "bad.txt")
+    git("commit", "-m", "add bad whitespace")
+
+    output_dir = tmp_path / "validation-output"
+    result = subprocess.run(
+        ["bash", "scripts/validate_release.sh", "--output", str(output_dir)],
+        cwd=repo,
+        env={**os.environ, "PYTHON": true_bin},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED: git diff check (origin/main...HEAD)" in result.stderr
+    checklist = output_dir / "validation-checklist.md"
+    assert checklist.exists()
+    assert "diff_check_range: origin/main...HEAD" in checklist.read_text(encoding="utf-8")
+
+
+def test_validate_release_checks_last_commit_when_origin_main_missing(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    source_script = repo_root / "scripts" / "validate_release.sh"
+    true_bin = shutil.which("true")
+    assert true_bin is not None
+
+    repo = tmp_path / "repo"
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(source_script, scripts_dir / "validate_release.sh")
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes-test@example.invalid")
+    (repo / "README.md").write_text("clean\n", encoding="utf-8")
+    git("add", "README.md", "scripts/validate_release.sh")
+    git("commit", "-m", "base")
+    (repo / "bad.txt").write_text("committed trailing whitespace  \n", encoding="utf-8")
+    git("add", "bad.txt")
+    git("commit", "-m", "add bad whitespace")
+
+    output_dir = tmp_path / "validation-output"
+    result = subprocess.run(
+        ["bash", "scripts/validate_release.sh", "--output", str(output_dir)],
+        cwd=repo,
+        env={**os.environ, "PYTHON": true_bin},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED: git diff check (HEAD^...HEAD)" in result.stderr
+    checklist = output_dir / "validation-checklist.md"
+    assert checklist.exists()
+    assert "diff_check_range: HEAD^...HEAD" in checklist.read_text(encoding="utf-8")
 
 
 def test_plugin_manifest_lists_all_registered_tools():
@@ -221,6 +328,34 @@ def test_plugin_entrypoint_skips_registered_lcm_tools_without_message_forwarding
     assert ctx.engine is not None
     assert registered == {}
     assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+
+
+def test_capability_false_host_log_describes_expected_path_b_fallback(caplog):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_expected_path_b_fallback")
+    registered = []
+
+    class _HermesAgentV016LikeCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered.append(name)
+
+    ctx = _HermesAgentV016LikeCtx()
+    caplog.set_level(logging.INFO)
+
+    module.register(ctx)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert ctx.engine is not None
+    assert registered == []
+    assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+    assert "LCM tools are available through context-engine schemas" in messages
+    assert "expected Path B fallback" in messages
+    assert "tool registration skipped because" not in messages
 
 
 def test_register_gracefully_degrades_when_host_lacks_register_tool():

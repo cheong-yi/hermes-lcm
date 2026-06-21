@@ -13,7 +13,11 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     repair_external_content_fts,
 )
-from .diagnostics import _has_lifecycle_fragmentation, _state_db_path_for_engine
+from .diagnostics import (
+    _has_lifecycle_fragmentation,
+    _state_db_path_for_engine,
+    doctor_guidance_for_checks,
+)
 from .ingest_protection import (
     externalized_payload_stats,
     scan_externalized_payload_integrity,
@@ -948,6 +952,7 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
+    payload_storage_error = ""
     try:
         payload_risks = scan_sqlite_payload_risks(store_conn)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
@@ -956,7 +961,8 @@ def _doctor_text(engine) -> str:
             engine._config,
             hermes_home=engine._hermes_home,
         )
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        payload_storage_error = str(exc)
         payload_risks = {
             "largest_content_rows": [],
             "largest_tool_calls_rows": [],
@@ -1049,6 +1055,9 @@ def _doctor_text(engine) -> str:
         recommended_actions.append(
             "inspect missing externalized payload refs and restore from backups if needed"
         )
+    if payload_storage_error:
+        observations.append(f"payload_storage_error: {payload_storage_error}")
+        recommended_actions.append("inspect payload storage diagnostics before cleanup or deletion")
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -1144,6 +1153,41 @@ def _doctor_text(engine) -> str:
             "remove unknown LCM_SENSITIVE_PATTERNS entries or replace them with supported names"
         )
 
+    triage_checks: list[dict[str, Any]] = []
+    if integrity != "ok":
+        triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
+    if schema_health.get("error") or schema_missing_tables:
+        triage_checks.append({"check": "schema_core_tables", "status": "fail", "detail": schema_health})
+    if store_fts != "ok":
+        triage_checks.append({"check": "messages_fts_integrity", "status": "fail", "detail": store_fts})
+    if node_fts != "ok":
+        triage_checks.append({"check": "nodes_fts_integrity", "status": "fail", "detail": node_fts})
+    if clean_scan["candidates"]:
+        triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
+    if payload_storage_error or missing_externalized_refs or any(payload_risks.get(key) for key in (
+        "suspicious_data_uri_content_rows",
+        "suspicious_data_uri_tool_calls_rows",
+        "suspicious_base64_like_rows",
+        "suspicious_repetitive_assistant_rows",
+        "heartbeat_noise_rows",
+    )):
+        detail = {**payload_risks, **externalized_integrity}
+        if payload_storage_error:
+            detail["error"] = payload_storage_error
+        triage_checks.append({
+            "check": "payload_storage",
+            "status": "fail" if payload_storage_error else "warn",
+            "detail": detail,
+        })
+    if (protection["enabled"] and not protection["active_patterns"]) or protection["unknown_patterns"]:
+        triage_checks.append({"check": "sensitive_pattern_handling", "status": "warn", "detail": protection})
+    if source_stats.get("error"):
+        triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
+    if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
+        lifecycle_status = "fail" if lifecycle_stats.get("error") else "warn"
+        triage_checks.append({"check": "lifecycle_fragmentation", "status": lifecycle_status, "detail": lifecycle_stats})
+    triage_guidance = doctor_guidance_for_checks(triage_checks)
+
     doctor_status = "issues-found" if integrity != "ok" or issues else (
         "action-recommended" if recommended_actions else "ok"
     )
@@ -1210,6 +1254,17 @@ def _doctor_text(engine) -> str:
     if recommended_actions:
         for item in recommended_actions:
             lines.append(f"- {item}")
+    else:
+        lines.append("- none")
+    lines.append("triage_guidance:")
+    if triage_guidance:
+        for item in triage_guidance:
+            warning_suffix = " warning-only" if item.get("warning_only") else ""
+            lines.append(
+                "- "
+                f"{item['check']}: {item['action']}{warning_suffix} — "
+                f"{item['operator_action']}"
+            )
     else:
         lines.append("- none")
     return "\n".join(lines)
