@@ -759,6 +759,28 @@ def test_lcm_doctor_command_payload_read_error_guidance_is_failure(engine, monke
     assert "payload_storage: inspect warning-only" not in result
 
 
+def test_lcm_doctor_command_payload_warning_drives_action_recommended(engine, monkeypatch):
+    def payload_warning(*_args, **_kwargs):
+        return {
+            "largest_content_rows": [],
+            "largest_tool_calls_rows": [],
+            "suspicious_data_uri_content_rows": [],
+            "suspicious_data_uri_tool_calls_rows": [],
+            "suspicious_base64_like_rows": [{"store_id": 1, "chars": 24000}],
+            "quarantined_assistant_rows": [],
+            "suspicious_repetitive_assistant_rows": [],
+            "heartbeat_noise_rows": [],
+        }
+
+    monkeypatch.setattr(command_mod, "scan_sqlite_payload_risks", payload_warning)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: action-recommended" in result
+    assert "payload_storage: 1 suspicious inline/base64 payload row(s) need review" in result
+    assert "payload_storage: inspect warning-only" in result
+
+
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):
     engine._store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
     engine._store.append("sess-unknown", {"role": "user", "content": "unknown message"})

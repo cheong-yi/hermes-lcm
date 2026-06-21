@@ -1011,6 +1011,15 @@ def _doctor_text(engine) -> str:
     observations: list[str] = []
     recommended_actions: list[str] = []
     missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
+    suspicious_payload_rows = sum(
+        len(payload_risks.get(key) or [])
+        for key in (
+            "suspicious_data_uri_content_rows",
+            "suspicious_data_uri_tool_calls_rows",
+            "suspicious_base64_like_rows",
+            "suspicious_repetitive_assistant_rows",
+        )
+    )
 
     if schema_health.get("error"):
         observations.append(f"schema_core_tables: error: {schema_health['error']}")
@@ -1054,6 +1063,13 @@ def _doctor_text(engine) -> str:
         )
         recommended_actions.append(
             "inspect missing externalized payload refs and restore from backups if needed"
+        )
+    if suspicious_payload_rows:
+        observations.append(
+            f"payload_storage: {suspicious_payload_rows} suspicious inline/base64 payload row(s) need review"
+        )
+        recommended_actions.append(
+            "inspect suspicious payload rows before cleanup; restore payload files from backup before deleting or rewriting anything"
         )
     if payload_storage_error:
         observations.append(f"payload_storage_error: {payload_storage_error}")
