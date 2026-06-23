@@ -114,6 +114,16 @@ For a live session check, send one normal Hermes message after restart, then run
 
 If startup logs say LCM tools are available through `context-engine schemas` or mention the `Path B fallback`, that is expected on older Hermes hosts such as Hermes Agent v0.16. The seven `lcm_*` tools remain available through the context-engine path; standalone plugin-registry registration is not required there.
 
+## Runtime context sizing
+
+LCM follows Hermes Agent's provider-aware context behavior for Codex gpt-5.5. When the active route is `provider=openai-codex` with `model=gpt-5.5`, `gpt-5.5-*`, or `gpt-5.5.*`, and Hermes reports a larger raw window, LCM uses a 272000 token effective context window for compaction math.
+
+For that route, LCM also mirrors Hermes Agent's 0.85 auto-compaction threshold when the threshold is inherited from Hermes `compression.threshold` or left at the plugin default. This gives a trigger around 231K tokens on the effective 272K Codex window.
+
+Explicit LCM threshold overrides stay authoritative. If you set `LCM_CONTEXT_THRESHOLD` or `lcm.context_threshold`, LCM keeps that value and does not auto-raise it.
+
+Use `lcm_status` or `/lcm status` to see both `raw_context_length` and `context_length`, plus `configured_context_threshold` and the runtime `context_threshold`. Use `lcm_doctor` or `/lcm doctor` to check current context pressure against the runtime threshold.
+
 ## Update
 
 If you cloned directly into the plugin directory:
