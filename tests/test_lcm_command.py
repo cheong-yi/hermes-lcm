@@ -488,6 +488,26 @@ def test_lcm_doctor_tool_reports_heartbeat_noise_as_read_only_payload_detail(eng
     assert "Still working" not in json.dumps(payload)
 
 
+def test_lcm_doctor_context_pressure_uses_runtime_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "doctor-runtime-threshold.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("gpt-5.5", 400_000, provider="openai-codex")
+        engine.last_prompt_tokens = 225_000
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        pressure = next(check for check in doctor["checks"] if check["check"] == "context_pressure")
+
+        assert pressure["status"] == "pass"
+        assert pressure["detail"] == "82.7% used, compaction triggers at 85.0%"
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
     storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
     storage_dir.mkdir(parents=True)

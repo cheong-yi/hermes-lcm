@@ -223,6 +223,20 @@ def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[
         return default, "default"
 
 
+def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
+    cfg = _load_hermes_config_yaml()
+    try:
+        compression = cfg.get("compression") or {}
+        if not isinstance(compression, dict):
+            return default, "default"
+        value = compression.get("codex_gpt55_autoraise")
+        if value is None:
+            return default, "default"
+        return (not _config_bool_disabled(value)), "config_yaml:compression.codex_gpt55_autoraise"
+    except Exception:
+        return default, "default"
+
+
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
@@ -235,6 +249,10 @@ class LCMConfig:
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
+    # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
+    # when LCM is inheriting the host compression threshold. Explicit LCM
+    # threshold overrides remain authoritative.
+    codex_gpt55_autoraise_enabled: bool = True
     # Max condensation depth (-1 = unlimited, 0 = leaf only)
     incremental_max_depth: int = 3
     # How many same-depth summaries trigger condensation
@@ -398,6 +416,10 @@ class LCMConfig:
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
+        c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
+            c.codex_gpt55_autoraise_enabled
+        )
+        _record("codex_gpt55_autoraise_enabled", source)
         c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
         c.condensation_fanin = _int("LCM_CONDENSATION_FANIN", c.condensation_fanin)
         c.dynamic_leaf_chunk_enabled = _parse_bool_env(

@@ -137,9 +137,14 @@ def _status_text(engine) -> str:
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
+        f"raw_context_length: {status.get('raw_context_length', 0) if session_bound else '(uninitialized)'}",
+        f"effective_context_length_cap: {status.get('effective_context_length_cap') or '(none)'}",
+        f"effective_context_length_reason: {status.get('effective_context_length_reason') or '(none)'}",
         f"context_length_source: {context_length_source}",
-        f"context_threshold: {engine._config.context_threshold}",
-        f"context_threshold_source: {config_sources.get('context_threshold', 'manual_or_default')}",
+        f"configured_context_threshold: {status.get('configured_context_threshold', engine._config.context_threshold)}",
+        f"context_threshold: {status.get('context_threshold', engine._config.context_threshold)}",
+        f"context_threshold_source: {status.get('context_threshold_source', config_sources.get('context_threshold', 'manual_or_default'))}",
+        f"context_threshold_autoraised: {status.get('context_threshold_autoraised') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",
@@ -1714,7 +1719,12 @@ def _preset_suggest_text(engine) -> str:
         f"invalid_overrides: {invalid_text}",
         "preview:",
     ])
-    for item in preset_env_diff(preset, engine._config):
+    for item in preset_env_diff(
+        preset,
+        engine._config,
+        runtime_context_threshold=getattr(engine, "context_threshold", None),
+        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
+    ):
         lines.append(f"- {item}")
     lines.extend([
         f"unsupported_runtime_fields: {unsupported_runtime_fields_text(preset)}",
@@ -1748,7 +1758,12 @@ def _preset_apply_text(tokens: list[str], engine) -> str:
         f"preset: {preset.name}",
         "would_set:",
     ]
-    for item in preset_env_diff(preset, engine._config):
+    for item in preset_env_diff(
+        preset,
+        engine._config,
+        runtime_context_threshold=getattr(engine, "context_threshold", None),
+        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
+    ):
         lines.append(f"- {item}")
     lines.extend([
         f"unsupported_runtime_fields: {unsupported_runtime_fields_text(preset)}",

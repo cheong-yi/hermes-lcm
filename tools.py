@@ -1887,9 +1887,15 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
         "model": full_status.get("model", ""),
         "provider": full_status.get("provider", ""),
+        "raw_context_length": full_status.get("raw_context_length", engine.context_length),
         "context_length": engine.context_length,
+        "effective_context_length_cap": full_status.get("effective_context_length_cap"),
+        "effective_context_length_reason": full_status.get("effective_context_length_reason", ""),
         "context_length_source": full_status.get("context_length_source", ""),
+        "configured_context_threshold": full_status.get("configured_context_threshold", engine._config.context_threshold),
         "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
+        "context_threshold_source": full_status.get("context_threshold_source", ""),
+        "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
@@ -2228,7 +2234,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 7. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
-        threshold_pct = round(c.context_threshold * 100, 1)
+        runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
+        threshold_pct = round(runtime_threshold * 100, 1)
         checks.append({
             "check": "context_pressure",
             "status": "pass" if usage_pct < threshold_pct else "warn",

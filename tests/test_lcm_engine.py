@@ -244,6 +244,99 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+def test_codex_gpt55_uses_route_cap_and_hermes_autoraise_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "codex-gpt55.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.5",
+            provider="openai-codex",
+            context_length=400_000,
+        )
+
+        assert engine.raw_context_length == 400_000
+        assert engine.context_length == 272_000
+        assert engine.effective_context_length_cap == 272_000
+        assert engine.effective_context_length_reason == "codex_gpt55_route_cap"
+        assert engine.context_threshold == 0.85
+        assert engine.threshold_tokens == int(272_000 * 0.85)
+
+        status = engine.get_status()
+        assert status["raw_context_length"] == 400_000
+        assert status["context_length"] == 272_000
+        assert status["configured_context_threshold"] == 0.68
+        assert status["context_threshold"] == 0.85
+        assert status["context_threshold_source"] == "codex_gpt55_autoraise"
+        assert status["context_threshold_autoraised"] == {"from": 0.68, "to": 0.85}
+    finally:
+        engine.shutdown()
+
+
+def test_codex_gpt55_route_cap_keeps_explicit_lcm_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "codex-explicit-threshold.db"),
+    )
+    config.config_sources["context_threshold"] = "env:LCM_CONTEXT_THRESHOLD"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.5-2026-04-23",
+            provider="openai-codex",
+            context_length=400_000,
+        )
+
+        assert engine.raw_context_length == 400_000
+        assert engine.context_length == 272_000
+        assert engine.context_threshold == 0.68
+        assert engine.threshold_tokens == int(272_000 * 0.68)
+        assert engine._effective_assembly_token_cap() is None
+
+        status = engine.get_status()
+        assert status["context_threshold_source"] == "env:LCM_CONTEXT_THRESHOLD"
+        assert status["context_threshold_autoraised"] is None
+    finally:
+        engine.shutdown()
+
+
+def test_codex_gpt55_route_cap_constrains_reserve_based_assembly_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "codex-assembly-cap.db"),
+        max_assembly_tokens=700_000,
+        reserve_tokens_floor=24_000,
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.5-pro",
+            provider="openai-codex",
+            context_length=400_000,
+        )
+
+        assert engine.context_length == 272_000
+        assert engine._effective_assembly_token_cap() == 248_000
+    finally:
+        engine.shutdown()
+
+
+def test_non_codex_gpt55_keeps_host_context_window(engine):
+    engine.update_model(
+        model="gpt-5.5",
+        provider="openai",
+        context_length=400_000,
+    )
+
+    assert engine.raw_context_length == 400_000
+    assert engine.context_length == 400_000
+    assert engine.effective_context_length_cap is None
+    assert engine.threshold_tokens == int(400_000 * engine._config.context_threshold)
+
+
 def test_session_start_does_not_overwrite_update_model_context_length_with_stale_metadata(engine):
     engine.update_model(
         model="deepseek-v4-flash",
@@ -262,6 +355,109 @@ def test_session_start_does_not_overwrite_update_model_context_length_with_stale
     assert engine.model == "deepseek-v4-flash"
     assert engine.context_length == 1_000_000
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_accepts_raw_context_length_for_capped_codex_runtime(tmp_path, caplog):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "codex-session-start.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.5",
+            provider="openai-codex",
+            context_length=400_000,
+        )
+
+        caplog.set_level(logging.WARNING)
+        engine.on_session_start(
+            "telegram:chat-1:session-2",
+            platform="telegram",
+            model="gpt-5.5",
+            provider="openai-codex",
+            context_length=400_000,
+            conversation_id="telegram:chat-1",
+        )
+
+        assert engine.raw_context_length == 400_000
+        assert engine.context_length == 272_000
+        assert engine.threshold_tokens == int(272_000 * 0.85)
+        assert "ignored stale session-start context_length" not in caplog.text
+    finally:
+        engine.shutdown()
+
+
+def test_session_start_only_uses_incoming_route_for_codex_gpt55_cap(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "codex-session-start-only.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start(
+            "telegram:chat-1:session-1",
+            platform="telegram",
+            model="gpt-5.5",
+            provider="openai-codex",
+            context_length=400_000,
+            conversation_id="telegram:chat-1",
+        )
+
+        assert engine.raw_context_length == 400_000
+        assert engine.context_length == 272_000
+        assert engine.context_threshold == 0.85
+        assert engine.threshold_tokens == int(272_000 * 0.85)
+        assert engine.effective_context_length_reason == "codex_gpt55_route_cap"
+
+        engine.on_session_start(
+            "telegram:chat-2:session-1",
+            platform="telegram",
+            model="gpt-5.5",
+            provider="openai",
+            context_length=400_000,
+            conversation_id="telegram:chat-2",
+        )
+
+        assert engine.raw_context_length == 400_000
+        assert engine.context_length == 400_000
+        assert engine.context_threshold == 0.68
+        assert engine.threshold_tokens == int(400_000 * 0.68)
+        assert engine.effective_context_length_cap is None
+        assert engine.effective_context_length_reason == ""
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_status_surfaces_capped_context_and_effective_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "codex-status.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine._session_id = "codex-status-session"
+        engine.update_model(
+            model="gpt-5.5",
+            provider="openai-codex",
+            context_length=400_000,
+        )
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+        assert payload["raw_context_length"] == 400_000
+        assert payload["context_length"] == 272_000
+        assert payload["effective_context_length_cap"] == 272_000
+        assert payload["effective_context_length_reason"] == "codex_gpt55_route_cap"
+        assert payload["configured_context_threshold"] == 0.68
+        assert payload["context_threshold"] == 0.85
+        assert payload["context_threshold_source"] == "codex_gpt55_autoraise"
+        assert payload["context_threshold_autoraised"] == {"from": 0.68, "to": 0.85}
+    finally:
+        engine.shutdown()
 
 
 def test_session_start_does_not_overwrite_update_model_with_stale_runtime_identity(engine):

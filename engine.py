@@ -81,6 +81,20 @@ logger = logging.getLogger(__name__)
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _PLUGIN_METADATA: dict[str, str] | None = None
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_CODEX_GPT55_CONTEXT_CAP = 272_000
+_CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
+
+
+def _is_codex_gpt55_route(model: str, provider: str) -> bool:
+    """Return True for gpt-5.5 on ChatGPT Codex OAuth, mirroring Hermes core."""
+    if (provider or "").strip().lower() != "openai-codex":
+        return False
+    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (
+        bare_model == "gpt-5.5"
+        or bare_model.startswith("gpt-5.5-")
+        or bare_model.startswith("gpt-5.5.")
+    )
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
 # real user turns so that summarization can prioritise current user intent.
@@ -344,11 +358,21 @@ class LCMEngine(ContextEngine):
         self.api_key = ""
         self.provider = ""
         self.api_mode = ""
+        self.raw_context_length = 0
         self.context_length = 0
+        self.effective_context_length_cap: int | None = None
+        self.effective_context_length_reason = ""
         self._context_length_source = ""
         self._update_model_pending_session_start = False
         self.threshold_tokens = 0
-        self.threshold_percent = self._config.context_threshold
+        self.context_threshold = self._config.context_threshold
+        self.threshold_percent = self.context_threshold
+        self._context_threshold_source = (
+            self._config.config_sources.get("context_threshold", "manual_or_default")
+            if getattr(self._config, "config_sources", None)
+            else "manual_or_default"
+        )
+        self._context_threshold_autoraised: dict[str, float] | None = None
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -496,7 +520,65 @@ class LCMEngine(ContextEngine):
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
-    def _set_context_length(self, context_length: Any, *, source: str) -> bool:
+    def _runtime_context_threshold(
+        self,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> tuple[float, str, dict[str, float] | None]:
+        configured = float(self._config.context_threshold)
+        source = (
+            self._config.config_sources.get("context_threshold", "manual_or_default")
+            if getattr(self._config, "config_sources", None)
+            else "manual_or_default"
+        )
+        explicit_lcm_override = source in {
+            "env:LCM_CONTEXT_THRESHOLD",
+            "config_yaml:lcm.context_threshold",
+        }
+        route_model = self.model if model is None else model
+        route_provider = self.provider if provider is None else provider
+        if (
+            _is_codex_gpt55_route(route_model, route_provider)
+            and self._config.codex_gpt55_autoraise_enabled
+            and not explicit_lcm_override
+            and configured < _CODEX_GPT55_COMPACTION_THRESHOLD
+        ):
+            return (
+                _CODEX_GPT55_COMPACTION_THRESHOLD,
+                "codex_gpt55_autoraise",
+                {"from": configured, "to": _CODEX_GPT55_COMPACTION_THRESHOLD},
+            )
+        return configured, source, None
+
+    def _effective_context_length(
+        self,
+        raw_context_length: int,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> tuple[int, int | None, str]:
+        route_model = self.model if model is None else model
+        route_provider = self.provider if provider is None else provider
+        if (
+            raw_context_length > _CODEX_GPT55_CONTEXT_CAP
+            and _is_codex_gpt55_route(route_model, route_provider)
+        ):
+            return (
+                _CODEX_GPT55_CONTEXT_CAP,
+                _CODEX_GPT55_CONTEXT_CAP,
+                "codex_gpt55_route_cap",
+            )
+        return raw_context_length, None, ""
+
+    def _set_context_length(
+        self,
+        context_length: Any,
+        *,
+        source: str,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> bool:
         try:
             parsed_context_length = int(context_length)
         except (TypeError, ValueError):
@@ -508,14 +590,33 @@ class LCMEngine(ContextEngine):
                 source,
                 context_length,
             )
+            self.raw_context_length = 0
             self.context_length = 0
+            self.effective_context_length_cap = None
+            self.effective_context_length_reason = ""
             self._context_length_source = source
             self.threshold_tokens = 0
+            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
+                self._runtime_context_threshold(model=model, provider=provider)
+            )
+            self.threshold_percent = self.context_threshold
             return True
-        self.context_length = parsed_context_length
+        self.raw_context_length = parsed_context_length
+        effective_context_length, cap, reason = self._effective_context_length(
+            parsed_context_length,
+            model=model,
+            provider=provider,
+        )
+        self.context_length = effective_context_length
+        self.effective_context_length_cap = cap
+        self.effective_context_length_reason = reason
         self._context_length_source = source
+        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
+            self._runtime_context_threshold(model=model, provider=provider)
+        )
+        self.threshold_percent = self.context_threshold
         self.threshold_tokens = int(
-            parsed_context_length * self._config.context_threshold
+            effective_context_length * self.context_threshold
         )
         return True
 
@@ -1830,12 +1931,13 @@ class LCMEngine(ContextEngine):
             else:
                 if (
                     update_model_is_authoritative
-                    and parsed_context_length != self.context_length
+                    and parsed_context_length not in {self.context_length, self.raw_context_length}
                 ):
                     logger.warning(
-                        "LCM ignored stale session-start context_length=%s for model=%s; active update_model context_length=%s",
+                        "LCM ignored stale session-start context_length=%s for model=%s; active update_model raw_context_length=%s effective_context_length=%s",
                         parsed_context_length,
                         self.model or str(kwargs.get("model") or ""),
+                        self.raw_context_length,
                         self.context_length,
                     )
                     self._update_model_pending_session_start = False
@@ -1850,7 +1952,12 @@ class LCMEngine(ContextEngine):
                         self._update_model_pending_session_start = False
                         return
                 else:
-                    self._set_context_length(parsed_context_length, source="session_start")
+                    self._set_context_length(
+                        parsed_context_length,
+                        source="session_start",
+                        model=str(kwargs.get("model") or self.model),
+                        provider=str(kwargs.get("provider") or self.provider),
+                    )
                     update_model_is_authoritative = False
         if (
             update_model_is_authoritative
@@ -2433,14 +2540,20 @@ class LCMEngine(ContextEngine):
             "last_reasoning_tokens": self.last_reasoning_tokens,
             "cache_metrics_available": self.cache_metrics_available,
             "cache_read_ratio": round(self.cache_read_ratio, 4),
+            "raw_context_length": self.raw_context_length,
             "context_length": self.context_length,
+            "effective_context_length_cap": self.effective_context_length_cap,
+            "effective_context_length_reason": self.effective_context_length_reason,
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
             "model": self.model,
             "provider": self.provider,
             "context_length_source": self._context_length_source,
-            "context_threshold": self._config.context_threshold,
+            "configured_context_threshold": self._config.context_threshold,
+            "context_threshold": self.context_threshold,
+            "context_threshold_source": self._context_threshold_source,
+            "context_threshold_autoraised": self._context_threshold_autoraised,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),

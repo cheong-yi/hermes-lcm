@@ -3,6 +3,7 @@
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.presets import preset_status_payload
 
 
 _PRESET_ENV_VARS = (
@@ -97,6 +98,33 @@ def test_lcm_preset_suggest_reports_explicit_operator_config_precedence(tmp_path
     assert "explicit_overrides: LCM_FRESH_TAIL_COUNT" in result
     assert "LCM_FRESH_TAIL_COUNT: keep explicit value 99 (preset 24)" in result
     assert "note: suggestion only; no live config was changed" in result
+
+
+def test_lcm_preset_suggest_does_not_lower_codex_gpt55_autoraised_threshold(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=400_000)
+    engine._config.context_threshold = 0.68
+    engine._config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine.update_model(
+        model="gpt-5.5",
+        provider="openai-codex",
+        context_length=400_000,
+    )
+
+    result = handle_lcm_command("preset suggest", engine)
+    payload = preset_status_payload(engine, environ={})
+
+    assert "LCM_CONTEXT_THRESHOLD: keep runtime auto-raised value 0.85 (preset 0.75)" in result
+    assert "LCM_FRESH_TAIL_COUNT=24" in result
+    assert "LCM_LEAF_CHUNK_TOKENS=8000" in result
+    context_delta = next(item for item in payload["dry_run_delta"] if item["field"] == "context_threshold")
+    assert context_delta == {
+        "field": "context_threshold",
+        "env": "LCM_CONTEXT_THRESHOLD",
+        "action": "keep_runtime_autoraised",
+        "current_value": 0.85,
+        "preset_value": 0.75,
+    }
 
 
 def test_lcm_preset_suggest_reports_spark_for_128k_context_window(tmp_path, monkeypatch):

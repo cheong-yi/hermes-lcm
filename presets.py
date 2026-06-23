@@ -183,6 +183,8 @@ def preset_env_diff(
     config: Any,
     *,
     environ: Mapping[str, str] | None = None,
+    runtime_context_threshold: float | None = None,
+    runtime_context_threshold_source: str = "",
 ) -> list[str]:
     """Render env-var changes a preset would suggest without applying them."""
 
@@ -202,6 +204,16 @@ def preset_env_diff(
                 f"{env_var}={value} "
                 f"(invalid current value {raw} ignored by runtime; runtime value {current})"
             )
+        elif (
+            field == "context_threshold"
+            and runtime_context_threshold_source == "codex_gpt55_autoraise"
+            and runtime_context_threshold is not None
+            and float(runtime_context_threshold) >= float(value)
+        ):
+            lines.append(
+                f"{env_var}: keep runtime auto-raised value {runtime_context_threshold:g} "
+                f"(preset {value})"
+            )
         else:
             lines.append(f"{env_var}={value}")
     return lines
@@ -212,6 +224,8 @@ def _preset_dry_run_delta(
     config: Any,
     *,
     environ: Mapping[str, str] | None = None,
+    runtime_context_threshold: float | None = None,
+    runtime_context_threshold_source: str = "",
 ) -> list[dict[str, Any]]:
     """Return structured preset dry-run actions without mutating runtime state."""
 
@@ -237,6 +251,19 @@ def _preset_dry_run_delta(
                 "action": "replace_invalid",
                 "invalid_value": env.get(env_var, ""),
                 "current_value": current,
+                "preset_value": preset_value,
+            })
+        elif (
+            field == "context_threshold"
+            and runtime_context_threshold_source == "codex_gpt55_autoraise"
+            and runtime_context_threshold is not None
+            and float(runtime_context_threshold) >= float(preset_value)
+        ):
+            delta.append({
+                "field": field,
+                "env": env_var,
+                "action": "keep_runtime_autoraised",
+                "current_value": runtime_context_threshold,
                 "preset_value": preset_value,
             })
         else:
@@ -309,7 +336,13 @@ def preset_status_payload(
         "notes": preset.notes,
     }
     payload["provenance"] = dict(preset.provenance)
-    payload["dry_run_delta"] = _preset_dry_run_delta(preset, config, environ=env)
+    payload["dry_run_delta"] = _preset_dry_run_delta(
+        preset,
+        config,
+        environ=env,
+        runtime_context_threshold=getattr(engine, "context_threshold", None),
+        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
+    )
     return payload
 
 
