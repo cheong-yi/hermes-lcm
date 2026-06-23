@@ -558,6 +558,21 @@ class TestConfig:
 
         assert c.context_threshold == 0.68
 
+    def test_from_env_reads_hermes_codex_gpt55_autoraise_flag(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  threshold: 0.68\n  codex_gpt55_autoraise: false\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
+        assert c.codex_gpt55_autoraise_enabled is False
+        assert c.config_sources["codex_gpt55_autoraise_enabled"] == "config_yaml:compression.codex_gpt55_autoraise"
+
     def test_from_env_reads_hermes_auxiliary_compression_timeout_when_lcm_env_missing(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()

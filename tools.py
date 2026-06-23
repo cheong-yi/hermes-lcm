@@ -2175,10 +2175,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     c = engine._config
     if c.fresh_tail_count < 2:
         config_warnings.append("fresh_tail_count < 2 may cause aggressive compaction")
-    if c.context_threshold > 0.95:
-        config_warnings.append("context_threshold > 0.95 leaves very little headroom")
-    if c.context_threshold < 0.3:
-        config_warnings.append("context_threshold < 0.3 triggers compaction very early")
+    runtime_context_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
+    if runtime_context_threshold > 0.95:
+        config_warnings.append("runtime context_threshold > 0.95 leaves very little headroom")
+    if runtime_context_threshold < 0.3:
+        config_warnings.append("runtime context_threshold < 0.3 triggers compaction very early")
     if c.condensation_fanin < 2:
         config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
     if c.incremental_max_depth == 0:

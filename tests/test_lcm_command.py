@@ -508,6 +508,26 @@ def test_lcm_doctor_context_pressure_uses_runtime_threshold(tmp_path):
         engine.shutdown()
 
 
+def test_lcm_doctor_config_validation_uses_runtime_threshold_for_autoraised_context(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.20,
+        database_path=str(tmp_path / "doctor-runtime-validation.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("gpt-5.5", 400_000, provider="openai-codex")
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        validation = next(check for check in doctor["checks"] if check["check"] == "config_validation")
+
+        assert engine.context_threshold == 0.85
+        assert validation["status"] == "pass"
+        assert validation["detail"] == "all settings within normal ranges"
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
     storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
     storage_dir.mkdir(parents=True)
