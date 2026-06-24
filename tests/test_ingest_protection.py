@@ -2176,7 +2176,7 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
         "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
         "chars=1; bytes=1; ref=example-missing.json]"
     )
-    arguments = json.dumps({"log": f'pytest output: "{placeholder}"'})
+    arguments = json.dumps({"log": f'pytest output: "prefix before placeholder {placeholder}"'})
     tool_calls = json.dumps(
         [
             {
@@ -2265,7 +2265,7 @@ def test_externalized_payload_integrity_scan_detects_escaped_json_tool_content_p
         "[Externalized LCM ingest payload: kind=media_payload; field=content; "
         "chars=1; bytes=1; ref=present-tool-content-media.json]"
     )
-    content = '{\\"image\\":\\"' + placeholder + '\\"}'
+    content = '{\\"image\\":\\"x ' + placeholder + '\\"}'
     engine._store._conn.execute(
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
@@ -2300,7 +2300,7 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
         "[Externalized LCM ingest payload: kind=media_payload; field=content; "
         "chars=1; bytes=1; ref=example-tool-content.json]"
     )
-    content = '{\\"log\\":\\"pytest output: \\\\\\\"' + placeholder + '\\\\\\\"\\"}'
+    content = '{\\"log\\":\\"pytest output: \\\\\\\"prefix before placeholder ' + placeholder + '\\\\\\\"\\"}'
     engine._store._conn.execute(
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)

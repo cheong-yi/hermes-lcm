@@ -1022,9 +1022,34 @@ def _walk_tool_call_argument_values(value: Any):
             yield from _walk_tool_call_argument_values(item)
 
 
+def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
+    in_span = False
+    i = 0
+    while i < start:
+        if text.startswith(token, i):
+            in_span = not in_span
+            i += len(token)
+        else:
+            i += 1
+    return in_span
+
+
+def _has_escaped_quote_before(text: str, start: int) -> bool:
+    return re.search(r"\\+[\"']", text[:start]) is not None
+
+
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
     prefix = text[max(0, start - 8):start]
-    return '\\"' in prefix or "\\'" in prefix or prefix.endswith("\\")
+    return (
+        '\\"' in prefix
+        or "\\'" in prefix
+        or prefix.endswith("\\")
+        or _has_escaped_quote_before(text, start)
+    )
+
+
+def _is_quoted_placeholder_example(text: str, start: int) -> bool:
+    return _is_inside_token_quote_span(text, start, '"') or _is_inside_token_quote_span(text, start, "'")
 
 
 def _looks_like_json_container_string(text: str) -> bool:
@@ -1032,11 +1057,13 @@ def _looks_like_json_container_string(text: str) -> bool:
     return stripped.startswith("{") or stripped.startswith("[")
 
 
-def _extract_unescaped_externalized_payload_refs(text: str) -> list[str]:
+def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
         for match in pattern.finditer(text):
             if _is_escaped_placeholder_example(text, match.start()):
+                continue
+            if ignore_quoted_spans and _is_quoted_placeholder_example(text, match.start()):
                 continue
             ref = match.group(1).strip()
             if _is_basename_ref(ref) and ref not in refs:
@@ -1074,7 +1101,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                     if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                         _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
                     else:
-                        _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
+                        _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         for nested in _walk_string_values(parsed):
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
@@ -1090,8 +1117,8 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 nested_stripped = nested.strip()
                 if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                     _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-                elif _looks_like_json_container_string(nested_stripped):
-                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
+                else:
+                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
     return extract_all_externalized_payload_refs(value)
 
