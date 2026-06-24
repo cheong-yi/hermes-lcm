@@ -2174,6 +2174,53 @@ def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_pla
     assert detail["externalized_payload_files_unreferenced"] == 0
 
 
+def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_placeholder_after_unmatched_caption_quote(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-unmatched-caption-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-unmatched-caption-tool-call-media.json]"
+    )
+    arguments = json.dumps({"image": f'caption says "front {placeholder}'})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
 def test_externalized_payload_integrity_scan_detects_parsed_object_tool_call_argument_placeholder(tmp_path):
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
