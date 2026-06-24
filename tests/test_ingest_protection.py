@@ -2137,7 +2137,7 @@ def test_externalized_payload_integrity_scan_detects_parsed_object_tool_call_arg
             {
                 "function": {
                     "name": "analyze_image",
-                    "arguments": {"image": f"prefix {placeholder} suffix"},
+                    "arguments": {"image": f"user's screenshot {placeholder} suffix"},
                 }
             }
         ]

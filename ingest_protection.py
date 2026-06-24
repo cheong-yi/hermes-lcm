@@ -1049,7 +1049,7 @@ def _is_escaped_placeholder_example(text: str, start: int) -> bool:
 
 
 def _is_quoted_placeholder_example(text: str, start: int) -> bool:
-    return _is_inside_token_quote_span(text, start, '"') or _is_inside_token_quote_span(text, start, "'")
+    return _is_inside_token_quote_span(text, start, '"')
 
 
 def _looks_like_json_container_string(text: str) -> bool:
