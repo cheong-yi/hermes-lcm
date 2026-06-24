@@ -1012,6 +1012,11 @@ def _is_escaped_placeholder_example(text: str, start: int) -> bool:
     return '\\"' in prefix or "\\'" in prefix or prefix.endswith("\\")
 
 
+def _looks_like_json_container_string(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
 def _extract_unescaped_externalized_payload_refs(text: str) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
@@ -1031,8 +1036,8 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     pytest failures, or docs that mention placeholder examples. Counting those
     as live payload references turns doctor into a false-positive machine. Exact
     placeholders are still counted everywhere; embedded unescaped placeholders
-    are counted for message content and tool-call argument strings so preserved
-    raw/duplicate-key tool arguments do not hide real refs.
+    are counted for message content and raw JSON-container tool-call argument
+    strings so preserved duplicate-key tool arguments do not hide real refs.
     """
     if not isinstance(value, str) or not value:
         return []
@@ -1048,7 +1053,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                 _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-            else:
+            elif _looks_like_json_container_string(nested_stripped):
                 _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
         return refs
     if role == "tool":
