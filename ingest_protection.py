@@ -1011,6 +1011,17 @@ def _walk_string_values(value: Any):
             yield from _walk_string_values(item)
 
 
+def _walk_tool_call_argument_strings(value: Any):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "arguments" and isinstance(nested, str):
+                yield nested
+            yield from _walk_tool_call_argument_strings(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_tool_call_argument_strings(item)
+
+
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
     prefix = text[max(0, start - 8):start]
     return '\\"' in prefix or "\\'" in prefix or prefix.endswith("\\")
@@ -1040,8 +1051,9 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     pytest failures, or docs that mention placeholder examples. Counting those
     as live payload references turns doctor into a false-positive machine. Exact
     placeholders are still counted everywhere; embedded unescaped placeholders
-    are counted for message content and raw JSON-container tool-call argument
-    strings so preserved duplicate-key tool arguments do not hide real refs.
+    are counted for message content, raw JSON-container tool-call argument
+    strings, and raw free-form tool-call argument strings so ingestion-produced
+    refs do not disappear while quoted examples stay ignored.
     """
     if not isinstance(value, str) or not value:
         return []
@@ -1053,6 +1065,8 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
         parsed = _maybe_parse_json_string(value)
         if parsed is None:
             return refs
+        for arguments in _walk_tool_call_argument_strings(parsed):
+            _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(arguments))
         for nested in _walk_string_values(parsed):
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
