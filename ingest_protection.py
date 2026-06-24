@@ -621,12 +621,16 @@ def _maybe_parse_json_string(text: str) -> Any | None:
     stripped = text.strip()
     if not stripped or stripped[0] not in "[{":
         return None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return None
-    if isinstance(parsed, (dict, list)):
-        return parsed
+    candidates = [text]
+    if '\\"' in stripped:
+        candidates.append(stripped.replace('\\"', '"'))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
     return None
 
 
@@ -1057,7 +1061,16 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
         return refs
     if role == "tool":
-        return _extract_unescaped_externalized_payload_refs(value)
+        refs = _extract_unescaped_externalized_payload_refs(value)
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not None:
+            for nested in _walk_string_values(parsed):
+                nested_stripped = nested.strip()
+                if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                    _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                elif _looks_like_json_container_string(nested_stripped):
+                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
+        return refs
     return extract_all_externalized_payload_refs(value)
 
 
