@@ -102,6 +102,9 @@ _HEARTBEAT_NOISE_RE = re.compile(
 _HEARTBEAT_NOISE_MAX_CHARS = 256
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
+_EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
+    r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
+)
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
@@ -991,6 +994,9 @@ def _append_unique_refs(target: list[str], refs: list[str]) -> None:
 def _walk_string_values(value: Any):
     if isinstance(value, str):
         yield value
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not None and not (isinstance(parsed, str) and parsed == value):
+            yield from _walk_string_values(parsed)
     elif isinstance(value, dict):
         for key, nested in value.items():
             if isinstance(key, str):
@@ -999,6 +1005,23 @@ def _walk_string_values(value: Any):
     elif isinstance(value, list):
         for item in value:
             yield from _walk_string_values(item)
+
+
+def _is_escaped_placeholder_example(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 8):start]
+    return '\\"' in prefix or "\\'" in prefix or prefix.endswith("\\")
+
+
+def _extract_unescaped_externalized_payload_refs(text: str) -> list[str]:
+    refs: list[str] = []
+    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+        for match in pattern.finditer(text):
+            if _is_escaped_placeholder_example(text, match.start()):
+                continue
+            ref = match.group(1).strip()
+            if _is_basename_ref(ref) and ref not in refs:
+                refs.append(ref)
+    return refs
 
 
 def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
@@ -1027,7 +1050,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
         return refs
     if role == "tool":
-        return []
+        return _extract_unescaped_externalized_payload_refs(value)
     return extract_all_externalized_payload_refs(value)
 
 
