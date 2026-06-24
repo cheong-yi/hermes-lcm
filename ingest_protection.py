@@ -1096,6 +1096,17 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
         for argument in _walk_tool_call_argument_values(parsed):
             if isinstance(argument, str):
                 _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument))
+                parsed_argument = _maybe_parse_json_string(argument)
+                if parsed_argument is not None:
+                    for nested in _walk_string_values(parsed_argument):
+                        nested_stripped = nested.strip()
+                        if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                            _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                        else:
+                            _append_unique_refs(
+                                refs,
+                                _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True),
+                            )
             else:
                 for nested in _walk_string_values(argument):
                     nested_stripped = nested.strip()
