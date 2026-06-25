@@ -1035,18 +1035,19 @@ def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
 
 
 def _has_local_escaped_quote_before(text: str, start: int) -> bool:
-    boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "[", ":"))
-    return re.search(r"\\+[\"']", text[boundary + 1:start]) is not None
+    boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "["))
+    segment = text[boundary + 1:start]
+    matches = list(re.finditer(r"\\+[\"']", segment))
+    if not matches:
+        return False
+    quote = matches[-1]
+    context = segment[max(0, quote.start() - 80):quote.start()].lower()
+    return any(marker in context for marker in ("pytest", "output", "log", "example", "traceback", "failure"))
 
 
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
     prefix = text[max(0, start - 8):start]
-    return (
-        '\\"' in prefix
-        or "\\'" in prefix
-        or prefix.endswith("\\")
-        or _has_local_escaped_quote_before(text, start)
-    )
+    return prefix.endswith("\\") or _has_local_escaped_quote_before(text, start)
 
 
 def _is_quoted_placeholder_example(text: str, start: int) -> bool:
