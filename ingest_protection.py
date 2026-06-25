@@ -1034,6 +1034,10 @@ def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
     return in_span
 
 
+def _looks_like_example_quote_context(context: str) -> bool:
+    return re.search(r"(?:pytest\s+output|log|example|traceback|failure)\s*:\s*$", context.lower()) is not None
+
+
 def _has_local_escaped_quote_before(text: str, start: int) -> bool:
     boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "["))
     segment = text[boundary + 1:start]
@@ -1041,8 +1045,8 @@ def _has_local_escaped_quote_before(text: str, start: int) -> bool:
     if not matches:
         return False
     quote = matches[-1]
-    context = segment[max(0, quote.start() - 80):quote.start()].lower()
-    return any(marker in context for marker in ("pytest", "log", "example", "traceback", "failure"))
+    context = segment[max(0, quote.start() - 80):quote.start()]
+    return _looks_like_example_quote_context(context)
 
 
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
@@ -1056,8 +1060,8 @@ def _is_quoted_placeholder_example(text: str, start: int) -> bool:
     quote = text.rfind('"', 0, start)
     if quote < 0:
         return False
-    context = text[max(0, quote - 80):quote].lower()
-    return any(marker in context for marker in ("pytest", "log", "example", "traceback", "failure"))
+    context = text[max(0, quote - 80):quote]
+    return _looks_like_example_quote_context(context)
 
 
 def _looks_like_json_container_string(text: str) -> bool:

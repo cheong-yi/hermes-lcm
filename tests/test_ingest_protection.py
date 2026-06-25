@@ -2315,7 +2315,7 @@ def test_externalized_payload_integrity_scan_detects_embedded_tool_content_place
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()
     content = (
-        'tool returned \\\"preview\\\" plus '
+        'log returned \\\"preview\\\" plus '
         "[Externalized LCM ingest payload: kind=media_payload; field=content; "
         "chars=1; bytes=1; ref=missing-tool-content-media.json]"
     )
