@@ -577,6 +577,14 @@ class LCMEngine(ContextEngine):
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
+        self._auxiliary_last_prompt_tokens: dict[str, int] = {}
+        self._auxiliary_session_generations: dict[str, int] = {}
+        self._auxiliary_generation_tokens: dict[int, tuple[Any, int]] = {}
+        self._auxiliary_next_generation_token = 0
+        self._auxiliary_direct_end_guard_session_ids: set[str] = set()
+        self._auxiliary_handoff_parent_session_ids: dict[str, str] = {}
+        self._auxiliary_retired_session_generations: dict[str, set[int]] = {}
+        self._auxiliary_foreground_reused_session_ids: set[str] = set()
         self._lcm_bypass_lineage_session_ids: set[str] = set()
         self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
         self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
@@ -704,6 +712,14 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
+            self._auxiliary_last_prompt_tokens.clear()
+            self._auxiliary_session_generations.clear()
+            self._auxiliary_generation_tokens.clear()
+            self._auxiliary_next_generation_token = 0
+            self._auxiliary_direct_end_guard_session_ids.clear()
+            self._auxiliary_handoff_parent_session_ids.clear()
+            self._auxiliary_retired_session_generations.clear()
+            self._auxiliary_foreground_reused_session_ids.clear()
             self._lcm_bypass_lineage_session_ids.clear()
             self._lcm_bypass_lineage_platforms.clear()
             self._lcm_non_bypass_platforms.clear()
@@ -973,6 +989,53 @@ class LCMEngine(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         if self._thread_context_stateless():
+            auxiliary_session_id = self._thread_context_session_id()
+            if auxiliary_session_id:
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                caller_generation = self._in_process_auxiliary_caller_generation(
+                    auxiliary_session_id
+                )
+                with self._auxiliary_session_lock:
+                    if auxiliary_session_id not in self._auxiliary_session_ids:
+                        return
+                    if self._auxiliary_generation_is_retired(
+                        auxiliary_session_id,
+                        caller_generation,
+                    ):
+                        return
+                    active_generation = self._auxiliary_session_generations.get(
+                        auxiliary_session_id
+                    )
+                    if active_generation is None and caller_generation:
+                        expected_parent = self._auxiliary_handoff_parent_session_ids.get(
+                            auxiliary_session_id
+                        )
+                        if expected_parent and self._in_process_parent_session_id(
+                            {},
+                            session_id=auxiliary_session_id,
+                            include_explicit=False,
+                        ) != expected_parent:
+                            return
+                        if auxiliary_session_id in self._auxiliary_last_prompt_tokens:
+                            self._auxiliary_direct_end_guard_session_ids.add(
+                                auxiliary_session_id
+                            )
+                        self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
+                        self._auxiliary_session_generations[
+                            auxiliary_session_id
+                        ] = caller_generation
+                        self._auxiliary_handoff_parent_session_ids.pop(
+                            auxiliary_session_id,
+                            None,
+                        )
+                        active_generation = caller_generation
+                    generation_matches = (
+                        caller_generation == 0
+                        if active_generation is None
+                        else caller_generation == active_generation
+                    )
+                    if generation_matches:
+                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
             return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
@@ -1519,7 +1582,14 @@ class LCMEngine(ContextEngine):
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
                 return False
-            tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+            if prompt_tokens is not None:
+                tokens = prompt_tokens
+            else:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    tokens = self._current_auxiliary_prompt_tokens(auxiliary_session_id)
+                else:
+                    tokens = self.last_prompt_tokens
             if self._should_force_overflow_recovery(observed_tokens=tokens):
                 return True
             if self.threshold_tokens <= 0:
@@ -1893,9 +1963,18 @@ class LCMEngine(ContextEngine):
         self._last_compression_noop_reason = ""
 
         if self._bypasses_lcm_context_management():
+            bypass_current_tokens = current_tokens
+            if bypass_current_tokens is None:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    auxiliary_prompt_tokens = self._current_auxiliary_prompt_tokens(
+                        auxiliary_session_id
+                    )
+                    if auxiliary_prompt_tokens > 0:
+                        bypass_current_tokens = auxiliary_prompt_tokens
             return self._compress_lcm_bypassed_session(
                 messages,
-                current_tokens=current_tokens,
+                current_tokens=bypass_current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
@@ -2438,6 +2517,23 @@ class LCMEngine(ContextEngine):
             return stack[-1]
         return ""
 
+    def _current_auxiliary_prompt_tokens(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        caller_generation = self._in_process_auxiliary_caller_generation(session_id)
+        with self._auxiliary_session_lock:
+            if session_id not in self._auxiliary_session_ids:
+                return 0
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            generation_matches = (
+                caller_generation == 0
+                if active_generation is None
+                else caller_generation == active_generation
+            )
+            if not generation_matches:
+                return 0
+            return self._auxiliary_last_prompt_tokens.get(session_id, 0)
+
     def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
@@ -2450,9 +2546,19 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             return set(self._auxiliary_lineage_session_ids)
 
+    def _known_auxiliary_parent_lineage_session_ids(self) -> set[str]:
+        with self._auxiliary_session_lock:
+            return set(self._auxiliary_lineage_session_ids) - set(
+                self._auxiliary_foreground_reused_session_ids
+            )
+
     def _has_auxiliary_lineage_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_lineage_session_ids
+
+    def _auxiliary_lineage_suppressed_as_foreground(self, session_id: str) -> bool:
+        with self._auxiliary_session_lock:
+            return session_id in self._auxiliary_foreground_reused_session_ids
 
     def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
         with self._auxiliary_session_lock:
@@ -2518,19 +2624,120 @@ class LCMEngine(ContextEngine):
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
 
-    def _register_auxiliary_session(self, session_id: str) -> None:
+    def _register_auxiliary_session(
+        self,
+        session_id: str,
+        *,
+        preserve_foreground_reuse_marker: bool = False,
+    ) -> bool:
+        generation = self._in_process_auxiliary_caller_generation(session_id)
         with self._auxiliary_session_lock:
+            previous_generation = self._auxiliary_session_generations.get(session_id)
+            had_active_session = session_id in self._auxiliary_session_ids
+            if generation and self._auxiliary_generation_is_retired(session_id, generation):
+                if previous_generation is not None and previous_generation != generation:
+                    return False
+                if had_active_session and previous_generation is None:
+                    return False
+                generation = self._in_process_auxiliary_caller_generation(
+                    session_id,
+                    refresh_retired=True,
+                )
+            had_cached_usage = session_id in self._auxiliary_last_prompt_tokens
             self._auxiliary_session_ids.add(session_id)
             self._auxiliary_lineage_session_ids.add(session_id)
+            if not preserve_foreground_reuse_marker:
+                self._auxiliary_foreground_reused_session_ids.discard(session_id)
+            if generation:
+                if previous_generation != generation:
+                    if previous_generation is not None:
+                        self._retire_auxiliary_generation(session_id, previous_generation)
+                    if (
+                        had_active_session
+                        or had_cached_usage
+                        or previous_generation is not None
+                    ):
+                        self._auxiliary_direct_end_guard_session_ids.add(session_id)
+                    self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations[session_id] = generation
+                self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            else:
+                if previous_generation is not None:
+                    self._retire_auxiliary_generation(session_id, previous_generation)
+                self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations.pop(session_id, None)
+                self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+                self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            return True
 
-    def _deactivate_auxiliary_session(self, session_id: str) -> None:
-        if not session_id:
-            return
+    def _retire_auxiliary_generation(self, session_id: str, generation: int | None) -> None:
+        if session_id and generation:
+            self._auxiliary_retired_session_generations.setdefault(session_id, set()).add(generation)
+
+    def _drop_auxiliary_generation_token(
+        self,
+        object_id: int,
+        token: int,
+        token_ref: weakref.ReferenceType[Any],
+    ) -> None:
         with self._auxiliary_session_lock:
-            self._auxiliary_session_ids.discard(session_id)
+            existing = self._auxiliary_generation_tokens.get(object_id)
+            if existing is not None and existing == (token_ref, token):
+                self._auxiliary_generation_tokens.pop(object_id, None)
 
-    def _mark_thread_context_stateless(self, session_id: str) -> None:
-        self._register_auxiliary_session(session_id)
+    def _auxiliary_generation_is_retired(self, session_id: str, generation: int) -> bool:
+        return bool(generation) and generation in self._auxiliary_retired_session_generations.get(
+            session_id,
+            set(),
+        )
+
+    def _deactivate_auxiliary_session(self, session_id: str, *, generation: int = 0) -> bool:
+        if not session_id:
+            return False
+        with self._auxiliary_session_lock:
+            if self._auxiliary_generation_is_retired(session_id, generation):
+                return False
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            if active_generation is None:
+                expected_parent = self._auxiliary_handoff_parent_session_ids.get(session_id)
+                caller_parent = self._in_process_parent_session_id(
+                    {},
+                    session_id=session_id,
+                    include_explicit=False,
+                )
+                if session_id in self._auxiliary_direct_end_guard_session_ids:
+                    has_usage = session_id in self._auxiliary_last_prompt_tokens
+                    if not generation and not has_usage:
+                        return False
+                    if expected_parent and caller_parent and caller_parent != expected_parent:
+                        return False
+            elif generation != active_generation:
+                expected_parent = self._auxiliary_handoff_parent_session_ids.get(session_id)
+                has_cached_usage = session_id in self._auxiliary_last_prompt_tokens
+                if generation != 0 or (
+                    session_id in self._auxiliary_direct_end_guard_session_ids
+                    and not (expected_parent and has_cached_usage)
+                ):
+                    return False
+            self._auxiliary_session_ids.discard(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
+            self._retire_auxiliary_generation(session_id, active_generation or generation)
+            self._auxiliary_session_generations.pop(session_id, None)
+            self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+            self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            return True
+
+    def _mark_thread_context_stateless(
+        self,
+        session_id: str,
+        *,
+        preserve_foreground_reuse_marker: bool = False,
+    ) -> None:
+        if not self._register_auxiliary_session(
+            session_id,
+            preserve_foreground_reuse_marker=preserve_foreground_reuse_marker,
+        ):
+            return
         stack = self._thread_context_auxiliary_stack()
         stack[:] = [existing for existing in stack if existing != session_id]
         stack.append(session_id)
@@ -2544,13 +2751,91 @@ class LCMEngine(ContextEngine):
             stack.clear()
         self._sync_thread_context_current_auxiliary()
 
-    def _handoff_auxiliary_session(self, old_session_id: str, new_session_id: str) -> None:
+    def _handoff_auxiliary_session(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        preserve_old_session: bool = False,
+        preserve_old_foreground_marker: bool = False,
+    ) -> None:
+        generation = self._in_process_auxiliary_caller_generation(new_session_id)
+        stack = self._thread_context_auxiliary_stack()
+        handoff_from_active_thread_marker = old_session_id in stack
         with self._auxiliary_session_lock:
             if old_session_id:
-                self._auxiliary_session_ids.discard(old_session_id)
+                if not preserve_old_session:
+                    self._auxiliary_last_prompt_tokens.pop(old_session_id, None)
+                    self._retire_auxiliary_generation(
+                        old_session_id,
+                        self._auxiliary_session_generations.get(old_session_id),
+                    )
+                    self._auxiliary_session_generations.pop(old_session_id, None)
+                    self._auxiliary_direct_end_guard_session_ids.discard(old_session_id)
+                    self._auxiliary_handoff_parent_session_ids.pop(old_session_id, None)
+                    self._auxiliary_session_ids.discard(old_session_id)
                 self._auxiliary_lineage_session_ids.add(old_session_id)
             if new_session_id:
-                self._auxiliary_session_ids.add(new_session_id)
+                previous_new_generation = self._auxiliary_session_generations.get(new_session_id)
+                had_new_runtime_state = (
+                    new_session_id in self._auxiliary_session_ids
+                    or new_session_id in self._auxiliary_last_prompt_tokens
+                    or previous_new_generation is not None
+                    or new_session_id in self._auxiliary_direct_end_guard_session_ids
+                )
+                had_new_session_state = (
+                    had_new_runtime_state
+                    or new_session_id in self._auxiliary_lineage_session_ids
+                )
+                had_direct_end_guard = new_session_id in self._auxiliary_direct_end_guard_session_ids
+                new_generation_replaces_old = (
+                    previous_new_generation is not None
+                    and (
+                        (bool(generation) and previous_new_generation != generation)
+                        or (not generation and had_direct_end_guard)
+                    )
+                )
+                if had_new_session_state and new_generation_replaces_old:
+                    self._retire_auxiliary_generation(new_session_id, previous_new_generation)
+                boundary_from_live_new_generation = bool(generation) and previous_new_generation == generation
+                preserve_new_foreground_marker = (
+                    new_session_id in self._auxiliary_foreground_reused_session_ids
+                    and not boundary_from_live_new_generation
+                )
+                if not preserve_new_foreground_marker:
+                    self._auxiliary_last_prompt_tokens.pop(new_session_id, None)
+                    self._auxiliary_direct_end_guard_session_ids.discard(new_session_id)
+                    if had_new_session_state and (
+                        new_generation_replaces_old
+                        or had_direct_end_guard
+                        or (bool(generation) and previous_new_generation is None and had_new_runtime_state)
+                        or (
+                            previous_new_generation is None
+                            and not generation
+                            and new_session_id in self._auxiliary_lineage_session_ids
+                            and (
+                                handoff_from_active_thread_marker
+                                or (
+                                    old_session_id
+                                    and had_new_runtime_state
+                                    and (
+                                        old_session_id in self._auxiliary_lineage_session_ids
+                                        or old_session_id in self._auxiliary_session_ids
+                                    )
+                                )
+                            )
+                        )
+                    ):
+                        self._auxiliary_direct_end_guard_session_ids.add(new_session_id)
+                        if old_session_id:
+                            self._auxiliary_handoff_parent_session_ids[new_session_id] = old_session_id
+                    self._auxiliary_session_ids.add(new_session_id)
+                    self._auxiliary_foreground_reused_session_ids.discard(new_session_id)
+                    if generation:
+                        self._auxiliary_session_generations[new_session_id] = generation
+                        self._auxiliary_handoff_parent_session_ids.pop(new_session_id, None)
+                    elif previous_new_generation is None or new_generation_replaces_old:
+                        self._auxiliary_session_generations.pop(new_session_id, None)
                 self._auxiliary_lineage_session_ids.add(new_session_id)
         stack = self._thread_context_auxiliary_stack()
         had_thread_marker = old_session_id in stack or new_session_id in stack
@@ -2563,9 +2848,23 @@ class LCMEngine(ContextEngine):
             stack.append(new_session_id)
         self._sync_thread_context_current_auxiliary()
 
-    def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
+    def _unmark_thread_context_auxiliary_session(
+        self,
+        session_id: str,
+        *,
+        suppress_as_foreground_reuse: bool = True,
+    ) -> None:
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.discard(session_id)
+            if suppress_as_foreground_reuse and session_id in self._auxiliary_lineage_session_ids:
+                self._auxiliary_foreground_reused_session_ids.add(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
+            self._retire_auxiliary_generation(
+                session_id,
+                self._auxiliary_session_generations.pop(session_id, None),
+            )
+            self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+            self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
         self._clear_thread_context_stateless(session_id)
 
     def _get_allowed_hermes_base(self) -> Path | None:
@@ -2619,6 +2918,74 @@ class LCMEngine(ContextEngine):
         if getattr(caller_self, "ephemeral_system_prompt", None) and log_prefix.startswith("[subagent-"):
             return True
         return False
+
+    def _auxiliary_generation_token_for(self, caller_self: object, *, force_new: bool = False) -> int:
+        """Return a process-local, non-reusable token for an auxiliary frame.
+
+        ``id(obj)`` can be reused after GC, which makes retired-generation
+        checks incorrectly reject later live frames. Key by id for lookup speed,
+        but verify object identity with ``is`` before reusing a token. Weak refs
+        avoid retaining ordinary frames; objects that cannot be weak-referenced
+        are held strongly so their id cannot be recycled while the token remains
+        live in this engine runtime.
+        """
+        with self._auxiliary_session_lock:
+            object_id = id(caller_self)
+            existing = self._auxiliary_generation_tokens.get(object_id)
+            if existing is not None and not force_new:
+                existing_ref, token = existing
+                if isinstance(existing_ref, weakref.ReferenceType):
+                    existing_obj = existing_ref()
+                else:
+                    existing_obj = existing_ref
+                if existing_obj is caller_self:
+                    return token
+
+            self._auxiliary_next_generation_token += 1
+            token = self._auxiliary_next_generation_token
+            try:
+                token_ref: Any = weakref.ref(
+                    caller_self,
+                    lambda ref, object_id=object_id, token=token: self._drop_auxiliary_generation_token(
+                        object_id,
+                        token,
+                        ref,
+                    ),
+                )
+            except TypeError:
+                token_ref = caller_self
+            self._auxiliary_generation_tokens[object_id] = (token_ref, token)
+            return token
+
+    def _in_process_auxiliary_caller_generation(
+        self,
+        session_id: str,
+        *,
+        refresh_retired: bool = False,
+    ) -> int:
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame is not None else None
+            for _ in range(32):
+                if frame is None:
+                    return 0
+                caller_self = frame.f_locals.get("self")
+                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                    frame = frame.f_back
+                    continue
+                caller_session = str(getattr(caller_self, "session_id", "") or "")
+                if not session_id or caller_session == session_id:
+                    token = self._auxiliary_generation_token_for(caller_self)
+                    if refresh_retired and self._auxiliary_generation_is_retired(
+                        session_id,
+                        token,
+                    ):
+                        token = self._auxiliary_generation_token_for(caller_self, force_new=True)
+                    return token
+                frame = frame.f_back
+        finally:
+            del frame
+        return 0
 
     def _in_process_parent_session_id(
         self,
@@ -2698,6 +3065,7 @@ class LCMEngine(ContextEngine):
         if not session_id or session_id == parent_session_id:
             return False
         known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        known_auxiliary_parent_ids = self._known_auxiliary_parent_lineage_session_ids()
         explicit_parent_id = str(kwargs.get("parent_session_id") or "")
         in_process_parent_id = self._in_process_parent_session_id(
             kwargs,
@@ -2712,7 +3080,12 @@ class LCMEngine(ContextEngine):
         if explicit_parent_id:
             if self._thread_context_has_auxiliary_session(explicit_parent_id):
                 return True
-            if explicit_parent_id in known_auxiliary_ids and explicit_parent_id != self._session_id:
+            if explicit_parent_id in known_auxiliary_parent_ids and explicit_parent_id != self._session_id:
+                return True
+            if (
+                explicit_parent_id in known_auxiliary_ids
+                and self._lcm_session_last_bypassed.get(explicit_parent_id)
+            ):
                 return True
             return False
         if not parent_session_id:
@@ -2754,14 +3127,15 @@ class LCMEngine(ContextEngine):
 
         active_auxiliary_ids = self._active_auxiliary_session_ids()
         known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        known_auxiliary_parent_ids = self._known_auxiliary_parent_lineage_session_ids()
         if child_parent_id in active_auxiliary_ids:
             return True
-        if child_parent_id in known_auxiliary_ids and child_parent_id != self._session_id:
+        if child_parent_id in known_auxiliary_parent_ids and child_parent_id != self._session_id:
             return True
         if child_parent_id != parent_session_id:
             return self._session_has_auxiliary_ancestor(
                 str(child_parent_id or ""),
-                known_auxiliary_ids | active_auxiliary_ids,
+                known_auxiliary_parent_ids | active_auxiliary_ids,
                 path,
             )
         return False
@@ -3429,11 +3803,37 @@ class LCMEngine(ContextEngine):
             self._host_fallback_compressor = None
             self._host_fallback_session_id = ""
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            old_session_is_suppressed_foreground = self._auxiliary_lineage_suppressed_as_foreground(
+                old_session_id
+            )
+            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
+                old_session_id
+            )
+            new_session_auxiliary_parent = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            new_session_is_auxiliary_continuation = new_session_auxiliary_parent == old_session_id
             if (
                 self._has_auxiliary_lineage_session(old_session_id)
-                and old_session_id != self._session_id
+                and (
+                    old_session_id != self._session_id
+                    or old_session_auxiliary_generation
+                    or new_session_is_auxiliary_continuation
+                )
+                and (
+                    not old_session_is_suppressed_foreground
+                    or old_session_auxiliary_generation
+                    or new_session_is_auxiliary_continuation
+                )
             ):
-                self._handoff_auxiliary_session(old_session_id, session_id)
+                self._handoff_auxiliary_session(
+                    old_session_id,
+                    session_id,
+                    preserve_old_session=old_session_id == self._session_id,
+                    preserve_old_foreground_marker=old_session_is_suppressed_foreground,
+                )
                 logger.info(
                     "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
                     old_session_id,
@@ -3475,14 +3875,35 @@ class LCMEngine(ContextEngine):
             return
 
         if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
-            self._register_auxiliary_session(session_id)
+            explicit_parent_id = str(kwargs.get("parent_session_id") or "")
+            preserve_foreground_reuse_marker = bool(
+                explicit_parent_id
+                and self._lcm_session_last_bypassed.get(explicit_parent_id)
+            )
+            if preserve_foreground_reuse_marker:
+                if self._lcm_session_last_normal_conversation_id.get(session_id):
+                    self._auxiliary_foreground_reused_session_ids.add(session_id)
+                self._mark_thread_context_stateless(
+                    session_id,
+                    preserve_foreground_reuse_marker=True,
+                )
+            else:
+                self._register_auxiliary_session(session_id)
             logger.info(
                 "LCM session %s is a live child of bound session %s — treating it as auxiliary/stateless",
                 session_id,
                 previous_session_id,
             )
             return
-        self._deactivate_auxiliary_session(session_id)
+        start_platform = str(kwargs.get("platform") or "")
+        side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
+            session_id,
+            platform=start_platform,
+        ) or self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
+        self._unmark_thread_context_auxiliary_session(
+            session_id,
+            suppress_as_foreground_reuse=not side_channel_rebind,
+        )
         self._clear_thread_context_stateless()
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
@@ -3847,21 +4268,65 @@ class LCMEngine(ContextEngine):
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        if self._has_auxiliary_lineage_session(session_id) and session_id != self._session_id:
+        ended_generation = self._in_process_auxiliary_caller_generation(session_id)
+        active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
+        if (
+            self._has_auxiliary_lineage_session(session_id)
+            and session_id != self._session_id
+            and (
+                active_auxiliary_end
+                or not self._auxiliary_lineage_suppressed_as_foreground(session_id)
+                or ended_generation
+                or (
+                    session_id in self._auxiliary_last_prompt_tokens
+                    and not self._auxiliary_lineage_suppressed_as_foreground(session_id)
+                )
+            )
+        ):
             current_thread_session_id = self._thread_context_session_id()
-            with self._auxiliary_session_lock:
-                self._auxiliary_session_ids.discard(session_id)
-            if current_thread_session_id == session_id:
+            if current_thread_session_id == session_id or active_auxiliary_end:
+                self._remember_lcm_bypass_message_prefix(session_id, messages)
+            deactivated = self._deactivate_auxiliary_session(
+                session_id,
+                generation=ended_generation,
+            )
+            if deactivated and current_thread_session_id == session_id:
                 self._clear_thread_context_stateless(session_id)
             return
         current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
         ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
-        if ended_session_directly_bypasses:
+        direct_bypass_normal_conversation_id = self._lcm_session_last_normal_conversation_id.get(session_id)
+        direct_bypass_normal_prefix_count = None
+        if (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and direct_bypass_normal_conversation_id
+            and not ended_generation
+        ):
+            direct_bypass_normal_prefix_count = self._session_end_store_prefix_count(
+                session_id,
+                messages,
+                conversation_id=direct_bypass_normal_conversation_id,
+            )
+        direct_bypass_is_suppressed_reused_normal = (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and bool(direct_bypass_normal_conversation_id)
+            and not ended_generation
+            and session_id != self._thread_context_session_id()
+            and direct_bypass_normal_prefix_count is not None
+            and direct_bypass_normal_prefix_count > 0
+        )
+        if ended_session_directly_bypasses and not direct_bypass_is_suppressed_reused_normal:
+            self._remember_lcm_bypass_message_prefix(session_id, messages)
             self._end_host_fallback_compressor_for_session(
                 session_id,
                 messages,
                 current_session_bypasses=current_session_bypasses,
             )
+            if session_id == self._thread_context_session_id():
+                self._deactivate_auxiliary_session(session_id, generation=ended_generation)
+                self._clear_thread_context_stateless(session_id)
             return
         same_id_has_bypass_lineage = (
             session_id == self._session_id
@@ -3914,7 +4379,19 @@ class LCMEngine(ContextEngine):
                 or same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
             )
         )
-        off_current_lineage = session_id != self._session_id and self._has_lcm_bypass_lineage_session(session_id)
+        off_current_auxiliary_reused_normal = (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and bool(direct_bypass_normal_conversation_id)
+            and not ended_generation
+        )
+        off_current_lineage = (
+            session_id != self._session_id
+            and (
+                self._has_lcm_bypass_lineage_session(session_id)
+                or off_current_auxiliary_reused_normal
+            )
+        )
         off_current_normal_conversation_id = (
             self._lcm_session_last_normal_conversation_id.get(session_id)
             if off_current_lineage
@@ -3989,6 +4466,7 @@ class LCMEngine(ContextEngine):
             off_current_prefix_count = off_current_recorded_prefix_for_append
         if (
             off_current_lineage
+            and not off_current_auxiliary_reused_normal
             and off_current_normal_conversation_id
             and off_current_store_prefix_count == 0
             and off_current_bypass_prefix_count <= 0
