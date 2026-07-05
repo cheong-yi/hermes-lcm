@@ -3869,26 +3869,18 @@ class LCMEngine(ContextEngine):
                 conversation_id=off_current_normal_conversation_id,
             )
         off_current_prefix_count = None
-        off_current_store_prefix_positive = (
-            off_current_store_prefix_count is not None
-            and off_current_store_prefix_count > 0
-        )
-        off_current_strongest_normal_prefix_count = max(
-            off_current_recorded_prefix_count,
-            off_current_store_prefix_count if off_current_store_prefix_positive else 0,
-        )
+        off_current_store_positive_count = 0
+        if off_current_store_prefix_count is not None and off_current_store_prefix_count > 0:
+            off_current_store_positive_count = off_current_store_prefix_count
+        off_current_store_prefix_positive = off_current_store_positive_count > 0
         if (
-            off_current_strongest_normal_prefix_count > 0
+            off_current_store_prefix_positive
             and (
                 off_current_bypass_prefix_count <= 0
-                or off_current_strongest_normal_prefix_count > off_current_bypass_prefix_count
+                or off_current_store_positive_count > off_current_bypass_prefix_count
             )
         ):
-            off_current_prefix_count = (
-                off_current_store_prefix_count
-                if off_current_store_prefix_positive
-                else off_current_recorded_prefix_count
-            )
+            off_current_prefix_count = off_current_store_positive_count
         if (
             off_current_lineage
             and off_current_normal_conversation_id

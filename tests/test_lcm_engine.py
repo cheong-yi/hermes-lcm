@@ -13159,6 +13159,57 @@ class TestSessionRollover:
         finally:
             engine.shutdown()
 
+    def test_off_current_divergent_normal_end_does_not_append_from_recorded_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_divergent_normal_end.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "unrelated bypass opener"}])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_messages = [
+                {"role": "user", "content": f"normal prefix {idx}"}
+                for idx in range(9)
+            ]
+            engine.ingest(normal_messages)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            divergent_end = normal_messages[:8] + [
+                {"role": "user", "content": "divergent ninth message"},
+                {"role": "assistant", "content": "corrupt suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", divergent_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                msg["content"] for msg in normal_messages
+            ]
+            assert all(row["content"] != "divergent ninth message" for row in rows)
+            assert all(row["content"] != "corrupt suffix must not append" for row in rows)
+            assert engine._store.get_session_count("foreground-session") == 0
+        finally:
+            engine.shutdown()
+
     def test_reused_normal_session_id_scopes_off_current_dedupe_to_current_conversation(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_reused_normal_id_current_conversation.db"),
