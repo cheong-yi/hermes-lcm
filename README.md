@@ -492,6 +492,16 @@ it.
 pattern sources, whether the current session is ignored/stateless, and a
 process-lifetime `ignored_message_count`.
 
+Ignored/stateless sessions are a storage ownership boundary, not a context-window
+opt-out. LCM does not ingest raw messages or create DAG nodes for sessions that
+match `LCM_IGNORE_SESSION_PATTERNS`, `LCM_STATELESS_SESSION_PATTERNS`, or the
+in-process auxiliary/thread stateless marker. If those sessions cross the normal
+context threshold, LCM delegates the compaction call to Hermes' native
+`ContextCompressor` so the active request is still bounded before model overflow.
+If the native compressor is unavailable, LCM falls back to a deterministic
+head/tail trim as a last-resort safety net, still without writing the bypassed
+session to `lcm.db`.
+
 ### Large tool-output handling
 
 Storage-boundary payload guard contract: LCM prevents media-ish inline payloads from being written into plugin-local SQLite rows at the storage boundary.

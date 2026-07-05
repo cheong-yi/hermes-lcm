@@ -431,6 +431,16 @@ their `*_source` fields (`default` or `env`), the current session's `ignored` an
 can confirm their patterns are loaded and watch how often message filters fire.
 The counter resets on engine restart.
 
+Ignored/stateless sessions are a storage ownership boundary, not a context-window
+opt-out. LCM does not ingest raw messages or create DAG nodes for sessions that
+match `LCM_IGNORE_SESSION_PATTERNS`, `LCM_STATELESS_SESSION_PATTERNS`, or the
+in-process auxiliary/thread stateless marker. If those sessions cross the normal
+context threshold, LCM delegates the compaction call to Hermes' native
+`ContextCompressor` so the active request is still bounded before model overflow.
+If the native compressor is unavailable, LCM falls back to a deterministic
+head/tail trim as a last-resort safety net, still without writing the bypassed
+session to `lcm.db`.
+
 ### Large tool-output handling
 
 Externalization for ordinary large tool output is opt-in. When enabled,

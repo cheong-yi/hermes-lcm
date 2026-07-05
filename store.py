@@ -493,22 +493,25 @@ class MessageStore:
 
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
-                  limit: int = 1000) -> List[Dict[str, Any]]:
+                  limit: int = 1000,
+                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get messages in a store_id range for a session."""
+        where = ["session_id = ?", "store_id >= ?"]
+        args: list[Any] = [session_id, start_id]
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
         if end_id is not None:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ? AND store_id <= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, end_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, limit),
-            ).fetchall()
+            where.append("store_id <= ?")
+            args.append(end_id)
+        args.append(limit)
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE {' AND '.join(where)}
+               ORDER BY store_id LIMIT ?""",
+            args,
+        ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def _session_load_where(

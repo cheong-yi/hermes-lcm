@@ -1196,6 +1196,36 @@ class TestMessageStore:
         result = store.get_range("sess1", start_id=ids[3], end_id=ids[7])
         assert len(result) == 5
 
+    def test_get_range_can_filter_by_conversation_id(self, store):
+        first = store.append(
+            "sess1",
+            {"role": "user", "content": "conv a first"},
+            conversation_id="conv-a",
+        )
+        store.append(
+            "sess1",
+            {"role": "user", "content": "conv b"},
+            conversation_id="conv-b",
+        )
+        last = store.append(
+            "sess1",
+            {"role": "assistant", "content": "conv a second"},
+            conversation_id="conv-a",
+        )
+
+        unfiltered = store.get_range("sess1", start_id=first, end_id=last)
+        filtered = store.get_range("sess1", start_id=first, end_id=last, conversation_id="conv-a")
+
+        assert [row["content"] for row in unfiltered] == [
+            "conv a first",
+            "conv b",
+            "conv a second",
+        ]
+        assert [row["content"] for row in filtered] == [
+            "conv a first",
+            "conv a second",
+        ]
+
     def test_session_count(self, store):
         store.append("sess1", {"role": "user", "content": "a"})
         store.append("sess1", {"role": "assistant", "content": "b"})
@@ -6063,6 +6093,47 @@ class TestLCMEngineCloning:
             lifecycle.close()
             for engine in (prototype, first_agent, second_agent):
                 engine.shutdown()
+
+    def test_clone_for_agent_does_not_copy_bypass_lineage_into_normal_session(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm-clone-bypass-lineage.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        shared_prefix = [{"role": "user", "content": "shared opener"}]
+        try:
+            prototype.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            prototype.ingest(shared_prefix)
+
+            clone = prototype.clone_for_agent()
+            clone.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            clone.on_session_end(
+                "shared-session",
+                shared_prefix + [{"role": "assistant", "content": "normal final"}],
+            )
+
+            rows = clone._store.get_session_messages("shared-session")
+            assert [(row["conversation_id"], row["role"], row["content"]) for row in rows] == [
+                ("normal-conversation", "user", "shared opener"),
+                ("normal-conversation", "assistant", "normal final"),
+            ]
+        finally:
+            prototype.shutdown()
+            if clone is not None:
+                clone.shutdown()
 
     def test_deepcopy_uses_clone_for_agent_without_copying_sqlite_handles(self, tmp_path):
         from hermes_lcm.engine import LCMEngine

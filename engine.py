@@ -7,6 +7,7 @@ with a DAG-based summarization system that preserves every message.
 import copy
 import hashlib
 import inspect
+import importlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from .externalize import (
     extract_externalized_ref,
     find_externalized_payload_for_message,
     find_externalized_tool_result_content_for_call,
+    is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_tool_output,
 )
@@ -377,6 +379,7 @@ _SYNTHETIC_ASSISTANT_NOISE = {
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
 def _tool_call_id(tool_call: Any) -> str:
@@ -574,7 +577,23 @@ class LCMEngine(ContextEngine):
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
+        self._lcm_bypass_lineage_session_ids: set[str] = set()
+        self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
+        self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
+        self._lcm_session_last_platform: dict[str, str] = {}
+        self._lcm_session_last_normal_platform: dict[str, str] = {}
+        self._lcm_session_last_bypassed: dict[str, bool] = {}
+        self._lcm_session_last_conversation_id: dict[str, str] = {}
+        self._lcm_session_last_normal_conversation_id: dict[str, str] = {}
+        self._lcm_bypass_message_prefix_fingerprints: dict[
+            str, list[tuple[list[str], bool]]
+        ] = {}
+        self._lcm_normal_message_prefix_fingerprints: dict[tuple[str, str], list[str]] = {}
+        self._lcm_current_start_allows_bypass_lineage = False
         self._auxiliary_session_lock = threading.RLock()
+        self._host_fallback_compressor: Any = None
+        self._host_fallback_session_id = ""
+        self._host_fallback_import_warning_logged = False
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -619,6 +638,7 @@ class LCMEngine(ContextEngine):
         # before binding it; hosts that bind only through on_session_start()
         # must still be able to replace the copied prototype route.
         clone._update_model_pending_session_start = False
+        clone._lcm_current_start_allows_bypass_lineage = False
         return clone
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
@@ -684,6 +704,20 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
+            self._lcm_bypass_lineage_session_ids.clear()
+            self._lcm_bypass_lineage_platforms.clear()
+            self._lcm_non_bypass_platforms.clear()
+            self._lcm_session_last_platform.clear()
+            self._lcm_session_last_normal_platform.clear()
+            self._lcm_session_last_bypassed.clear()
+            self._lcm_session_last_conversation_id.clear()
+            self._lcm_session_last_normal_conversation_id.clear()
+            self._lcm_bypass_message_prefix_fingerprints.clear()
+            self._lcm_normal_message_prefix_fingerprints.clear()
+        self._lcm_current_start_allows_bypass_lineage = False
+        self._host_fallback_compressor = None
+        self._host_fallback_session_id = ""
+        self._host_fallback_import_warning_logged = False
         self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 
@@ -974,6 +1008,482 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
         return False
 
+    def _bypasses_lcm_context_management(self) -> bool:
+        """Return True when this binding must not write/manage LCM state.
+
+        Ignored, stateless, and in-process auxiliary sessions are excluded from
+        LCM storage. They still need context-size protection because Hermes has
+        exactly one active context engine; returning a pure no-op here would
+        disable every compaction layer for the session.
+        """
+        return bool(
+            self._session_ignored
+            or self._session_stateless
+            or self._thread_context_stateless()
+        )
+
+    def _bypass_lcm_reason(self) -> str:
+        if self._thread_context_stateless():
+            return "auxiliary thread context"
+        if self._session_ignored:
+            return "ignored session"
+        if self._session_stateless:
+            return "stateless session"
+        return "active session"
+
+    def _bypass_lcm_session_id(self) -> str:
+        return self._thread_context_session_id() or self._session_id or "(unknown)"
+
+    def _session_id_matches_lcm_bypass_filters(
+        self,
+        session_id: str,
+        *,
+        platform: str = "",
+    ) -> bool:
+        if not session_id:
+            return False
+        match_keys = build_session_match_keys(session_id, platform=platform)
+        if matches_session_pattern(match_keys, self._compiled_ignore_session_patterns):
+            return True
+        return matches_session_pattern(match_keys, self._compiled_stateless_session_patterns)
+
+    def _ended_session_directly_bypasses_lcm(self, session_id: str) -> bool:
+        """Classify a session-end callback by the ended id, not the active binding."""
+        if not session_id:
+            return False
+        if session_id == self._thread_context_session_id():
+            return True
+        return self._session_id_matches_lcm_bypass_filters(session_id)
+
+    def _end_host_fallback_compressor_for_session(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        current_session_bypasses: bool,
+    ) -> None:
+        if self._host_fallback_compressor is not None and (
+            current_session_bypasses
+            or not self._host_fallback_session_id
+            or self._host_fallback_session_id == session_id
+        ):
+            compressor = self._host_fallback_compressor
+            fallback_session_id = self._host_fallback_session_id or session_id
+            on_session_end = getattr(compressor, "on_session_end", None)
+            if callable(on_session_end) and fallback_session_id:
+                try:
+                    on_session_end(fallback_session_id, messages)
+                except Exception:
+                    logger.debug("LCM host fallback compressor session-end reset failed", exc_info=True)
+            on_session_reset = getattr(compressor, "on_session_reset", None)
+            if callable(on_session_reset):
+                try:
+                    on_session_reset()
+                except Exception:
+                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+            self._host_fallback_compressor = None
+            self._host_fallback_session_id = ""
+
+    def _get_host_fallback_compressor(self) -> Any:
+        """Return Hermes' native compressor for LCM-bypassed sessions if available."""
+        session_id = self._bypass_lcm_session_id()
+        if self._host_fallback_compressor is not None:
+            if session_id == self._host_fallback_session_id:
+                return self._host_fallback_compressor
+            previous = self._host_fallback_compressor
+            on_session_end = getattr(previous, "on_session_end", None)
+            if callable(on_session_end) and self._host_fallback_session_id:
+                try:
+                    on_session_end(self._host_fallback_session_id, [])
+                except Exception:
+                    logger.debug("LCM host fallback compressor session-end reset failed", exc_info=True)
+            on_session_reset = getattr(previous, "on_session_reset", None)
+            if callable(on_session_reset):
+                try:
+                    on_session_reset()
+                except Exception:
+                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+            self._host_fallback_compressor = None
+            self._host_fallback_session_id = ""
+        try:
+            ContextCompressor = getattr(
+                importlib.import_module("agent.context_compressor"),
+                "ContextCompressor",
+            )
+        except Exception as exc:  # pragma: no cover - only hit on non-Hermes hosts
+            if not self._host_fallback_import_warning_logged:
+                logger.warning(
+                    "LCM could not load Hermes native ContextCompressor for bypassed session fallback: %s",
+                    exc,
+                )
+                self._host_fallback_import_warning_logged = True
+            return None
+
+        kwargs = {
+            "model": self.model or "unknown",
+            "threshold_percent": self.context_threshold or self.threshold_percent or 0.50,
+            "protect_first_n": self.protect_first_n,
+            "protect_last_n": self.protect_last_n,
+            "quiet_mode": True,
+            "summary_model_override": self._config.summary_model or None,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "config_context_length": self.context_length or self.raw_context_length or None,
+            "provider": self.provider,
+            "api_mode": self.api_mode,
+        }
+        try:
+            compressor = ContextCompressor(**kwargs)
+        except TypeError:
+            # Older Hermes hosts may not expose all constructor kwargs. Keep the
+            # fallback deliberately conservative rather than failing open to an
+            # unbounded ignored/stateless transcript.
+            try:
+                compressor = ContextCompressor(
+                    self.model or "unknown",
+                    threshold_percent=self.context_threshold or self.threshold_percent or 0.50,
+                    protect_first_n=self.protect_first_n,
+                    protect_last_n=self.protect_last_n,
+                    quiet_mode=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LCM could not initialize Hermes native ContextCompressor for bypassed session fallback; using deterministic trim: %s",
+                    exc,
+                )
+                return None
+        except Exception as exc:
+            logger.warning(
+                "LCM could not initialize Hermes native ContextCompressor for bypassed session fallback; using deterministic trim: %s",
+                exc,
+            )
+            return None
+        self._host_fallback_compressor = compressor
+        self._host_fallback_session_id = session_id
+        self._sync_host_fallback_compressor(compressor)
+        return compressor
+
+    def _sync_host_fallback_compressor(self, compressor: Any) -> None:
+        """Keep the delegated native compressor aligned with LCM runtime metadata."""
+        update_model = getattr(compressor, "update_model", None)
+        context_length = self.context_length or self.raw_context_length
+        if callable(update_model) and context_length > 0:
+            try:
+                update_model(
+                    model=self.model or "unknown",
+                    context_length=context_length,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    provider=self.provider,
+                    api_mode=self.api_mode,
+                )
+            except TypeError:
+                try:
+                    update_model(self.model or "unknown", context_length, self.base_url, self.api_key)
+                except TypeError:
+                    pass
+                except Exception:
+                    logger.debug("LCM host fallback compressor model sync failed", exc_info=True)
+            except Exception:
+                logger.debug("LCM host fallback compressor model sync failed", exc_info=True)
+        for attr, value in (
+            ("threshold_percent", self.context_threshold or self.threshold_percent),
+            ("protect_first_n", self.protect_first_n),
+            ("protect_last_n", self.protect_last_n),
+        ):
+            try:
+                setattr(compressor, attr, value)
+            except Exception:
+                pass
+        on_session_start = getattr(compressor, "on_session_start", None)
+        session_id = self._bypass_lcm_session_id()
+        if callable(on_session_start) and session_id:
+            try:
+                on_session_start(
+                    session_id,
+                    platform=self._session_platform,
+                    model=self.model,
+                    provider=self.provider,
+                    context_length=context_length,
+                )
+            except Exception:
+                logger.debug("LCM host fallback compressor session bind failed", exc_info=True)
+
+    def _mirror_host_fallback_state(self, compressor: Any) -> None:
+        for attr in (
+            "_last_compress_aborted",
+            "_last_summary_error",
+            "_last_summary_auth_failure",
+            "_last_summary_network_failure",
+            "_last_summary_dropped_count",
+            "_last_summary_fallback_used",
+            "_last_aux_model_failure_error",
+            "_last_aux_model_failure_model",
+        ):
+            if hasattr(compressor, attr):
+                setattr(self, attr, getattr(compressor, attr))
+
+    def _bypass_compaction_target_tokens(
+        self,
+        *,
+        observed_tokens: Optional[int] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[int]:
+        caps: list[int] = []
+        assembly_cap = self._overflow_recovery_assembly_cap(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
+        if assembly_cap is not None:
+            caps.append(assembly_cap)
+        if self.threshold_tokens > 0:
+            caps.append(self.threshold_tokens)
+        elif self.context_length > 0:
+            caps.append(self.context_length)
+        return min(caps) if caps else None
+
+    @staticmethod
+    def _truncate_bypass_content_value(content: Any, char_budget: int, *, suffix: str = "") -> Any:
+        if char_budget < 0:
+            char_budget = 0
+        if isinstance(content, str):
+            if len(content) <= char_budget:
+                return content
+            return content[:char_budget] + (suffix if char_budget > 0 else "")
+        if isinstance(content, list):
+            truncated_parts: list[Any] = []
+            changed = False
+            for part in content:
+                if isinstance(part, str):
+                    next_part = part if len(part) <= char_budget else part[:char_budget] + (suffix if char_budget > 0 else "")
+                    changed = changed or next_part != part
+                    truncated_parts.append(next_part)
+                    continue
+                if isinstance(part, dict):
+                    next_part = dict(part)
+                    for key in ("text", "content"):
+                        value = next_part.get(key)
+                        if isinstance(value, str) and len(value) > char_budget:
+                            next_part[key] = value[:char_budget] + (suffix if char_budget > 0 else "")
+                            changed = True
+                        elif isinstance(value, dict):
+                            nested = dict(value)
+                            for nested_key in ("value", "content"):
+                                nested_value = nested.get(nested_key)
+                                if isinstance(nested_value, str) and len(nested_value) > char_budget:
+                                    nested[nested_key] = nested_value[:char_budget] + (suffix if char_budget > 0 else "")
+                                    changed = True
+                            next_part[key] = nested
+                    truncated_parts.append(next_part)
+                    continue
+                truncated_parts.append(part)
+            if changed:
+                return truncated_parts
+        normalized = normalize_content_value(content)
+        if isinstance(normalized, str) and len(normalized) > char_budget:
+            return normalized[:char_budget] + (suffix if char_budget > 0 else "")
+        return content
+
+    def _trim_bypass_compacted_to_cap(
+        self,
+        messages: List[Dict[str, Any]],
+        target_tokens: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        compacted = self._sanitize_active_context_messages(messages)
+        if target_tokens is None or target_tokens <= 0:
+            return compacted
+
+        while len(compacted) > 2 and count_messages_tokens(compacted) > target_tokens:
+            remove_indices: list[int] = []
+            for idx, msg in enumerate(compacted):
+                if idx == 0:
+                    continue
+                if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                    continue
+                call_ids = _assistant_tool_call_ids([msg])
+                remove_indices = [idx]
+                remove_indices.extend(
+                    follow_idx
+                    for follow_idx in range(idx + 1, len(compacted))
+                    if compacted[follow_idx].get("role") == "tool"
+                    and str(compacted[follow_idx].get("tool_call_id") or "") in call_ids
+                )
+                break
+            if not remove_indices:
+                remove_index = 1
+                if (
+                    compacted[1].get("role") == "tool"
+                    and compacted[0].get("role") == "assistant"
+                    and compacted[0].get("tool_calls")
+                ):
+                    remove_index = 0
+                remove_indices = [remove_index]
+            before_shape = [
+                (msg.get("role"), msg.get("tool_call_id"), bool(msg.get("tool_calls")))
+                for msg in compacted
+            ]
+            before_tokens = count_messages_tokens(compacted)
+            for remove_index in sorted(set(remove_indices), reverse=True):
+                if 0 <= remove_index < len(compacted):
+                    del compacted[remove_index]
+            compacted = self._sanitize_active_context_messages(compacted)
+            after_shape = [
+                (msg.get("role"), msg.get("tool_call_id"), bool(msg.get("tool_calls")))
+                for msg in compacted
+            ]
+            if after_shape == before_shape and count_messages_tokens(compacted) >= before_tokens:
+                break
+
+        if count_messages_tokens(compacted) <= target_tokens:
+            return compacted
+
+        char_budget = max(0, min(500, target_tokens * 4 // max(1, len(compacted))))
+        truncated = compacted
+        previous_budget = -1
+        for _ in range(12):
+            next_messages: list[Dict[str, Any]] = []
+            for msg in compacted:
+                next_msg = dict(msg)
+                content = next_msg.get("content")
+                next_msg["content"] = self._truncate_bypass_content_value(content, char_budget, suffix="…")
+                next_messages.append(next_msg)
+            truncated = self._sanitize_active_context_messages(next_messages)
+            token_count = count_messages_tokens(truncated)
+            if token_count <= target_tokens:
+                return truncated
+            if char_budget == 0 or char_budget == previous_budget:
+                break
+            previous_budget = char_budget
+            ratio = target_tokens / max(1, token_count)
+            char_budget = max(0, min(char_budget - 1, int(char_budget * max(0.25, ratio * 0.8))))
+
+        compacted = truncated
+        while len(compacted) > 1 and count_messages_tokens(compacted) > target_tokens:
+            compacted = self._sanitize_active_context_messages(compacted[1:])
+
+        char_budget = max(0, min(80, target_tokens * 4))
+        previous_budget = -1
+        while count_messages_tokens(compacted) > target_tokens and char_budget != previous_budget:
+            previous_budget = char_budget
+            shrunk: list[Dict[str, Any]] = []
+            for msg in compacted:
+                next_msg = dict(msg)
+                content = next_msg.get("content")
+                next_msg["content"] = self._truncate_bypass_content_value(content, char_budget)
+                shrunk.append(next_msg)
+            compacted = self._sanitize_active_context_messages(shrunk)
+            char_budget = max(0, char_budget // 2)
+
+        return compacted
+
+    def _fallback_tail_compaction(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        target_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Last-resort size guard when Hermes' native compressor is unavailable."""
+        if len(messages) <= 2:
+            return self._trim_bypass_compacted_to_cap(messages, target_tokens)
+        head_count = max(1, min(self.protect_first_n, len(messages)))
+        tail_count = max(1, min(self.protect_last_n, len(messages) - head_count))
+        marker = {
+            "role": "user",
+            "content": (
+                "[Context omitted: this session is ignored/stateless for LCM, "
+                "and Hermes native compression was unavailable. Older messages "
+                "were dropped to keep the request within the model context window.]"
+            ),
+        }
+        compacted = list(messages[:head_count]) + [marker] + list(messages[-tail_count:])
+        return self._trim_bypass_compacted_to_cap(compacted, target_tokens)
+
+    def _compress_lcm_bypassed_session(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int | None = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Delegate ignored/stateless context bounding without writing to LCM."""
+        reason = self._bypass_lcm_reason()
+        session_id = self._bypass_lcm_session_id()
+        self._remember_lcm_bypass_message_prefix(session_id, messages)
+        observed_tokens = current_tokens if current_tokens and current_tokens > 0 else count_messages_tokens(messages)
+        force_overflow = self._should_force_overflow_recovery(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
+        if not force and not force_overflow and self.threshold_tokens > 0 and observed_tokens < self.threshold_tokens:
+            logger.debug(
+                "LCM compaction bypass no-op for %s %s below threshold (%s < %s)",
+                reason,
+                session_id,
+                observed_tokens,
+                self.threshold_tokens,
+            )
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = f"LCM bypassed below threshold: {reason}"
+            return self._redact_active_replay_messages(messages)
+
+        logger.debug("LCM delegating compaction for bypassed %s %s", reason, session_id)
+        self._last_compression_status = "host_fallback"
+        self._last_compression_noop_reason = f"LCM bypassed: {reason}"
+        safe_messages = self._redact_active_replay_messages(messages)
+        target_tokens = self._bypass_compaction_target_tokens(
+            observed_tokens=observed_tokens,
+            messages=safe_messages,
+        )
+
+        compressor = self._get_host_fallback_compressor()
+        if compressor is None:
+            compacted = self._fallback_tail_compaction(safe_messages, target_tokens=target_tokens)
+            if compacted != messages:
+                self.compression_count += 1
+            return compacted
+
+        self._sync_host_fallback_compressor(compressor)
+        before_count = int(getattr(compressor, "compression_count", 0) or 0)
+        try:
+            try:
+                compacted = compressor.compress(
+                    safe_messages,
+                    current_tokens=current_tokens,
+                    focus_topic=focus_topic,
+                    force=force,
+                )
+            except TypeError:
+                compacted = compressor.compress(
+                    safe_messages,
+                    current_tokens=current_tokens,
+                    focus_topic=focus_topic,
+                )
+        except Exception as exc:
+            self._mirror_host_fallback_state(compressor)
+            logger.warning(
+                "LCM Hermes native ContextCompressor failed for bypassed %s %s; using deterministic trim: %s",
+                reason,
+                session_id,
+                exc,
+            )
+            self._host_fallback_compressor = None
+            self._host_fallback_session_id = ""
+            compacted = self._fallback_tail_compaction(safe_messages, target_tokens=target_tokens)
+            if compacted != safe_messages:
+                self.compression_count += 1
+                self._last_compress_aborted = False
+            return compacted
+        self._mirror_host_fallback_state(compressor)
+        after_count = int(getattr(compressor, "compression_count", before_count) or before_count)
+        self.compression_count += max(1, after_count - before_count)
+        compacted = self._sanitize_active_context_messages(compacted)
+        if target_tokens is not None and count_messages_tokens(compacted) > target_tokens:
+            compacted = self._fallback_tail_compaction(safe_messages, target_tokens=target_tokens)
+            if compacted != safe_messages:
+                self._last_compress_aborted = False
+        return compacted
+
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
@@ -987,10 +1497,16 @@ class LCMEngine(ContextEngine):
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+        if self._bypasses_lcm_context_management():
+            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
             try:
+                self._remember_lcm_normal_message_prefix(
+                    self._session_id,
+                    messages,
+                    conversation_id=self._conversation_id,
+                )
                 self._ingest_messages(messages)
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
@@ -1000,8 +1516,15 @@ class LCMEngine(ContextEngine):
                 logger.warning("Ingest during per-turn ingest(): %s", e)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
-            return False
+        if self._bypasses_lcm_context_management():
+            if self._compression_boundary_cooldown_active():
+                return False
+            tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+            if self._should_force_overflow_recovery(observed_tokens=tokens):
+                return True
+            if self.threshold_tokens <= 0:
+                return False
+            return tokens >= self.threshold_tokens
         if self._compression_boundary_cooldown_active():
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -1013,9 +1536,14 @@ class LCMEngine(ContextEngine):
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
-            return False
-        from .tokens import count_messages_tokens
+        if self._bypasses_lcm_context_management():
+            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            rough = count_messages_tokens(messages)
+            if self._compression_boundary_cooldown_active():
+                return False
+            if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
+                return True
+            return self.threshold_tokens > 0 and rough >= self.threshold_tokens
         rough = count_messages_tokens(messages)
         pre_ingest_placeholder_ambiguous_noop = False
         pre_ingest_noop_reason = ""
@@ -1346,7 +1874,8 @@ class LCMEngine(ContextEngine):
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
-                 focus_topic: Optional[str] = None) -> List[Dict[str, Any]]:
+                 focus_topic: Optional[str] = None,
+                 force: bool = False) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
         1. Ingest any new messages into the store
@@ -1363,22 +1892,13 @@ class LCMEngine(ContextEngine):
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
 
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
-            reason = (
-                "auxiliary thread context"
-                if self._thread_context_stateless()
-                else "ignored session"
-                if self._session_ignored
-                else "stateless session"
+        if self._bypasses_lcm_context_management():
+            return self._compress_lcm_bypassed_session(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
             )
-            logger.debug(
-                "LCM compress bypassed for %s session %s",
-                "auxiliary" if self._thread_context_stateless() else "ignored" if self._session_ignored else "stateless",
-                self._thread_context_session_id() or self._session_id or "(unknown)",
-            )
-            self._last_compression_status = "noop"
-            self._last_compression_noop_reason = f"bypassed: {reason}"
-            return self._redact_active_replay_messages(messages)
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
@@ -1832,9 +2352,11 @@ class LCMEngine(ContextEngine):
     ) -> None:
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
+        self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
+            self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
@@ -1931,6 +2453,67 @@ class LCMEngine(ContextEngine):
     def _has_auxiliary_lineage_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_lineage_session_ids
+
+    def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
+        with self._auxiliary_session_lock:
+            if session_id not in self._lcm_bypass_lineage_session_ids:
+                return False
+            if platform is None:
+                return True
+            platforms = self._lcm_bypass_lineage_platforms.get(session_id) or set()
+            return not platforms or platform in platforms
+
+    def _mark_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> None:
+        if not session_id:
+            return
+        platform = self._session_platform if platform is None else str(platform or "")
+        with self._auxiliary_session_lock:
+            self._lcm_bypass_lineage_session_ids.add(session_id)
+            self._lcm_bypass_lineage_platforms.setdefault(session_id, set()).add(platform)
+            self._lcm_session_last_platform[session_id] = platform
+            self._lcm_session_last_bypassed[session_id] = True
+
+    def _unmark_lcm_bypass_lineage_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._auxiliary_session_lock:
+            self._lcm_bypass_lineage_session_ids.discard(session_id)
+            self._lcm_bypass_lineage_platforms.pop(session_id, None)
+
+    def _handoff_lcm_bypass_lineage(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        new_platform: str = "",
+    ) -> None:
+        with self._auxiliary_session_lock:
+            if old_session_id:
+                self._lcm_bypass_lineage_session_ids.add(old_session_id)
+            if new_session_id:
+                new_platform = str(new_platform or "")
+                self._lcm_bypass_lineage_session_ids.add(new_session_id)
+                self._lcm_bypass_lineage_platforms.setdefault(new_session_id, set()).add(new_platform)
+                self._lcm_session_last_platform[new_session_id] = new_platform
+                self._lcm_session_last_bypassed[new_session_id] = True
+
+    def _compression_boundary_from_lcm_bypassed_session(self, old_session_id: str) -> bool:
+        if not old_session_id:
+            return False
+        if old_session_id in self._lcm_session_last_bypassed:
+            return bool(self._lcm_session_last_bypassed.get(old_session_id))
+        if old_session_id == self._session_id:
+            return bool(
+                self._bypasses_lcm_context_management()
+                or self._session_id_matches_lcm_bypass_filters(
+                    old_session_id,
+                    platform=self._session_platform,
+                )
+            )
+        return bool(
+            self._has_lcm_bypass_lineage_session(old_session_id)
+            or self._session_id_matches_lcm_bypass_filters(old_session_id)
+        )
 
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
@@ -2824,6 +3407,27 @@ class LCMEngine(ContextEngine):
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self._session_id
+        self._lcm_current_start_allows_bypass_lineage = False
+        requested_platform = str(kwargs.get("platform") or self._session_platform or "")
+        if self._host_fallback_compressor is not None and (
+            self._host_fallback_session_id != session_id or requested_platform != self._session_platform
+        ):
+            compressor = self._host_fallback_compressor
+            fallback_session_id = self._host_fallback_session_id or previous_session_id
+            on_session_end = getattr(compressor, "on_session_end", None)
+            if callable(on_session_end) and fallback_session_id:
+                try:
+                    on_session_end(fallback_session_id, [])
+                except Exception:
+                    logger.debug("LCM host fallback compressor session-start reset failed", exc_info=True)
+            on_session_reset = getattr(compressor, "on_session_reset", None)
+            if callable(on_session_reset):
+                try:
+                    on_session_reset()
+                except Exception:
+                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+            self._host_fallback_compressor = None
+            self._host_fallback_session_id = ""
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
             if (
                 self._has_auxiliary_lineage_session(old_session_id)
@@ -2832,6 +3436,36 @@ class LCMEngine(ContextEngine):
                 self._handoff_auxiliary_session(old_session_id, session_id)
                 logger.info(
                     "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
+                    old_session_id,
+                    session_id,
+                )
+                return
+            if self._compression_boundary_from_lcm_bypassed_session(old_session_id):
+                self._handoff_lcm_bypass_lineage(
+                    old_session_id,
+                    session_id,
+                    new_platform=str(kwargs.get("platform") or ""),
+                )
+                self._clear_thread_context_stateless()
+                if previous_session_id and previous_session_id != session_id:
+                    self._finalize_pending_reset_boundary(previous_session_id)
+                    self._reset_session_scoped_runtime_state()
+                else:
+                    self._clear_pending_reset_boundary()
+                    self._ingest_cursor = 0
+                    self._last_compacted_store_id = 0
+                    self._last_overflow_recovery_failed = False
+                    self._last_condensation_suppressed_reason = ""
+                self._lcm_current_start_allows_bypass_lineage = True
+                self._apply_session_start_metadata(session_id, kwargs)
+                self._bind_lifecycle_state(
+                    session_id,
+                    conversation_id=kwargs.get("conversation_id"),
+                )
+                self._schedule_ingest_cursor_reconciliation()
+                self._log_session_filter_diagnostics()
+                logger.info(
+                    "LCM compression boundary %s -> %s stayed stateless because the source session bypasses LCM storage",
                     old_session_id,
                     session_id,
                 )
@@ -2867,6 +3501,351 @@ class LCMEngine(ContextEngine):
         self._schedule_ingest_cursor_reconciliation()
         self._log_session_filter_diagnostics()
 
+    def _session_end_matches_current_store_prefix(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        prefix_count = self._session_end_store_prefix_count(session_id, messages)
+        return prefix_count is not None and prefix_count > 0
+
+    def _session_end_prefix_compare_value(self, value: Any, *, session_id: str) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._session_end_prefix_compare_value(child, session_id=session_id)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                self._session_end_prefix_compare_value(child, session_id=session_id)
+                for child in value
+            ]
+        if not isinstance(value, str):
+            return value
+
+        text = restore_ingest_payload_placeholders(
+            value,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+        stripped = text.strip()
+        ingest_refs = extract_ingest_externalized_refs(stripped)
+        if (
+            len(ingest_refs) == 1
+            and stripped.startswith("[Externalized LCM ingest payload:")
+            and stripped.endswith("]")
+        ):
+            payload = load_externalized_payload(
+                ingest_refs[0],
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if payload is not None:
+                payload_session_id = str(payload.get("session_id") or "")
+                if not session_id or not payload_session_id or payload_session_id == session_id:
+                    content = payload.get("content")
+                    if isinstance(content, str):
+                        return content
+
+        if is_externalized_placeholder(stripped):
+            ref = extract_externalized_ref(stripped)
+            payload = load_externalized_payload(
+                ref or "",
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if payload is not None:
+                payload_session_id = str(payload.get("session_id") or "")
+                if not session_id or not payload_session_id or payload_session_id == session_id:
+                    content = payload.get("content")
+                    if isinstance(content, str):
+                        return content
+        return text
+
+    def _session_end_prefix_compare_content(
+        self,
+        message: Dict[str, Any],
+        *,
+        session_id: str,
+    ) -> str:
+        content = self._session_end_prefix_compare_value(
+            (message or {}).get("content"),
+            session_id=session_id,
+        )
+        content = redact_sensitive_value(
+            content,
+            self._config,
+            parse_json_strings=False,
+        )
+        return normalize_content_value(content)
+
+    def _session_end_prefix_compare_tool_calls(
+        self,
+        message: Dict[str, Any],
+        *,
+        session_id: str,
+    ) -> str:
+        tool_calls = self._session_end_prefix_compare_value(
+            (message or {}).get("tool_calls"),
+            session_id=session_id,
+        )
+        tool_calls = redact_sensitive_value(
+            tool_calls,
+            self._config,
+            parse_json_strings=True,
+        )
+        if tool_calls is None or tool_calls == [] or tool_calls == {}:
+            tool_calls = None
+        return json.dumps(
+            tool_calls,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _session_end_prefix_compare_identity(
+        self,
+        message: Dict[str, Any],
+        *,
+        session_id: str,
+    ) -> tuple[str, str, str, str, str]:
+        return (
+            str((message or {}).get("role") or ""),
+            self._session_end_prefix_compare_content(message, session_id=session_id),
+            str((message or {}).get("tool_call_id") or ""),
+            str((message or {}).get("tool_name") or ""),
+            self._session_end_prefix_compare_tool_calls(message, session_id=session_id),
+        )
+
+    def _session_end_store_prefix_count(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str | None = None,
+    ) -> Optional[int]:
+        try:
+            stored_messages = self._store.get_range(
+                session_id,
+                limit=max(1, len(messages)),
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            logger.debug("LCM session-end prefix check failed", exc_info=True)
+            return None
+        if not stored_messages:
+            return 0
+        if len(messages) < len(stored_messages):
+            return None
+        for idx, stored_msg in enumerate(stored_messages):
+            msg = messages[idx]
+            try:
+                message_identity = self._session_end_prefix_compare_identity(
+                    msg,
+                    session_id=session_id,
+                )
+                stored_identity = self._session_end_prefix_compare_identity(
+                    stored_msg,
+                    session_id=session_id,
+                )
+            except Exception:
+                logger.debug("LCM session-end prefix compare normalization failed", exc_info=True)
+                return None
+            if message_identity != stored_identity:
+                return None
+        return len(stored_messages)
+
+    @staticmethod
+    def _lcm_bypass_message_fingerprint(message: Dict[str, Any]) -> str:
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None or tool_calls == [] or tool_calls == {}:
+            tool_calls = None
+        payload = {
+            "role": message.get("role"),
+            "content": normalize_content_value(message.get("content")),
+            "tool_call_id": message.get("tool_call_id"),
+            "tool_calls": tool_calls,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
+
+    def _remember_lcm_bypass_message_prefix(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        if not session_id or not messages:
+            return
+        fingerprints = [
+            self._lcm_bypass_message_fingerprint(msg)
+            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
+        ]
+        if fingerprints:
+            remembered = self._lcm_bypass_message_prefix_fingerprints.setdefault(session_id, [])
+            truncated = len(messages) > _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT
+            retained: list[tuple[list[str], bool]] = []
+            for existing_fingerprints, existing_truncated in remembered:
+                if existing_fingerprints == fingerprints:
+                    truncated = truncated or bool(existing_truncated)
+                    continue
+                retained.append((existing_fingerprints, existing_truncated))
+            retained.append((fingerprints, truncated))
+            remembered[:] = retained
+
+    def _remember_lcm_normal_message_prefix(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
+        if not session_id or not messages:
+            return
+        fingerprints = [
+            self._lcm_bypass_message_fingerprint(msg)
+            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
+        ]
+        if fingerprints:
+            self._lcm_normal_message_prefix_fingerprints[
+                self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
+            ] = fingerprints
+
+    def _lcm_normal_prefix_key(
+        self,
+        session_id: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> tuple[str, str]:
+        return (
+            session_id,
+            str(
+                conversation_id
+                or self._lcm_session_last_normal_conversation_id.get(session_id)
+                or ""
+            ),
+        )
+
+    def _messages_match_fingerprint_prefix(
+        self,
+        fingerprints: list[str],
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        return self._matching_fingerprint_prefix_count(fingerprints, messages) > 0
+
+    def _matching_fingerprint_prefix_count(
+        self,
+        fingerprints: list[str],
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        if not fingerprints or not messages:
+            return 0
+        compare_count = min(len(fingerprints), len(messages))
+        if compare_count <= 0:
+            return 0
+        candidate = [self._lcm_bypass_message_fingerprint(msg) for msg in messages[:compare_count]]
+        if candidate == fingerprints[:compare_count]:
+            return compare_count
+        return 0
+
+    def _messages_match_lcm_bypass_prefix(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        return self._matching_lcm_bypass_prefix_count(session_id, messages) > 0
+
+    def _matching_lcm_bypass_prefix_count(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        count, _truncated = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
+        return count
+
+    def _matching_lcm_bypass_prefix_evidence(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, bool]:
+        best_count = 0
+        best_truncated = False
+        for fingerprints, truncated in self._lcm_bypass_message_prefix_fingerprints.get(session_id, []):
+            count = self._matching_fingerprint_prefix_count(fingerprints, messages)
+            count_truncated = bool(truncated and count > 0 and count == len(fingerprints))
+            if count > best_count:
+                best_count = count
+                best_truncated = count_truncated
+            elif count == best_count:
+                best_truncated = best_truncated or count_truncated
+        return best_count, best_truncated
+
+    def _messages_match_lcm_normal_prefix(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str | None = None,
+    ) -> bool:
+        return self._matching_lcm_normal_prefix_count(
+            session_id,
+            messages,
+            conversation_id=conversation_id,
+        ) > 0
+
+    def _matching_lcm_normal_prefix_count(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str | None = None,
+    ) -> int:
+        return self._matching_fingerprint_prefix_count(
+            self._lcm_normal_message_prefix_fingerprints.get(
+                self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
+            ) or [],
+            messages,
+        )
+
+    def _append_off_current_session_end_suffix(
+        self,
+        session_id: str,
+        suffix: List[Dict[str, Any]],
+        *,
+        source: str,
+        conversation_id: str,
+    ) -> list[int]:
+        if not session_id or not suffix:
+            return []
+        kept: list[Dict[str, Any]] = []
+        for msg in suffix:
+            if self._matches_ignore_message_patterns(msg):
+                self._ignored_message_count += 1
+                excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
+                logger.debug(
+                    "LCM ignore_message_patterns dropped late session-end %s message: %r",
+                    msg.get("role", "unknown"),
+                    excerpt,
+                )
+                continue
+            kept.append(msg)
+        if not kept:
+            return []
+        protected_messages = protect_messages_for_ingest(
+            kept,
+            session_id=session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        return self._store._append_protected_batch(
+            session_id,
+            protected_messages,
+            [count_message_tokens(msg) for msg in protected_messages],
+            source=source,
+            conversation_id=conversation_id,
+        )
+
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._has_auxiliary_lineage_session(session_id) and session_id != self._session_id:
             current_thread_session_id = self._thread_context_session_id()
@@ -2874,6 +3853,202 @@ class LCMEngine(ContextEngine):
                 self._auxiliary_session_ids.discard(session_id)
             if current_thread_session_id == session_id:
                 self._clear_thread_context_stateless(session_id)
+            return
+        current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
+        ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
+        if ended_session_directly_bypasses:
+            self._end_host_fallback_compressor_for_session(
+                session_id,
+                messages,
+                current_session_bypasses=current_session_bypasses,
+            )
+            return
+        same_id_has_bypass_lineage = (
+            session_id == self._session_id
+            and not current_session_bypasses
+            and self._has_lcm_bypass_lineage_session(session_id)
+        )
+        same_id_normal_prefix_count = None
+        same_id_recorded_normal_prefix_count = 0
+        same_id_bypass_prefix_count = 0
+        same_id_bypass_prefix_truncated = False
+        if same_id_has_bypass_lineage:
+            same_id_conversation_id = (
+                self._conversation_id
+                or self._lcm_session_last_normal_conversation_id.get(session_id)
+                or None
+            )
+            (
+                same_id_bypass_prefix_count,
+                same_id_bypass_prefix_truncated,
+            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
+            same_id_normal_prefix_count = self._session_end_store_prefix_count(
+                session_id,
+                messages,
+                conversation_id=same_id_conversation_id,
+            )
+            same_id_recorded_normal_prefix_count = self._matching_lcm_normal_prefix_count(
+                session_id,
+                messages,
+                conversation_id=same_id_conversation_id,
+            )
+        same_id_store_prefix_positive = (
+            same_id_normal_prefix_count is not None
+            and same_id_normal_prefix_count > 0
+        )
+        same_id_strongest_normal_prefix_count = max(
+            same_id_recorded_normal_prefix_count,
+            same_id_normal_prefix_count if same_id_store_prefix_positive else 0,
+        )
+        same_id_truncated_bypass_prefix_ambiguous = (
+            same_id_bypass_prefix_truncated
+            and same_id_bypass_prefix_count > 0
+            and same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
+            and len(messages) > same_id_bypass_prefix_count
+        )
+        same_id_matches_stronger_normal_prefix = (
+            same_id_strongest_normal_prefix_count > 0
+            and not same_id_truncated_bypass_prefix_ambiguous
+            and (
+                same_id_bypass_prefix_count <= 0
+                or same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
+            )
+        )
+        off_current_lineage = session_id != self._session_id and self._has_lcm_bypass_lineage_session(session_id)
+        off_current_normal_conversation_id = (
+            self._lcm_session_last_normal_conversation_id.get(session_id)
+            if off_current_lineage
+            else ""
+        )
+        off_current_store_prefix_count = None
+        off_current_recorded_prefix_count = 0
+        off_current_bypass_prefix_count = 0
+        off_current_bypass_prefix_truncated = False
+        if off_current_lineage:
+            (
+                off_current_bypass_prefix_count,
+                off_current_bypass_prefix_truncated,
+            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
+        if off_current_lineage and off_current_normal_conversation_id:
+            off_current_store_prefix_count = self._session_end_store_prefix_count(
+                session_id,
+                messages,
+                conversation_id=off_current_normal_conversation_id,
+            )
+            off_current_recorded_prefix_count = self._matching_lcm_normal_prefix_count(
+                session_id,
+                messages,
+                conversation_id=off_current_normal_conversation_id,
+            )
+        off_current_prefix_count = None
+        off_current_store_prefix_positive = (
+            off_current_store_prefix_count is not None
+            and off_current_store_prefix_count > 0
+        )
+        off_current_store_prefix_for_append = int(off_current_store_prefix_count or 0)
+        off_current_recorded_prefix_for_append = 0
+        if off_current_recorded_prefix_count > 0 and off_current_normal_conversation_id:
+            try:
+                stored_normal_rows = self._store.get_range(
+                    session_id,
+                    limit=off_current_recorded_prefix_count + 1,
+                    conversation_id=off_current_normal_conversation_id,
+                )
+            except Exception:
+                logger.debug("LCM off-current recorded-prefix row-count probe failed", exc_info=True)
+                stored_normal_rows = []
+            if len(stored_normal_rows) == off_current_recorded_prefix_count:
+                off_current_recorded_prefix_for_append = off_current_recorded_prefix_count
+        off_current_strongest_normal_prefix_count = max(
+            off_current_store_prefix_for_append if off_current_store_prefix_positive else 0,
+            off_current_recorded_prefix_for_append,
+        )
+        off_current_truncated_bypass_prefix_ambiguous = (
+            off_current_bypass_prefix_truncated
+            and off_current_bypass_prefix_count > 0
+            and off_current_strongest_normal_prefix_count >= off_current_bypass_prefix_count
+            and len(messages) > off_current_bypass_prefix_count
+        )
+        if (
+            off_current_store_prefix_positive
+            and not off_current_truncated_bypass_prefix_ambiguous
+            and (
+                off_current_bypass_prefix_count <= 0
+                or off_current_store_prefix_for_append > off_current_bypass_prefix_count
+            )
+        ):
+            off_current_prefix_count = off_current_store_prefix_for_append
+        elif (
+            off_current_recorded_prefix_for_append > 0
+            and not off_current_truncated_bypass_prefix_ambiguous
+            and (
+                off_current_bypass_prefix_count <= 0
+                or off_current_recorded_prefix_for_append > off_current_bypass_prefix_count
+            )
+        ):
+            off_current_prefix_count = off_current_recorded_prefix_for_append
+        if (
+            off_current_lineage
+            and off_current_normal_conversation_id
+            and off_current_store_prefix_count == 0
+            and off_current_bypass_prefix_count <= 0
+            and self._lcm_session_last_bypassed.get(session_id) is False
+        ):
+            off_current_prefix_count = 0
+        same_id_should_bypass = (
+            same_id_has_bypass_lineage
+            and same_id_bypass_prefix_count > 0
+            and not same_id_matches_stronger_normal_prefix
+        )
+        off_current_matches_bypass_prefix = (
+            session_id != self._session_id
+            and self._has_lcm_bypass_lineage_session(session_id)
+            and off_current_bypass_prefix_count > 0
+            and off_current_prefix_count is None
+        )
+        ended_lineage_bypasses = (
+            session_id != self._session_id
+            and self._has_lcm_bypass_lineage_session(session_id)
+            and bool(self._lcm_session_last_bypassed.get(session_id))
+            and not self._session_end_matches_current_store_prefix(session_id, messages)
+        )
+        off_current_should_bypass = off_current_lineage and off_current_prefix_count is None
+        if off_current_prefix_count is not None:
+            prefix_count = off_current_prefix_count
+            suffix = messages[prefix_count:]
+            if suffix:
+                self._append_off_current_session_end_suffix(
+                    session_id,
+                    suffix,
+                    source=(
+                        self._lcm_session_last_normal_platform.get(session_id)
+                        or self._lcm_session_last_platform.get(session_id, self._session_platform)
+                    ),
+                    conversation_id=off_current_normal_conversation_id,
+                )
+            try:
+                state = self._lifecycle.get_by_conversation(off_current_normal_conversation_id)
+                frontier_store_id = state.current_frontier_store_id if state is not None else 0
+                self._lifecycle.finalize_session(
+                    off_current_normal_conversation_id,
+                    session_id,
+                    frontier_store_id=frontier_store_id,
+                )
+            except Exception:
+                logger.debug("LCM off-current session-end lifecycle finalization failed", exc_info=True)
+            return
+        if (
+            current_session_bypasses
+            or same_id_should_bypass
+            or off_current_should_bypass
+            or off_current_matches_bypass_prefix
+            or ended_lineage_bypasses
+        ):
+            self._end_host_fallback_compressor_for_session(
+                session_id,
+                messages,
+                current_session_bypasses=current_session_bypasses,
+            )
             return
         try:
             with _temporary_sqlite_busy_timeout(
@@ -2938,6 +4113,16 @@ class LCMEngine(ContextEngine):
             raise
 
     def on_session_reset(self) -> None:
+        if self._host_fallback_compressor is not None:
+            compressor = self._host_fallback_compressor
+            on_session_reset = getattr(compressor, "on_session_reset", None)
+            if callable(on_session_reset):
+                try:
+                    on_session_reset()
+                except Exception:
+                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+            self._host_fallback_compressor = None
+            self._host_fallback_session_id = ""
         self._pending_reset_session_id = self._session_id
         self._pending_reset_conversation_id = self._conversation_id
         self._pending_reset_frontier_store_id = self._last_compacted_store_id
@@ -3273,11 +4458,25 @@ class LCMEngine(ContextEngine):
         )
         self._session_stateless = (
             not self._session_ignored
-            and matches_session_pattern(
-                self._session_match_keys,
-                self._compiled_stateless_session_patterns,
+            and (
+                (
+                    self._lcm_current_start_allows_bypass_lineage
+                    and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
+                )
+                or matches_session_pattern(
+                    self._session_match_keys,
+                    self._compiled_stateless_session_patterns,
+                )
             )
         )
+        if self._session_id:
+            self._lcm_session_last_platform[self._session_id] = self._session_platform
+            self._lcm_session_last_bypassed[self._session_id] = bool(self._session_ignored or self._session_stateless)
+            if not self._session_ignored and not self._session_stateless:
+                self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(self._session_platform)
+                self._lcm_session_last_normal_platform[self._session_id] = self._session_platform
+        if self._session_ignored or self._session_stateless:
+            self._mark_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
 
     def _log_session_filter_diagnostics(self) -> None:
         if not self._logged_filter_config:
