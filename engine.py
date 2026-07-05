@@ -2525,10 +2525,17 @@ class LCMEngine(ContextEngine):
             if session_id not in self._auxiliary_session_ids:
                 return 0
             active_generation = self._auxiliary_session_generations.get(session_id)
+            stack = self._thread_context_auxiliary_stack()
+            stack_marks_current_session = bool(
+                active_generation is not None
+                and caller_generation == 0
+                and stack
+                and stack[-1] == session_id
+            )
             generation_matches = (
                 caller_generation == 0
                 if active_generation is None
-                else caller_generation == active_generation
+                else caller_generation == active_generation or stack_marks_current_session
             )
             if not generation_matches:
                 return 0

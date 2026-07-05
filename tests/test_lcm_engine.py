@@ -16253,6 +16253,52 @@ class TestSessionRollover:
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("background-review-session") == 0
 
+    def test_stack_marked_auxiliary_no_arg_calls_use_generation_usage_without_caller_frame(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_stack_marked_generation.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.update_from_response(engine, {"prompt_tokens": 25})
+        assert engine._auxiliary_session_generations["background-review-session"]
+        stack = engine._thread_context_auxiliary_stack()
+        stack[:] = ["background-review-session"]
+        engine._thread_context.current_auxiliary_session_id = "background-review-session"
+        assert engine._thread_context_session_id() == "background-review-session"
+
+        calls = []
+
+        def fake_bypassed_compress(messages, *, current_tokens=None, focus_topic=None, force=False):
+            calls.append((current_tokens, focus_topic, force))
+            return list(messages)
+
+        monkeypatch.setattr(engine, "_compress_lcm_bypassed_session", fake_bypassed_compress)
+        messages = [{"role": "user", "content": "short bypass payload"}]
+
+        assert count_messages_tokens(messages) < engine.threshold_tokens
+        assert engine.should_compress()
+        assert engine.compress(messages) == messages
+        assert calls == [(25, None, False)]
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
     def test_auxiliary_handoff_accepts_new_continuation_generation(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
