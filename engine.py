@@ -5590,7 +5590,11 @@ class LCMEngine(ContextEngine):
         recovered_content: str,
         current_redacted_content: str,
     ) -> bool:
-        if not durable_content or "[LCM sensitive redaction:" not in durable_content:
+        if not durable_content:
+            return False
+        if durable_content == recovered_content:
+            return True
+        if "[LCM sensitive redaction:" not in durable_content:
             return False
         if durable_content == current_redacted_content:
             return True

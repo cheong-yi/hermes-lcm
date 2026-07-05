@@ -4776,6 +4776,60 @@ class TestIngestExternalization:
         assert identity[1] == new_result
         assert identity[1] != old_result
 
+    def test_replay_reconciles_raw_durable_payload_when_later_redaction_recovers_live_file(self, tmp_path, monkeypatch):
+        import tempfile
+        from dataclasses import replace
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+            sensitive_patterns_enabled=False,
+            sensitive_patterns=[],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = LATERSECRET1234567890 suffix " + ("raw" * 1000)
+        preview = full_result[:32]
+        assert "LATERSECRET" in preview
+        persisted_path = host_storage / "call_raw_then_redacted.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_raw_then_redacted", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_raw_then_redacted", "content": marker},
+        ]
+
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+        raw_payload = json.loads(next(output_dir.glob("*.json")).read_text())
+        assert raw_payload["content"] == full_result
+        assert "[LCM sensitive redaction:" not in raw_payload["content"]
+
+        replay = LCMEngine(
+            config=replace(
+                engine._config,
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            ),
+            hermes_home=str(tmp_path / "hermes"),
+        )
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 2
+        assert len(list(output_dir.glob("*.json"))) == 1
+
     def test_replay_identity_does_not_let_redacted_durable_payload_mask_live_retry(self, tmp_path, monkeypatch):
         import tempfile
         from hermes_lcm.engine import LCMEngine
