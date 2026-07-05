@@ -3565,6 +3565,8 @@ class LCMEngine(ContextEngine):
             self._config,
             parse_json_strings=True,
         )
+        if tool_calls is None or tool_calls == [] or tool_calls == {}:
+            tool_calls = None
         return json.dumps(
             tool_calls,
             ensure_ascii=False,
@@ -3627,11 +3629,14 @@ class LCMEngine(ContextEngine):
 
     @staticmethod
     def _lcm_bypass_message_fingerprint(message: Dict[str, Any]) -> str:
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None or tool_calls == [] or tool_calls == {}:
+            tool_calls = None
         payload = {
             "role": message.get("role"),
             "content": normalize_content_value(message.get("content")),
             "tool_call_id": message.get("tool_call_id"),
-            "tool_calls": message.get("tool_calls"),
+            "tool_calls": tool_calls,
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
@@ -3911,10 +3916,27 @@ class LCMEngine(ContextEngine):
             and off_current_store_prefix_count > 0
         )
         off_current_store_prefix_for_append = int(off_current_store_prefix_count or 0)
+        off_current_recorded_prefix_for_append = 0
+        if off_current_recorded_prefix_count > 0 and off_current_normal_conversation_id:
+            try:
+                stored_normal_rows = self._store.get_range(
+                    session_id,
+                    limit=off_current_recorded_prefix_count + 1,
+                    conversation_id=off_current_normal_conversation_id,
+                )
+            except Exception:
+                logger.debug("LCM off-current recorded-prefix row-count probe failed", exc_info=True)
+                stored_normal_rows = []
+            if len(stored_normal_rows) == off_current_recorded_prefix_count:
+                off_current_recorded_prefix_for_append = off_current_recorded_prefix_count
+        off_current_strongest_normal_prefix_count = max(
+            off_current_store_prefix_for_append if off_current_store_prefix_positive else 0,
+            off_current_recorded_prefix_for_append,
+        )
         off_current_truncated_bypass_prefix_ambiguous = (
             off_current_bypass_prefix_truncated
             and off_current_bypass_prefix_count > 0
-            and off_current_store_prefix_for_append >= off_current_bypass_prefix_count
+            and off_current_strongest_normal_prefix_count >= off_current_bypass_prefix_count
             and len(messages) > off_current_bypass_prefix_count
         )
         if (
@@ -3926,6 +3948,15 @@ class LCMEngine(ContextEngine):
             )
         ):
             off_current_prefix_count = off_current_store_prefix_for_append
+        elif (
+            off_current_recorded_prefix_for_append > 0
+            and not off_current_truncated_bypass_prefix_ambiguous
+            and (
+                off_current_bypass_prefix_count <= 0
+                or off_current_recorded_prefix_for_append > off_current_bypass_prefix_count
+            )
+        ):
+            off_current_prefix_count = off_current_recorded_prefix_for_append
         if (
             off_current_lineage
             and off_current_normal_conversation_id

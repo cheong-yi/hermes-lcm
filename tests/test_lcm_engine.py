@@ -12993,6 +12993,177 @@ class TestSessionRollover:
         finally:
             engine.shutdown()
 
+    def test_off_current_recorded_prefix_appends_when_store_normalizes_equivalent_row(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_recorded_prefix_normalized.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normalized_prefix = {
+                "role": "assistant",
+                "content": "stored row normalizes empty tool_calls",
+                "tool_calls": [],
+            }
+            normal_suffix = {"role": "user", "content": "normal suffix must append"}
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([normalized_prefix])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", [normalized_prefix, normal_suffix])
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "stored row normalizes empty tool_calls",
+                "normal suffix must append",
+            ]
+            assert all(row["conversation_id"] != "bypass-conversation" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_store_prefix_appends_normalized_empty_tool_calls_beyond_recorded_limit(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_long_normalized_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normal_prefix = [
+                {
+                    "role": "assistant",
+                    "content": "long prefix stores empty tool_calls as NULL",
+                    "tool_calls": [],
+                },
+                *(
+                    {"role": "user", "content": f"long normalized prefix {idx}"}
+                    for idx in range(8)
+                ),
+            ]
+            normal_suffix = {"role": "assistant", "content": "long normalized suffix must append"}
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(normal_prefix)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", [*normal_prefix, normal_suffix])
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "long prefix stores empty tool_calls as NULL",
+                *(f"long normalized prefix {idx}" for idx in range(8)),
+                "long normalized suffix must append",
+            ]
+            assert normal_rows[0]["tool_calls"] is None
+            assert all(row["conversation_id"] != "bypass-conversation" for row in rows)
+        finally:
+            engine.shutdown()
+
+    @pytest.mark.parametrize("bypass_tool_calls", [[], {}])
+    def test_off_current_empty_tool_calls_bypass_tie_does_not_append_suffix(
+        self,
+        tmp_path,
+        bypass_tool_calls,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_empty_tool_calls_bypass_tie.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            bypass_prefix = {
+                "role": "assistant",
+                "content": "shared empty tool_calls opener",
+                "tool_calls": bypass_tool_calls,
+            }
+            normal_prefix = {
+                "role": "assistant",
+                "content": "shared empty tool_calls opener",
+            }
+            late_bypass_end = [
+                {
+                    "role": "assistant",
+                    "content": "shared empty tool_calls opener",
+                },
+                {
+                    "role": "assistant",
+                    "content": "empty tool_calls bypass suffix must not append",
+                },
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([bypass_prefix])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([normal_prefix])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == ["shared empty tool_calls opener"]
+            assert normal_rows[0]["tool_calls"] is None
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "empty tool_calls bypass suffix must not append"
+                for row in rows
+            )
+        finally:
+            engine.shutdown()
+
     def test_off_current_truncated_bypass_prefix_does_not_append_ambiguous_suffix(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_off_current_truncated_bypass_prefix.db"),
