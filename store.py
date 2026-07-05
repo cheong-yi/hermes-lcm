@@ -729,6 +729,105 @@ class MessageStore:
             return None, None
         return row[0], row[1]
 
+    # -- Metadata key/value JSON --------------------------------------------
+
+    def read_metadata_json(self, key: str) -> Any:
+        """Return the JSON-decoded value stored under ``key`` in the metadata table.
+
+        Returns ``None`` when the connection is closed, the key is absent, or the
+        stored value is empty. JSON decoding is deliberately *not* wrapped: a
+        malformed value raises, so callers keep the ``try``/``except`` scoping
+        that decides whether one bad key aborts a multi-key load or is skipped.
+        Reads are unlocked, matching the store's other read paths (``_write_lock``
+        guards writes only).
+        """
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(str(row[0]))
+
+    def write_metadata_json(
+        self,
+        keys: list[str],
+        serialized: str,
+        *,
+        skip_unchanged: bool = False,
+    ) -> bool:
+        """Write the pre-serialized JSON string ``serialized`` to every key in ``keys``.
+
+        Serialization stays with the caller so it keeps control of ``sort_keys``
+        and payload shape. Runs under the store write lock and issues at most one
+        commit. With ``skip_unchanged=True`` a key already holding ``serialized``
+        is left untouched and the commit is skipped entirely when nothing changed
+        -- the ingest-hot-path optimization used by the placeholder count/ordinal
+        writers. Returns ``True`` if any key was written.
+        """
+        conn = self._conn
+        if conn is None:
+            return False
+        wrote = False
+        with self._write_lock:
+            for key in keys:
+                if skip_unchanged:
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?", (key,)
+                    ).fetchone()
+                    if existing is not None and existing[0] == serialized:
+                        continue
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                wrote = True
+            if wrote:
+                conn.commit()
+        return wrote
+
+    # -- Compaction telemetry ------------------------------------------------
+
+    @staticmethod
+    def _compaction_telemetry_key(conversation_id: str) -> str:
+        return f"compaction_telemetry:{conversation_id}"
+
+    def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Return the persisted per-conversation compaction-telemetry record, or None.
+
+        Best-effort: a closed connection, missing/empty row, or malformed JSON all
+        yield None. Telemetry is diagnostic and must never block a turn. Reads are
+        unlocked, matching the store's other read paths.
+        """
+        if not conversation_id:
+            return None
+        try:
+            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
+        """Upsert the per-conversation compaction-telemetry record.
+
+        Stored as a single JSON row in the existing metadata table (no dedicated
+        schema, no version bump) under the store write lock. The write -- and its
+        commit -- is skipped when the serialized payload is unchanged so idle
+        turns do not churn the row.
+        """
+        if not conversation_id:
+            return
+        serialized = json.dumps(record, sort_keys=True)
+        key = self._compaction_telemetry_key(conversation_id)
+        self.write_metadata_json([key], serialized, skip_unchanged=True)
+
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
@@ -908,16 +1007,16 @@ class MessageStore:
         collapse_risky_repeats = contains_risky_fts_ascii(query)
         order_by = ""
         order_args: list[Any] = []
+        role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
+
+        def count_expr(term: str) -> tuple[str, list[Any]]:
+            return (
+                "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
+                "/ NULLIF(LENGTH(?), 0))",
+                [term, term],
+            )
+
         if normalized_sort == "recency":
-            role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
-
-            def count_expr(term: str) -> tuple[str, list[Any]]:
-                return (
-                    "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
-                    "/ NULLIF(LENGTH(?), 0))",
-                    [term, term],
-                )
-
             score_exprs: list[str] = []
             for term in terms:
                 if collapse_risky_repeats:
@@ -1042,14 +1141,56 @@ class MessageStore:
                         offset += len(tie_rows)
                     break
         else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                    FROM messages
-                    WHERE {' AND '.join(where)}
-                    LIMIT ?""",
-                [*base_args, fetch_limit],
-            ).fetchall()
-            add_rows(rows)
+            # Deterministic relevance/hybrid candidate scan for LIKE fallback.
+            # Apply the same coarse score/directness ordering before the hard
+            # candidate cap that Python uses below; otherwise a recent-biased
+            # window can exclude older but materially better relevance matches.
+            score_exprs: list[str] = []
+            order_args = []
+            for term in terms:
+                if collapse_risky_repeats:
+                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    order_args.append(f"%{escape_like(term)}%")
+                else:
+                    expr, expr_args = count_expr(term)
+                    score_exprs.append(expr)
+                    order_args.extend(expr_args)
+            score_expr = " + ".join(score_exprs) if score_exprs else "0"
+            exact_query = (query or "").strip()
+            exact_expr = "CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END" if exact_query else "0"
+            exact_args: list[Any] = [exact_query] if exact_query else []
+            directness_expr = "0.0 + 0"
+
+            if normalized_sort == "hybrid":
+                primary_expr = (
+                    f"(({score_expr}) / (1 + (MAX(0.0, "
+                    f"((strftime('%s','now') - timestamp) / 3600.0)) * {AGE_DECAY_RATE})))"
+                )
+            else:
+                primary_expr = f"({score_expr})"
+
+            order_by = (
+                f"ORDER BY {primary_expr} DESC, ({exact_expr}) DESC, ({directness_expr}) DESC, "
+                f"{role_bias} ASC, timestamp DESC, store_id DESC"
+            )
+            candidate_cap = compute_search_candidate_cap(limit)
+            offset = 0
+            while offset < candidate_cap:
+                batch_limit = min(fetch_limit, candidate_cap - offset)
+                rows = self._conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                        FROM messages
+                        WHERE {' AND '.join(where)}
+                        {order_by}
+                        LIMIT ? OFFSET ?""",
+                    [*base_args, *order_args, *exact_args, batch_limit, offset],
+                ).fetchall()
+                if not rows:
+                    break
+                add_rows(rows)
+                offset += len(rows)
+                if len(rows) < batch_limit:
+                    break
 
         results.sort(key=lambda result: _fallback_result_sort_key(result, sort))
         for result in results:

@@ -34,6 +34,7 @@ from .escalation import (
 )
 from .externalize import (
     build_transcript_gc_placeholder,
+    externalized_tool_result_has_persisted_output_marker,
     extract_externalized_ref,
     find_externalized_payload_for_message,
     find_externalized_tool_result_content_for_call,
@@ -48,9 +49,16 @@ from .extraction import (
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
+    _add_inline_persisted_output_generation_metadata,
+    _add_inline_persisted_output_identity_metadata,
     _expected_persisted_output_chars,
+    _has_inline_persisted_output_generation_metadata,
+    _has_lossy_sensitive_redaction,
+    _inline_persisted_output_generation_metadata,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
+    _persisted_output_inline_preview_sha256,
+    _persisted_output_marker_identity_digest,
     _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     assistant_output_quarantine_reason,
@@ -60,6 +68,7 @@ from .ingest_protection import (
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
     recover_hermes_persisted_output,
+    recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
@@ -476,6 +485,13 @@ class LCMEngine(ContextEngine):
             self._config.ignore_message_patterns
         )
         self._ignored_message_count: int = 0
+        # Raw messages permanently dropped because they matched
+        # ignore_message_patterns. These are NOT persisted anywhere, so an
+        # over-broad operator pattern silently discards substantive turns from
+        # the "lossless" store. Count + log them so the loss is at least
+        # visible; full lossless retention (store with ignored=1) is a larger
+        # follow-up that touches cursor reconciliation and FTS.
+        self._ignore_pattern_dropped_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -525,6 +541,8 @@ class LCMEngine(ContextEngine):
         self.last_reasoning_tokens = 0
         self.cache_metrics_available = False
         self.compression_count = 0
+        # Wall-clock of the last leaf compaction (ms); surfaced via telemetry only.
+        self._last_compaction_duration_ms = 0.0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
         self.protect_last_n = self._config.fresh_tail_count
@@ -554,6 +572,16 @@ class LCMEngine(ContextEngine):
         self._last_condensation_suppressed_reason = ""
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        # Ingest-failure tracking. The core promise is that nothing is ever
+        # lost, but a swallowed persistence error (disk full, DB locked,
+        # corruption) silently breaks it: the turn continues while messages
+        # exist only in the volatile host list. Surface it instead of hiding
+        # it in a debug log so get_status()/doctor can escalate. Store-scoped,
+        # not session-scoped, so it is not cleared on session reset.
+        self._ingest_failure_count = 0
+        self._consecutive_ingest_failures = 0
+        self._last_ingest_error = ""
+        self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
@@ -577,6 +605,14 @@ class LCMEngine(ContextEngine):
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
+        self._auxiliary_last_prompt_tokens: dict[str, int] = {}
+        self._auxiliary_session_generations: dict[str, int] = {}
+        self._auxiliary_generation_tokens: dict[int, tuple[Any, int]] = {}
+        self._auxiliary_next_generation_token = 0
+        self._auxiliary_direct_end_guard_session_ids: set[str] = set()
+        self._auxiliary_handoff_parent_session_ids: dict[str, str] = {}
+        self._auxiliary_retired_session_generations: dict[str, set[int]] = {}
+        self._auxiliary_foreground_reused_session_ids: set[str] = set()
         self._lcm_bypass_lineage_session_ids: set[str] = set()
         self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
         self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
@@ -704,6 +740,14 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
+            self._auxiliary_last_prompt_tokens.clear()
+            self._auxiliary_session_generations.clear()
+            self._auxiliary_generation_tokens.clear()
+            self._auxiliary_next_generation_token = 0
+            self._auxiliary_direct_end_guard_session_ids.clear()
+            self._auxiliary_handoff_parent_session_ids.clear()
+            self._auxiliary_retired_session_generations.clear()
+            self._auxiliary_foreground_reused_session_ids.clear()
             self._lcm_bypass_lineage_session_ids.clear()
             self._lcm_bypass_lineage_platforms.clear()
             self._lcm_non_bypass_platforms.clear()
@@ -973,6 +1017,53 @@ class LCMEngine(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         if self._thread_context_stateless():
+            auxiliary_session_id = self._thread_context_session_id()
+            if auxiliary_session_id:
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                caller_generation = self._in_process_auxiliary_caller_generation(
+                    auxiliary_session_id
+                )
+                with self._auxiliary_session_lock:
+                    if auxiliary_session_id not in self._auxiliary_session_ids:
+                        return
+                    if self._auxiliary_generation_is_retired(
+                        auxiliary_session_id,
+                        caller_generation,
+                    ):
+                        return
+                    active_generation = self._auxiliary_session_generations.get(
+                        auxiliary_session_id
+                    )
+                    if active_generation is None and caller_generation:
+                        expected_parent = self._auxiliary_handoff_parent_session_ids.get(
+                            auxiliary_session_id
+                        )
+                        if expected_parent and self._in_process_parent_session_id(
+                            {},
+                            session_id=auxiliary_session_id,
+                            include_explicit=False,
+                        ) != expected_parent:
+                            return
+                        if auxiliary_session_id in self._auxiliary_last_prompt_tokens:
+                            self._auxiliary_direct_end_guard_session_ids.add(
+                                auxiliary_session_id
+                            )
+                        self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
+                        self._auxiliary_session_generations[
+                            auxiliary_session_id
+                        ] = caller_generation
+                        self._auxiliary_handoff_parent_session_ids.pop(
+                            auxiliary_session_id,
+                            None,
+                        )
+                        active_generation = caller_generation
+                    generation_matches = (
+                        caller_generation == 0
+                        if active_generation is None
+                        else caller_generation == active_generation
+                    )
+                    if generation_matches:
+                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
             return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
@@ -987,12 +1078,97 @@ class LCMEngine(ContextEngine):
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        self._record_turn_compaction_telemetry()
 
     @property
     def cache_read_ratio(self) -> float:
         if self.last_prompt_tokens <= 0:
             return 0.0
         return self.last_cache_read_tokens / self.last_prompt_tokens
+
+    def _record_turn_compaction_telemetry(self) -> None:
+        """Persist a per-conversation compaction-telemetry snapshot for this turn.
+
+        Best-effort and diagnostic only: any failure is logged at debug and never
+        affects the turn. Turns with no token or cache signal are skipped so idle
+        turns do not churn the record. The since-compaction accumulators reset off
+        the monotonic ``compression_count`` (which also drops to 0 on a session
+        reset) rather than instrumenting the compaction hot path.
+        """
+        conversation_id = self._conversation_id
+        if not conversation_id:
+            return
+        prompt_tokens = self.last_prompt_tokens
+        cache_read = self.last_cache_read_tokens
+        cache_write = self.last_cache_write_tokens
+        if (
+            prompt_tokens <= 0
+            and cache_read <= 0
+            and cache_write <= 0
+            and not self.cache_metrics_available
+        ):
+            return
+        try:
+            existing = self._store.read_compaction_telemetry(conversation_id) or {}
+
+            if cache_read > 0 or cache_write > 0:
+                cache_state = "hot"
+            elif self.cache_metrics_available:
+                cache_state = "cold"
+            else:
+                cache_state = "unknown"
+            cold_streak = int(existing.get("consecutive_cold_observations", 0) or 0)
+            if cache_state == "hot":
+                cold_streak = 0
+            elif cache_state == "cold":
+                cold_streak += 1
+
+            prev_count = int(existing.get("compression_count_at_record", 0) or 0)
+            compacted = self.compression_count > prev_count
+            rebaselined = self.compression_count != prev_count  # compaction or session reset
+            if rebaselined:
+                turns_since = 0
+                peak_tokens_since = prompt_tokens
+            else:
+                turns_since = int(existing.get("turns_since_leaf_compaction", 0) or 0) + 1
+                peak_tokens_since = max(
+                    int(existing.get("peak_prompt_tokens_since_leaf_compaction", 0) or 0),
+                    prompt_tokens,
+                )
+            total_compactions = int(existing.get("total_compactions", 0) or 0)
+            if compacted:
+                total_compactions += self.compression_count - prev_count
+                last_leaf_compaction_at = time.time()
+                last_compaction_duration_ms = round(self._last_compaction_duration_ms, 3)
+            else:
+                last_leaf_compaction_at = existing.get("last_leaf_compaction_at")
+                last_compaction_duration_ms = existing.get("last_compaction_duration_ms")
+
+            record = dict(existing)
+            record.update({
+                "conversation_id": conversation_id,
+                "last_observed_prompt_tokens": prompt_tokens,
+                "last_observed_cache_read": cache_read,
+                "last_observed_cache_write": cache_write,
+                "cache_state": cache_state,
+                "consecutive_cold_observations": cold_streak,
+                "turns_since_leaf_compaction": turns_since,
+                "peak_prompt_tokens_since_leaf_compaction": peak_tokens_since,
+                # Reserved carry-forward field; no live 'medium'/'high' computation yet.
+                "activity_band": existing.get("activity_band", "low"),
+                "provider": self.provider or existing.get("provider"),
+                "model": self.model or existing.get("model"),
+                "last_api_call_at": time.time(),
+                "last_leaf_compaction_at": last_leaf_compaction_at,
+                "last_compaction_duration_ms": last_compaction_duration_ms,
+                "total_compactions": total_compactions,
+                "compression_count_at_record": self.compression_count,
+            })
+            if cache_state == "hot":
+                record["last_cache_hit_at"] = time.time()
+            self._store.write_compaction_telemetry(conversation_id, record)
+        except Exception:
+            logger.debug("LCM compaction telemetry update failed", exc_info=True)
 
     def _compression_boundary_cooldown_active(self) -> bool:
         """Return true while a boundary skip is in its short no-compress window."""
@@ -1008,6 +1184,31 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
         return False
 
+    def _record_ingest_success(self) -> None:
+        self._consecutive_ingest_failures = 0
+
+    def _record_ingest_failure(self, where: str, error: Exception) -> None:
+        """Track a swallowed ingest error so it is operator-visible.
+
+        Escalates to error level once failures are consecutive: a single
+        transient lock is a warning, but a sustained inability to persist
+        means the lossless guarantee is broken and must not stay hidden.
+        """
+        self._ingest_failure_count += 1
+        self._consecutive_ingest_failures += 1
+        self._last_ingest_error = f"{type(error).__name__}: {error}"
+        self._last_ingest_error_time = time.time()
+        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]"
+        args = (
+            where,
+            error,
+            self._consecutive_ingest_failures,
+            self._ingest_failure_count,
+        )
+        if self._consecutive_ingest_failures >= 3:
+            logger.error(message, *args)
+        else:
+            logger.warning(message, *args)
     def _bypasses_lcm_context_management(self) -> bool:
         """Return True when this binding must not write/manage LCM state.
 
@@ -1508,18 +1709,26 @@ class LCMEngine(ContextEngine):
                     conversation_id=self._conversation_id,
                 )
                 self._ingest_messages(messages)
+                self._record_ingest_success()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
                 )
             except Exception as e:
-                logger.warning("Ingest during per-turn ingest(): %s", e)
+                self._record_ingest_failure("per-turn ingest()", e)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
                 return False
-            tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+            if prompt_tokens is not None:
+                tokens = prompt_tokens
+            else:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    tokens = self._current_auxiliary_prompt_tokens(auxiliary_session_id)
+                else:
+                    tokens = self.last_prompt_tokens
             if self._should_force_overflow_recovery(observed_tokens=tokens):
                 return True
             if self.threshold_tokens <= 0:
@@ -1566,8 +1775,18 @@ class LCMEngine(ContextEngine):
         if self._session_id and messages:
             try:
                 replay_messages = self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during preflight: %s", e)
+                # Fail closed for NORMAL threshold compaction: the store did not
+                # accept this turn, so do not compact against a store missing the
+                # latest messages - that could rebuild active context without
+                # them. But still honor emergency overflow recovery, whose whole
+                # job is to keep the prompt under the provider limit; it converges
+                # via deterministic L3 truncation without needing the store write.
+                self._record_ingest_failure("preflight", e)
+                if self._should_force_overflow_recovery(observed_tokens=rough):
+                    return True
+                return False
         if replay_messages is not None and replay_messages != messages:
             if self._compression_boundary_cooldown_active():
                 return False
@@ -1891,11 +2110,21 @@ class LCMEngine(ContextEngine):
 
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
+        _compress_started = time.perf_counter()
 
         if self._bypasses_lcm_context_management():
+            bypass_current_tokens = current_tokens
+            if bypass_current_tokens is None:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    auxiliary_prompt_tokens = self._current_auxiliary_prompt_tokens(
+                        auxiliary_session_id
+                    )
+                    if auxiliary_prompt_tokens > 0:
+                        bypass_current_tokens = auxiliary_prompt_tokens
             return self._compress_lcm_bypassed_session(
                 messages,
-                current_tokens=current_tokens,
+                current_tokens=bypass_current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
@@ -2299,6 +2528,10 @@ class LCMEngine(ContextEngine):
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
+        self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+        logger.info(
+            "LCM leaf compaction finished in %.1fms", self._last_compaction_duration_ms
+        )
         self._last_compression_status = "compacted"
         self._last_compression_noop_reason = ""
         if recovery_assembly_cap is None:
@@ -2438,6 +2671,30 @@ class LCMEngine(ContextEngine):
             return stack[-1]
         return ""
 
+    def _current_auxiliary_prompt_tokens(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        caller_generation = self._in_process_auxiliary_caller_generation(session_id)
+        with self._auxiliary_session_lock:
+            if session_id not in self._auxiliary_session_ids:
+                return 0
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            stack = self._thread_context_auxiliary_stack()
+            stack_marks_current_session = bool(
+                active_generation is not None
+                and caller_generation == 0
+                and stack
+                and stack[-1] == session_id
+            )
+            generation_matches = (
+                caller_generation == 0
+                if active_generation is None
+                else caller_generation == active_generation or stack_marks_current_session
+            )
+            if not generation_matches:
+                return 0
+            return self._auxiliary_last_prompt_tokens.get(session_id, 0)
+
     def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
@@ -2450,9 +2707,19 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             return set(self._auxiliary_lineage_session_ids)
 
+    def _known_auxiliary_parent_lineage_session_ids(self) -> set[str]:
+        with self._auxiliary_session_lock:
+            return set(self._auxiliary_lineage_session_ids) - set(
+                self._auxiliary_foreground_reused_session_ids
+            )
+
     def _has_auxiliary_lineage_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_lineage_session_ids
+
+    def _auxiliary_lineage_suppressed_as_foreground(self, session_id: str) -> bool:
+        with self._auxiliary_session_lock:
+            return session_id in self._auxiliary_foreground_reused_session_ids
 
     def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
         with self._auxiliary_session_lock:
@@ -2518,19 +2785,120 @@ class LCMEngine(ContextEngine):
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
 
-    def _register_auxiliary_session(self, session_id: str) -> None:
+    def _register_auxiliary_session(
+        self,
+        session_id: str,
+        *,
+        preserve_foreground_reuse_marker: bool = False,
+    ) -> bool:
+        generation = self._in_process_auxiliary_caller_generation(session_id)
         with self._auxiliary_session_lock:
+            previous_generation = self._auxiliary_session_generations.get(session_id)
+            had_active_session = session_id in self._auxiliary_session_ids
+            if generation and self._auxiliary_generation_is_retired(session_id, generation):
+                if previous_generation is not None and previous_generation != generation:
+                    return False
+                if had_active_session and previous_generation is None:
+                    return False
+                generation = self._in_process_auxiliary_caller_generation(
+                    session_id,
+                    refresh_retired=True,
+                )
+            had_cached_usage = session_id in self._auxiliary_last_prompt_tokens
             self._auxiliary_session_ids.add(session_id)
             self._auxiliary_lineage_session_ids.add(session_id)
+            if not preserve_foreground_reuse_marker:
+                self._auxiliary_foreground_reused_session_ids.discard(session_id)
+            if generation:
+                if previous_generation != generation:
+                    if previous_generation is not None:
+                        self._retire_auxiliary_generation(session_id, previous_generation)
+                    if (
+                        had_active_session
+                        or had_cached_usage
+                        or previous_generation is not None
+                    ):
+                        self._auxiliary_direct_end_guard_session_ids.add(session_id)
+                    self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations[session_id] = generation
+                self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            else:
+                if previous_generation is not None:
+                    self._retire_auxiliary_generation(session_id, previous_generation)
+                self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations.pop(session_id, None)
+                self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+                self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            return True
 
-    def _deactivate_auxiliary_session(self, session_id: str) -> None:
-        if not session_id:
-            return
+    def _retire_auxiliary_generation(self, session_id: str, generation: int | None) -> None:
+        if session_id and generation:
+            self._auxiliary_retired_session_generations.setdefault(session_id, set()).add(generation)
+
+    def _drop_auxiliary_generation_token(
+        self,
+        object_id: int,
+        token: int,
+        token_ref: weakref.ReferenceType[Any],
+    ) -> None:
         with self._auxiliary_session_lock:
-            self._auxiliary_session_ids.discard(session_id)
+            existing = self._auxiliary_generation_tokens.get(object_id)
+            if existing is not None and existing == (token_ref, token):
+                self._auxiliary_generation_tokens.pop(object_id, None)
 
-    def _mark_thread_context_stateless(self, session_id: str) -> None:
-        self._register_auxiliary_session(session_id)
+    def _auxiliary_generation_is_retired(self, session_id: str, generation: int) -> bool:
+        return bool(generation) and generation in self._auxiliary_retired_session_generations.get(
+            session_id,
+            set(),
+        )
+
+    def _deactivate_auxiliary_session(self, session_id: str, *, generation: int = 0) -> bool:
+        if not session_id:
+            return False
+        with self._auxiliary_session_lock:
+            if self._auxiliary_generation_is_retired(session_id, generation):
+                return False
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            if active_generation is None:
+                expected_parent = self._auxiliary_handoff_parent_session_ids.get(session_id)
+                caller_parent = self._in_process_parent_session_id(
+                    {},
+                    session_id=session_id,
+                    include_explicit=False,
+                )
+                if session_id in self._auxiliary_direct_end_guard_session_ids:
+                    has_usage = session_id in self._auxiliary_last_prompt_tokens
+                    if not generation and not has_usage:
+                        return False
+                    if expected_parent and caller_parent and caller_parent != expected_parent:
+                        return False
+            elif generation != active_generation:
+                expected_parent = self._auxiliary_handoff_parent_session_ids.get(session_id)
+                has_cached_usage = session_id in self._auxiliary_last_prompt_tokens
+                if generation != 0 or (
+                    session_id in self._auxiliary_direct_end_guard_session_ids
+                    and not (expected_parent and has_cached_usage)
+                ):
+                    return False
+            self._auxiliary_session_ids.discard(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
+            self._retire_auxiliary_generation(session_id, active_generation or generation)
+            self._auxiliary_session_generations.pop(session_id, None)
+            self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+            self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
+            return True
+
+    def _mark_thread_context_stateless(
+        self,
+        session_id: str,
+        *,
+        preserve_foreground_reuse_marker: bool = False,
+    ) -> None:
+        if not self._register_auxiliary_session(
+            session_id,
+            preserve_foreground_reuse_marker=preserve_foreground_reuse_marker,
+        ):
+            return
         stack = self._thread_context_auxiliary_stack()
         stack[:] = [existing for existing in stack if existing != session_id]
         stack.append(session_id)
@@ -2544,13 +2912,91 @@ class LCMEngine(ContextEngine):
             stack.clear()
         self._sync_thread_context_current_auxiliary()
 
-    def _handoff_auxiliary_session(self, old_session_id: str, new_session_id: str) -> None:
+    def _handoff_auxiliary_session(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        preserve_old_session: bool = False,
+        preserve_old_foreground_marker: bool = False,
+    ) -> None:
+        generation = self._in_process_auxiliary_caller_generation(new_session_id)
+        stack = self._thread_context_auxiliary_stack()
+        handoff_from_active_thread_marker = old_session_id in stack
         with self._auxiliary_session_lock:
             if old_session_id:
-                self._auxiliary_session_ids.discard(old_session_id)
+                if not preserve_old_session:
+                    self._auxiliary_last_prompt_tokens.pop(old_session_id, None)
+                    self._retire_auxiliary_generation(
+                        old_session_id,
+                        self._auxiliary_session_generations.get(old_session_id),
+                    )
+                    self._auxiliary_session_generations.pop(old_session_id, None)
+                    self._auxiliary_direct_end_guard_session_ids.discard(old_session_id)
+                    self._auxiliary_handoff_parent_session_ids.pop(old_session_id, None)
+                    self._auxiliary_session_ids.discard(old_session_id)
                 self._auxiliary_lineage_session_ids.add(old_session_id)
             if new_session_id:
-                self._auxiliary_session_ids.add(new_session_id)
+                previous_new_generation = self._auxiliary_session_generations.get(new_session_id)
+                had_new_runtime_state = (
+                    new_session_id in self._auxiliary_session_ids
+                    or new_session_id in self._auxiliary_last_prompt_tokens
+                    or previous_new_generation is not None
+                    or new_session_id in self._auxiliary_direct_end_guard_session_ids
+                )
+                had_new_session_state = (
+                    had_new_runtime_state
+                    or new_session_id in self._auxiliary_lineage_session_ids
+                )
+                had_direct_end_guard = new_session_id in self._auxiliary_direct_end_guard_session_ids
+                new_generation_replaces_old = (
+                    previous_new_generation is not None
+                    and (
+                        (bool(generation) and previous_new_generation != generation)
+                        or (not generation and had_direct_end_guard)
+                    )
+                )
+                if had_new_session_state and new_generation_replaces_old:
+                    self._retire_auxiliary_generation(new_session_id, previous_new_generation)
+                boundary_from_live_new_generation = bool(generation) and previous_new_generation == generation
+                preserve_new_foreground_marker = (
+                    new_session_id in self._auxiliary_foreground_reused_session_ids
+                    and not boundary_from_live_new_generation
+                )
+                if not preserve_new_foreground_marker:
+                    self._auxiliary_last_prompt_tokens.pop(new_session_id, None)
+                    self._auxiliary_direct_end_guard_session_ids.discard(new_session_id)
+                    if had_new_session_state and (
+                        new_generation_replaces_old
+                        or had_direct_end_guard
+                        or (bool(generation) and previous_new_generation is None and had_new_runtime_state)
+                        or (
+                            previous_new_generation is None
+                            and not generation
+                            and new_session_id in self._auxiliary_lineage_session_ids
+                            and (
+                                handoff_from_active_thread_marker
+                                or (
+                                    old_session_id
+                                    and had_new_runtime_state
+                                    and (
+                                        old_session_id in self._auxiliary_lineage_session_ids
+                                        or old_session_id in self._auxiliary_session_ids
+                                    )
+                                )
+                            )
+                        )
+                    ):
+                        self._auxiliary_direct_end_guard_session_ids.add(new_session_id)
+                        if old_session_id:
+                            self._auxiliary_handoff_parent_session_ids[new_session_id] = old_session_id
+                    self._auxiliary_session_ids.add(new_session_id)
+                    self._auxiliary_foreground_reused_session_ids.discard(new_session_id)
+                    if generation:
+                        self._auxiliary_session_generations[new_session_id] = generation
+                        self._auxiliary_handoff_parent_session_ids.pop(new_session_id, None)
+                    elif previous_new_generation is None or new_generation_replaces_old:
+                        self._auxiliary_session_generations.pop(new_session_id, None)
                 self._auxiliary_lineage_session_ids.add(new_session_id)
         stack = self._thread_context_auxiliary_stack()
         had_thread_marker = old_session_id in stack or new_session_id in stack
@@ -2563,9 +3009,23 @@ class LCMEngine(ContextEngine):
             stack.append(new_session_id)
         self._sync_thread_context_current_auxiliary()
 
-    def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
+    def _unmark_thread_context_auxiliary_session(
+        self,
+        session_id: str,
+        *,
+        suppress_as_foreground_reuse: bool = True,
+    ) -> None:
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.discard(session_id)
+            if suppress_as_foreground_reuse and session_id in self._auxiliary_lineage_session_ids:
+                self._auxiliary_foreground_reused_session_ids.add(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
+            self._retire_auxiliary_generation(
+                session_id,
+                self._auxiliary_session_generations.pop(session_id, None),
+            )
+            self._auxiliary_direct_end_guard_session_ids.discard(session_id)
+            self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
         self._clear_thread_context_stateless(session_id)
 
     def _get_allowed_hermes_base(self) -> Path | None:
@@ -2619,6 +3079,74 @@ class LCMEngine(ContextEngine):
         if getattr(caller_self, "ephemeral_system_prompt", None) and log_prefix.startswith("[subagent-"):
             return True
         return False
+
+    def _auxiliary_generation_token_for(self, caller_self: object, *, force_new: bool = False) -> int:
+        """Return a process-local, non-reusable token for an auxiliary frame.
+
+        ``id(obj)`` can be reused after GC, which makes retired-generation
+        checks incorrectly reject later live frames. Key by id for lookup speed,
+        but verify object identity with ``is`` before reusing a token. Weak refs
+        avoid retaining ordinary frames; objects that cannot be weak-referenced
+        are held strongly so their id cannot be recycled while the token remains
+        live in this engine runtime.
+        """
+        with self._auxiliary_session_lock:
+            object_id = id(caller_self)
+            existing = self._auxiliary_generation_tokens.get(object_id)
+            if existing is not None and not force_new:
+                existing_ref, token = existing
+                if isinstance(existing_ref, weakref.ReferenceType):
+                    existing_obj = existing_ref()
+                else:
+                    existing_obj = existing_ref
+                if existing_obj is caller_self:
+                    return token
+
+            self._auxiliary_next_generation_token += 1
+            token = self._auxiliary_next_generation_token
+            try:
+                token_ref: Any = weakref.ref(
+                    caller_self,
+                    lambda ref, object_id=object_id, token=token: self._drop_auxiliary_generation_token(
+                        object_id,
+                        token,
+                        ref,
+                    ),
+                )
+            except TypeError:
+                token_ref = caller_self
+            self._auxiliary_generation_tokens[object_id] = (token_ref, token)
+            return token
+
+    def _in_process_auxiliary_caller_generation(
+        self,
+        session_id: str,
+        *,
+        refresh_retired: bool = False,
+    ) -> int:
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame is not None else None
+            for _ in range(32):
+                if frame is None:
+                    return 0
+                caller_self = frame.f_locals.get("self")
+                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                    frame = frame.f_back
+                    continue
+                caller_session = str(getattr(caller_self, "session_id", "") or "")
+                if not session_id or caller_session == session_id:
+                    token = self._auxiliary_generation_token_for(caller_self)
+                    if refresh_retired and self._auxiliary_generation_is_retired(
+                        session_id,
+                        token,
+                    ):
+                        token = self._auxiliary_generation_token_for(caller_self, force_new=True)
+                    return token
+                frame = frame.f_back
+        finally:
+            del frame
+        return 0
 
     def _in_process_parent_session_id(
         self,
@@ -2698,6 +3226,7 @@ class LCMEngine(ContextEngine):
         if not session_id or session_id == parent_session_id:
             return False
         known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        known_auxiliary_parent_ids = self._known_auxiliary_parent_lineage_session_ids()
         explicit_parent_id = str(kwargs.get("parent_session_id") or "")
         in_process_parent_id = self._in_process_parent_session_id(
             kwargs,
@@ -2712,7 +3241,12 @@ class LCMEngine(ContextEngine):
         if explicit_parent_id:
             if self._thread_context_has_auxiliary_session(explicit_parent_id):
                 return True
-            if explicit_parent_id in known_auxiliary_ids and explicit_parent_id != self._session_id:
+            if explicit_parent_id in known_auxiliary_parent_ids and explicit_parent_id != self._session_id:
+                return True
+            if (
+                explicit_parent_id in known_auxiliary_ids
+                and self._lcm_session_last_bypassed.get(explicit_parent_id)
+            ):
                 return True
             return False
         if not parent_session_id:
@@ -2754,14 +3288,15 @@ class LCMEngine(ContextEngine):
 
         active_auxiliary_ids = self._active_auxiliary_session_ids()
         known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
+        known_auxiliary_parent_ids = self._known_auxiliary_parent_lineage_session_ids()
         if child_parent_id in active_auxiliary_ids:
             return True
-        if child_parent_id in known_auxiliary_ids and child_parent_id != self._session_id:
+        if child_parent_id in known_auxiliary_parent_ids and child_parent_id != self._session_id:
             return True
         if child_parent_id != parent_session_id:
             return self._session_has_auxiliary_ancestor(
                 str(child_parent_id or ""),
-                known_auxiliary_ids | active_auxiliary_ids,
+                known_auxiliary_parent_ids | active_auxiliary_ids,
                 path,
             )
         return False
@@ -3429,11 +3964,37 @@ class LCMEngine(ContextEngine):
             self._host_fallback_compressor = None
             self._host_fallback_session_id = ""
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            old_session_is_suppressed_foreground = self._auxiliary_lineage_suppressed_as_foreground(
+                old_session_id
+            )
+            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
+                old_session_id
+            )
+            new_session_auxiliary_parent = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            new_session_is_auxiliary_continuation = new_session_auxiliary_parent == old_session_id
             if (
                 self._has_auxiliary_lineage_session(old_session_id)
-                and old_session_id != self._session_id
+                and (
+                    old_session_id != self._session_id
+                    or old_session_auxiliary_generation
+                    or new_session_is_auxiliary_continuation
+                )
+                and (
+                    not old_session_is_suppressed_foreground
+                    or old_session_auxiliary_generation
+                    or new_session_is_auxiliary_continuation
+                )
             ):
-                self._handoff_auxiliary_session(old_session_id, session_id)
+                self._handoff_auxiliary_session(
+                    old_session_id,
+                    session_id,
+                    preserve_old_session=old_session_id == self._session_id,
+                    preserve_old_foreground_marker=old_session_is_suppressed_foreground,
+                )
                 logger.info(
                     "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
                     old_session_id,
@@ -3475,14 +4036,35 @@ class LCMEngine(ContextEngine):
             return
 
         if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
-            self._register_auxiliary_session(session_id)
+            explicit_parent_id = str(kwargs.get("parent_session_id") or "")
+            preserve_foreground_reuse_marker = bool(
+                explicit_parent_id
+                and self._lcm_session_last_bypassed.get(explicit_parent_id)
+            )
+            if preserve_foreground_reuse_marker:
+                if self._lcm_session_last_normal_conversation_id.get(session_id):
+                    self._auxiliary_foreground_reused_session_ids.add(session_id)
+                self._mark_thread_context_stateless(
+                    session_id,
+                    preserve_foreground_reuse_marker=True,
+                )
+            else:
+                self._register_auxiliary_session(session_id)
             logger.info(
                 "LCM session %s is a live child of bound session %s — treating it as auxiliary/stateless",
                 session_id,
                 previous_session_id,
             )
             return
-        self._deactivate_auxiliary_session(session_id)
+        start_platform = str(kwargs.get("platform") or "")
+        side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
+            session_id,
+            platform=start_platform,
+        ) or self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
+        self._unmark_thread_context_auxiliary_session(
+            session_id,
+            suppress_as_foreground_reuse=not side_channel_rebind,
+        )
         self._clear_thread_context_stateless()
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
@@ -3847,21 +4429,65 @@ class LCMEngine(ContextEngine):
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        if self._has_auxiliary_lineage_session(session_id) and session_id != self._session_id:
+        ended_generation = self._in_process_auxiliary_caller_generation(session_id)
+        active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
+        if (
+            self._has_auxiliary_lineage_session(session_id)
+            and session_id != self._session_id
+            and (
+                active_auxiliary_end
+                or not self._auxiliary_lineage_suppressed_as_foreground(session_id)
+                or ended_generation
+                or (
+                    session_id in self._auxiliary_last_prompt_tokens
+                    and not self._auxiliary_lineage_suppressed_as_foreground(session_id)
+                )
+            )
+        ):
             current_thread_session_id = self._thread_context_session_id()
-            with self._auxiliary_session_lock:
-                self._auxiliary_session_ids.discard(session_id)
-            if current_thread_session_id == session_id:
+            if current_thread_session_id == session_id or active_auxiliary_end:
+                self._remember_lcm_bypass_message_prefix(session_id, messages)
+            deactivated = self._deactivate_auxiliary_session(
+                session_id,
+                generation=ended_generation,
+            )
+            if deactivated and current_thread_session_id == session_id:
                 self._clear_thread_context_stateless(session_id)
             return
         current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
         ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
-        if ended_session_directly_bypasses:
+        direct_bypass_normal_conversation_id = self._lcm_session_last_normal_conversation_id.get(session_id)
+        direct_bypass_normal_prefix_count = None
+        if (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and direct_bypass_normal_conversation_id
+            and not ended_generation
+        ):
+            direct_bypass_normal_prefix_count = self._session_end_store_prefix_count(
+                session_id,
+                messages,
+                conversation_id=direct_bypass_normal_conversation_id,
+            )
+        direct_bypass_is_suppressed_reused_normal = (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and bool(direct_bypass_normal_conversation_id)
+            and not ended_generation
+            and session_id != self._thread_context_session_id()
+            and direct_bypass_normal_prefix_count is not None
+            and direct_bypass_normal_prefix_count > 0
+        )
+        if ended_session_directly_bypasses and not direct_bypass_is_suppressed_reused_normal:
+            self._remember_lcm_bypass_message_prefix(session_id, messages)
             self._end_host_fallback_compressor_for_session(
                 session_id,
                 messages,
                 current_session_bypasses=current_session_bypasses,
             )
+            if session_id == self._thread_context_session_id():
+                self._deactivate_auxiliary_session(session_id, generation=ended_generation)
+                self._clear_thread_context_stateless(session_id)
             return
         same_id_has_bypass_lineage = (
             session_id == self._session_id
@@ -3914,7 +4540,19 @@ class LCMEngine(ContextEngine):
                 or same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
             )
         )
-        off_current_lineage = session_id != self._session_id and self._has_lcm_bypass_lineage_session(session_id)
+        off_current_auxiliary_reused_normal = (
+            session_id != self._session_id
+            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            and bool(direct_bypass_normal_conversation_id)
+            and not ended_generation
+        )
+        off_current_lineage = (
+            session_id != self._session_id
+            and (
+                self._has_lcm_bypass_lineage_session(session_id)
+                or off_current_auxiliary_reused_normal
+            )
+        )
         off_current_normal_conversation_id = (
             self._lcm_session_last_normal_conversation_id.get(session_id)
             if off_current_lineage
@@ -3989,6 +4627,7 @@ class LCMEngine(ContextEngine):
             off_current_prefix_count = off_current_recorded_prefix_for_append
         if (
             off_current_lineage
+            and not off_current_auxiliary_reused_normal
             and off_current_normal_conversation_id
             and off_current_store_prefix_count == 0
             and off_current_bypass_prefix_count <= 0
@@ -4248,8 +4887,9 @@ class LCMEngine(ContextEngine):
         ):
             try:
                 self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during tool call failed: %s", e)
+                self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -4345,6 +4985,10 @@ class LCMEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "ingest_failure_count": self._ingest_failure_count,
+            "consecutive_ingest_failures": self._consecutive_ingest_failures,
+            "last_ingest_error": self._last_ingest_error,
+            "last_ingest_error_time": self._last_ingest_error_time,
             "model": self.model,
             "provider": self.provider,
             "context_length_source": self._context_length_source,
@@ -4405,6 +5049,7 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
             status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
             status["ignored_message_count"] = self._ignored_message_count
+            status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -4425,6 +5070,35 @@ class LCMEngine(ContextEngine):
                     "last_rollover_at": lifecycle_state.last_rollover_at,
                     "last_reset_at": lifecycle_state.last_reset_at,
                     "updated_at": lifecycle_state.updated_at,
+                }
+            try:
+                telemetry = self._store.read_compaction_telemetry(conversation_id)
+            except Exception:
+                telemetry = None
+            if telemetry:
+                status["compaction_telemetry"] = {
+                    "cache_state": telemetry.get("cache_state", "unknown"),
+                    "consecutive_cold_observations": telemetry.get(
+                        "consecutive_cold_observations", 0
+                    ),
+                    "turns_since_leaf_compaction": telemetry.get(
+                        "turns_since_leaf_compaction", 0
+                    ),
+                    "peak_prompt_tokens_since_leaf_compaction": telemetry.get(
+                        "peak_prompt_tokens_since_leaf_compaction", 0
+                    ),
+                    "last_observed_prompt_tokens": telemetry.get(
+                        "last_observed_prompt_tokens", 0
+                    ),
+                    "last_observed_cache_read": telemetry.get("last_observed_cache_read", 0),
+                    "last_observed_cache_write": telemetry.get("last_observed_cache_write", 0),
+                    "activity_band": telemetry.get("activity_band", "low"),
+                    "total_compactions": telemetry.get("total_compactions", 0),
+                    "last_leaf_compaction_at": telemetry.get("last_leaf_compaction_at"),
+                    "last_compaction_duration_ms": telemetry.get("last_compaction_duration_ms"),
+                    "provider": telemetry.get("provider"),
+                    "model": telemetry.get("model"),
+                    "last_api_call_at": telemetry.get("last_api_call_at"),
                 }
         return status
 
@@ -4714,19 +5388,10 @@ class LCMEngine(ContextEngine):
         if not keys:
             return []
         try:
-            conn = self._store._conn
-            if conn is None:
-                return []
             ordered: list[str] = []
             seen: set[str] = set()
             for key in keys:
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    (key,),
-                ).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if isinstance(data, list):
                     for item in data:
                         digest = str(item)
@@ -4749,20 +5414,7 @@ class LCMEngine(ContextEngine):
             return ordered_hashes
         try:
             payload = json.dumps(ordered_hashes)
-            conn = self._store._conn
-            if conn is None:
-                return ordered_hashes
-            with self._store._write_lock:
-                for key in keys:
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, payload),
-                    )
-                conn.commit()
+            self._store.write_metadata_json(keys, payload)
         except Exception:
             logger.debug("LCM scoped hash metadata write failed", exc_info=True)
         return ordered_hashes
@@ -4782,14 +5434,8 @@ class LCMEngine(ContextEngine):
         if not count_keys:
             return counts
         try:
-            conn = self._store._conn
-            if conn is None:
-                return counts
             for key in count_keys:
-                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, dict):
                     continue
                 for digest, count in data.items():
@@ -4825,32 +5471,10 @@ class LCMEngine(ContextEngine):
             if parsed_count > 0:
                 payload[digest] = parsed_count
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             serialized = json.dumps(payload, sort_keys=True)
-            with self._store._write_lock:
-                wrote = False
-                for key in count_keys:
-                    # Skip the write (and its fsync commit under synchronous=FULL)
-                    # when the stored value already matches. This runs on every
-                    # ingest and was previously an unconditional UPSERT+commit.
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, serialized),
-                    )
-                    wrote = True
-                if wrote:
-                    conn.commit()
+            # skip_unchanged avoids the fsync commit (under synchronous=FULL) when
+            # the stored value already matches; this runs on every ingest.
+            self._store.write_metadata_json(count_keys, serialized, skip_unchanged=True)
         except Exception:
             logger.debug("LCM ignored placeholder count metadata write failed", exc_info=True)
 
@@ -4863,14 +5487,8 @@ class LCMEngine(ContextEngine):
         if not ordinal_keys:
             return ordinals
         try:
-            conn = self._store._conn
-            if conn is None:
-                return ordinals
             for key in ordinal_keys:
-                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, dict):
                     continue
                 for digest, values in data.items():
@@ -4914,31 +5532,10 @@ class LCMEngine(ContextEngine):
             if clean:
                 payload[digest] = clean
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             serialized = json.dumps(payload, sort_keys=True)
-            with self._store._write_lock:
-                wrote = False
-                for key in ordinal_keys:
-                    # Skip the write (and its fsync commit) when unchanged; see
-                    # the counts writer above for rationale.
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, serialized),
-                    )
-                    wrote = True
-                if wrote:
-                    conn.commit()
+            # Skip the write (and its fsync commit) when unchanged; see the counts
+            # writer above for rationale.
+            self._store.write_metadata_json(ordinal_keys, serialized, skip_unchanged=True)
         except Exception:
             logger.debug("LCM ignored placeholder ordinal metadata write failed", exc_info=True)
 
@@ -5070,19 +5667,10 @@ class LCMEngine(ContextEngine):
         if not keys:
             return []
         try:
-            conn = self._store._conn
-            if conn is None:
-                return []
             records: list[dict[str, str]] = []
             seen: set[tuple[str, str]] = set()
             for key in keys:
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    (key,),
-                ).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, list):
                     continue
                 for item in data:
@@ -5137,21 +5725,8 @@ class LCMEngine(ContextEngine):
             normalized.append(clean)
         normalized = normalized[-512:]
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             payload = json.dumps(normalized)
-            with self._store._write_lock:
-                for key in keys:
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, payload),
-                    )
-                conn.commit()
+            self._store.write_metadata_json(keys, payload)
         except Exception:
             logger.debug("LCM ignored-dependent reply metadata write failed", exc_info=True)
 
@@ -5548,6 +6123,40 @@ class LCMEngine(ContextEngine):
             session_id=session_id,
         )
 
+    def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
+        recovered_identity_content = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                self._config,
+                parse_json_strings=False,
+            )
+        )
+        if recovered_identity_content == durable_content:
+            return True
+        redaction_names = sorted(set(re.findall(r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content)))
+        if not redaction_names or bool(getattr(self._config, "sensitive_patterns_enabled", False)):
+            return False
+        compat_config = copy.copy(self._config)
+        compat_config.sensitive_patterns_enabled = True
+        compat_config.sensitive_patterns = redaction_names
+        compat_identity_content = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                compat_config,
+                parse_json_strings=False,
+            )
+        )
+        return compat_identity_content == durable_content
+
+    @staticmethod
+    def _persisted_output_marker_replay_proof(content: str) -> tuple[str | None, bool]:
+        inline_preview_sha256 = _persisted_output_inline_preview_sha256(content)
+        preview_sha256 = inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
+        if not preview_sha256:
+            return None, False
+        allow_redacted_preview_match = inline_preview_sha256 is None and not _has_lossy_sensitive_redaction(content)
+        return preview_sha256, allow_redacted_preview_match
+
     def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
@@ -5555,12 +6164,47 @@ class LCMEngine(ContextEngine):
             return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
         if (
             expected_chars is None
             or not persisted_output_source_path
             or not persisted_output_preview_sha256
         ):
+            return False
+        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
+        if recovered_with_stat is None:
+            return False
+        require_live_file_freshness = True
+        durable_content = find_externalized_tool_result_content_for_call(
+            tool_call_id=str(msg.get("tool_call_id") or ""),
+            session_id=str(msg.get("session_id") or self._session_id or ""),
+            expected_chars=expected_chars,
+            persisted_output_source_path=persisted_output_source_path,
+            persisted_output_preview_sha256=persisted_output_preview_sha256,
+            require_persisted_output_file_not_newer=require_live_file_freshness,
+            allow_redacted_preview_match=allow_redacted_preview_match,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        if durable_content is None:
+            return False
+        if recovered_with_stat is not None:
+            recovered_content, _file_stat = recovered_with_stat
+            if not self._recovered_content_matches_durable_identity(recovered_content, durable_content):
+                return False
+        return True
+
+    def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
+        role = str(msg.get("role") or "unknown")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role != "tool" or not _is_hermes_persisted_output_marker(content):
+            return False
+        expected_chars = _expected_persisted_output_chars(content)
+        persisted_output_source_path = _persisted_output_saved_path(content)
+        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
+        if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
+            return False
+        if recover_hermes_persisted_output_with_file_stat(content) is None:
             return False
         durable_content = find_externalized_tool_result_content_for_call(
             tool_call_id=str(msg.get("tool_call_id") or ""),
@@ -5568,120 +6212,105 @@ class LCMEngine(ContextEngine):
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
+            allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
         )
         return durable_content is not None
 
-    @staticmethod
-    def _sensitive_redaction_names_from_content(content: str) -> list[str]:
-        names: list[str] = []
-        if not isinstance(content, str) or "[LCM sensitive redaction:" not in content:
-            return names
-        for match in re.finditer(r"\[LCM sensitive redaction:\s*name=([^;\]\s]+)", content):
-            name = match.group(1).strip().lower()
-            if name and name not in names:
-                names.append(name)
-        return names
-
-    def _durable_redacted_content_matches_recovered(
-        self,
-        durable_content: str | None,
-        recovered_content: str,
-        current_redacted_content: str,
-    ) -> bool:
-        if not durable_content:
-            return False
-        if durable_content == recovered_content:
-            return True
-        if "[LCM sensitive redaction:" not in durable_content:
-            return False
-        if durable_content == current_redacted_content:
-            return True
-        candidate_pattern_sets: list[list[str]] = []
-        configured_patterns = list(getattr(self._config, "sensitive_patterns", None) or [])
-        durable_redaction_patterns = self._sensitive_redaction_names_from_content(
-            durable_content
-        )
-        default_patterns = list(LCMConfig().sensitive_patterns)
-        for pattern_set in (configured_patterns, durable_redaction_patterns, default_patterns):
-            normalized = [
-                str(pattern).strip().lower()
-                for pattern in pattern_set
-                if str(pattern).strip()
-            ]
-            if normalized and normalized not in candidate_pattern_sets:
-                candidate_pattern_sets.append(normalized)
-        for pattern_set in candidate_pattern_sets:
-            redaction_config = copy.copy(self._config)
-            redaction_config.sensitive_patterns_enabled = True
-            redaction_config.sensitive_patterns = pattern_set
-            expected_redacted = normalize_content_value(
-                redact_sensitive_value(
-                    recovered_content,
-                    redaction_config,
-                    parse_json_strings=False,
-                )
-            ) or ""
-            if durable_content == expected_redacted:
-                return True
-        return False
-
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
-        if role == "tool" and _is_hermes_persisted_output_marker(content):
+        if (
+            role == "tool"
+            and _is_hermes_persisted_output_marker(content)
+            and bool(getattr(self._config, "large_output_externalization_enabled", True))
+        ):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
-            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
-            recovered_content = recover_hermes_persisted_output(content)
-            has_durable_marker_proof = (
-                not stored_row
-                and expected_chars is not None
-                and persisted_output_source_path
-                and persisted_output_preview_sha256
-            )
+            persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
             durable_content = None
+            recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
+            recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
+            recovered_identity_content = None
             if recovered_content is not None:
-                content = normalize_content_value(
+                recovered_identity_content = normalize_content_value(
                     redact_sensitive_value(
                         recovered_content,
                         self._config,
                         parse_json_strings=False,
                     )
-                ) or ""
-                if has_durable_marker_proof:
-                    # Live file recovery is authoritative for raw content.  A
-                    # previously stored redacted durable payload remains the
-                    # canonical replay identity so a later config with redaction
-                    # disabled does not duplicate or de-redact an existing row.
-                    durable_content = find_externalized_tool_result_content_for_call(
-                        tool_call_id=str(msg.get("tool_call_id") or ""),
-                        session_id=str(msg.get("session_id") or self._session_id or ""),
-                        expected_chars=expected_chars,
-                        persisted_output_source_path=persisted_output_source_path,
-                        persisted_output_preview_sha256=persisted_output_preview_sha256,
-                        config=self._config,
-                        hermes_home=self._hermes_home,
+                )
+            require_live_file_freshness = recovered_with_stat is not None
+
+            def live_file_generation_identity() -> str:
+                try:
+                    live_stat = Path(str(persisted_output_source_path)).stat()
+                    return (
+                        "[LCM persisted-output live file: "
+                        f"path={persisted_output_source_path}; "
+                        f"mtime_ns={live_stat.st_mtime_ns}; "
+                        f"chars={expected_chars}]"
                     )
-                    if durable_content is not None and self._durable_redacted_content_matches_recovered(
-                        durable_content,
-                        recovered_content,
-                        content,
-                    ):
-                        content = durable_content
-            elif has_durable_marker_proof:
+                except OSError:
+                    return (
+                        "[LCM persisted-output live file: "
+                        f"path={persisted_output_source_path}; "
+                        f"chars={expected_chars}]"
+                    )
+
+            if (
+                not stored_row
+                and expected_chars is not None
+                and persisted_output_source_path
+                and persisted_output_preview_sha256
+                and recovered_with_stat is not None
+            ):
                 durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=str(msg.get("session_id") or self._session_id or ""),
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    require_persisted_output_file_not_newer=require_live_file_freshness,
+                    allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-                if durable_content is not None:
-                    content = durable_content
+            if durable_content is not None and (
+                recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
+            ):
+                content = durable_content
+            elif recovered_content is not None:
+                stale_durable_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    allow_redacted_preview_match=allow_redacted_preview_match,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if (
+                    stale_durable_content is not None
+                    and self._recovered_content_matches_durable_identity(recovered_content, stale_durable_content)
+                    and not _has_lossy_sensitive_redaction(stale_durable_content)
+                    and not _has_lossy_sensitive_redaction(recovered_identity_content)
+                ):
+                    content = stale_durable_content
+                elif stale_durable_content is not None:
+                    content = live_file_generation_identity()
+                elif recovered_with_stat is not None:
+                    content = _add_inline_persisted_output_generation_metadata(
+                        _add_inline_persisted_output_identity_metadata(
+                            content,
+                            _persisted_output_marker_identity_digest(content),
+                        ),
+                        recovered_with_stat[1],
+                    )
+                elif recovered_identity_content is not None:
+                    content = recovered_identity_content
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
@@ -5717,6 +6346,80 @@ class LCMEngine(ContextEngine):
         if len(candidate_prefix) > len(stored_tail):
             return False
         return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+
+    @staticmethod
+    def _strip_inline_persisted_output_generation_identity(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        role, content, tool_call_id, tool_calls = identity
+        if role != "tool" or not isinstance(content, str):
+            return identity
+        stripped = re.sub(
+            r"\n?\[LCM persisted-output file generation: "
+            r"size=\d+; mtime_ns=\d+; ctime_ns=\d+\]\n?(?=</persisted-output>)",
+            "\n",
+            content,
+        )
+        return (role, stripped, tool_call_id, tool_calls)
+
+    def _stored_row_has_durable_persisted_output_marker(self, row: Dict[str, Any]) -> bool:
+        if str(row.get("role") or "") != "tool":
+            return False
+        content = normalize_content_value(row.get("content")) or ""
+        ref = extract_externalized_ref(content)
+        if not ref:
+            return False
+        return externalized_tool_result_has_persisted_output_marker(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
+    @staticmethod
+    def _persisted_output_durable_wildcard_identity(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        role, _content, tool_call_id, tool_calls = identity
+        return (role, "[LCM persisted-output durable replay]", tool_call_id, tool_calls)
+
+    def _matches_persisted_output_durable_full_replay(
+        self,
+        candidate_messages: list[Dict[str, Any]],
+        candidate_prefix: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str]],
+        stored_tail_rows: list[Dict[str, Any]] | None,
+    ) -> bool:
+        if not stored_tail_rows or len(candidate_prefix) != len(stored_tail) or len(candidate_messages) != len(candidate_prefix):
+            return False
+        transformed_candidate: list[tuple[str, str, str, str]] = []
+        transformed_stored: list[tuple[str, str, str, str]] = []
+        saw_persisted_output = False
+        for candidate_msg, candidate_identity, stored_identity, stored_row in zip(
+            candidate_messages,
+            candidate_prefix,
+            stored_tail,
+            stored_tail_rows,
+        ):
+            candidate_content = normalize_content_value(candidate_msg.get("content")) or ""
+            candidate_is_persisted_marker = (
+                str(candidate_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(candidate_content)
+            )
+            stored_is_persisted_output = self._stored_row_has_durable_persisted_output_marker(stored_row)
+            if candidate_is_persisted_marker or stored_is_persisted_output:
+                if (
+                    not candidate_is_persisted_marker
+                    or not stored_is_persisted_output
+                    or not self._has_durable_persisted_output_replay_identity(candidate_msg)
+                ):
+                    return False
+                saw_persisted_output = True
+                transformed_candidate.append(self._persisted_output_durable_wildcard_identity(candidate_identity))
+                transformed_stored.append(self._persisted_output_durable_wildcard_identity(stored_identity))
+                continue
+            transformed_candidate.append(candidate_identity)
+            transformed_stored.append(stored_identity)
+        return saw_persisted_output and transformed_candidate == transformed_stored
 
     @classmethod
     def _identity_content_for_active_cleanup(cls, content: str) -> Any:
@@ -5841,6 +6544,7 @@ class LCMEngine(ContextEngine):
         messages: List[Dict[str, Any]],
         stored_tail: list[tuple[str, str, str, str]],
         *,
+        stored_tail_rows: list[Dict[str, Any]] | None = None,
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
@@ -5923,14 +6627,62 @@ class LCMEngine(ContextEngine):
                 and bool(candidate_visible_prefix)
                 and self._matches_store_tail_suffix(stored_tail, candidate_visible_prefix)
             )
-            if matches_visible_sanitized_tail or matches_visible_raw_tail:
+            early_candidate_has_unrecoverable_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                and recover_hermes_persisted_output_with_file_stat(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                is None
+                for msg in candidate_identity_messages
+            )
+            if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
                 return cursor
+            candidate_has_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                for msg in candidate_identity_messages
+            )
+            matches_durable_persisted_output_full_replay = self._matches_persisted_output_durable_full_replay(
+                candidate_identity_messages,
+                candidate_prefix,
+                stored_tail,
+                stored_tail_rows,
+            )
+            candidate_has_unrecoverable_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                and recover_hermes_persisted_output_with_file_stat(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                is None
+                for msg in candidate_identity_messages
+            )
+            matches_inline_generation_cleanup_tail = False
+            if candidate_has_unrecoverable_persisted_marker:
+                generationless_sanitized_tail = [
+                    self._strip_inline_persisted_output_generation_identity(identity)
+                    for identity in sanitized_replay_tail
+                ]
+                generationless_candidate_prefix = [
+                    self._strip_inline_persisted_output_generation_identity(identity)
+                    for identity in candidate_prefix
+                ]
+                matches_inline_generation_cleanup_tail = self._matches_store_tail_suffix(
+                    generationless_sanitized_tail,
+                    generationless_candidate_prefix,
+                )
             raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
             raw_suffix_needs_cleanup_equivalence = any(
                 self._active_cleanup_replay_identity(identity) != identity
                 for identity in raw_tail_suffix
             )
-            if not matches_sanitized_tail and not matches_raw_tail:
+            if (
+                not matches_sanitized_tail
+                and not matches_raw_tail
+                and not matches_inline_generation_cleanup_tail
+                and not matches_durable_persisted_output_full_replay
+            ):
                 continue
 
             # Matching a stored suffix is not enough evidence by itself.  A
@@ -5983,11 +6735,21 @@ class LCMEngine(ContextEngine):
             )
             has_persisted_marker_singleton_replay = (
                 matches_raw_tail
+                and not candidate_has_unrecoverable_persisted_marker
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
                 and candidate_prefix == stored_tail
                 and candidate_prefix[0][0] == "tool"
                 and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
+            )
+            has_durable_persisted_marker_suffix_replay = (
+                (matches_sanitized_tail or matches_raw_tail)
+                and any(
+                    str(msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                    and self._has_durable_persisted_output_replay_identity(msg)
+                    for msg in candidate_messages
+                )
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -5995,17 +6757,56 @@ class LCMEngine(ContextEngine):
                 and len(candidate_prefix) >= effective_session_count
                 and effective_session_count > 0
             )
-            has_effective_full_replay = matches_sanitized_tail and len(candidate_prefix) >= effective_session_count and (
-                candidate_has_system
-                or (effective_session_count > 1 and not sanitized_tail_collapsed)
-                or has_quarantined_singleton_replay
-                or has_filtered_full_replay
+            has_inline_generation_cleanup_replay = (
+                matches_inline_generation_cleanup_tail
+                and candidate_has_unrecoverable_persisted_marker
+                and len(candidate_prefix) >= effective_session_count
+                and effective_session_count > 0
             )
+            has_inline_persisted_generation_suffix_replay = (
+                matches_sanitized_tail
+                and any(
+                    str(msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                    and _has_inline_persisted_output_generation_metadata(normalize_content_value(msg.get("content")) or "")
+                    for msg in candidate_identity_messages
+                )
+            )
+            if candidate_has_unrecoverable_persisted_marker:
+                continue
+            has_raw_persisted_marker_exact_replay = (
+                candidate_has_persisted_marker
+                and not candidate_has_unrecoverable_persisted_marker
+                and matches_raw_tail
+                and candidate_prefix == stored_tail[-len(candidate_prefix) :]
+            )
+            has_persisted_marker_specific_replay_evidence = (
+                not candidate_has_persisted_marker
+                or has_durable_persisted_marker_suffix_replay
+                or matches_durable_persisted_output_full_replay
+                or has_inline_generation_cleanup_replay
+                or has_inline_persisted_generation_suffix_replay
+                or has_persisted_marker_singleton_replay
+                or has_raw_persisted_marker_exact_replay
+            )
+            has_effective_full_replay = (
+                has_persisted_marker_specific_replay_evidence
+                and matches_sanitized_tail
+                and len(candidate_prefix) >= effective_session_count
+                and (
+                    candidate_has_system
+                    or (effective_session_count > 1 and not sanitized_tail_collapsed)
+                    or has_quarantined_singleton_replay
+                    or has_filtered_full_replay
+                )
+            )
+
             has_scaffold_evidence = any(
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             has_raw_full_replay = (
-                matches_raw_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_raw_tail
                 and not has_scaffold_evidence
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
@@ -6019,12 +6820,14 @@ class LCMEngine(ContextEngine):
             )
             candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)
             has_scaffold_suffix_replay = (
-                matches_sanitized_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_sanitized_tail
                 and has_preserved_objective_scaffold
                 and not candidate_suffix_has_user_turn
             )
             has_raw_cleanup_replay = (
-                matches_raw_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_raw_tail
                 and has_scaffold_evidence
                 and cursor < len(messages)
                 and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
@@ -6034,6 +6837,10 @@ class LCMEngine(ContextEngine):
                 has_effective_full_replay
                 or has_externalized_singleton_replay
                 or has_persisted_marker_singleton_replay
+                or has_durable_persisted_marker_suffix_replay
+                or matches_durable_persisted_output_full_replay
+                or has_inline_generation_cleanup_replay
+                or has_inline_persisted_generation_suffix_replay
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
@@ -6145,14 +6952,19 @@ class LCMEngine(ContextEngine):
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
-        stored_tail = [
-            self._message_replay_identity(row, stored_row=True)
+        stored_tail_rows = [
+            row
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        stored_tail = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_tail_rows
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
+            stored_tail_rows=stored_tail_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
@@ -6192,10 +7004,22 @@ class LCMEngine(ContextEngine):
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
-        if self._is_suspicious_stale_no_overlap_snapshot(
-            incoming_identities,
-            stored_tail,
-            stored_head,
+        incoming_has_unproofed_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            and recover_hermes_persisted_output_with_file_stat(
+                normalize_content_value(msg.get("content")) or ""
+            )
+            is None
+            for msg in messages
+        )
+        if (
+            not incoming_has_unproofed_raw_persisted_marker
+            and self._is_suspicious_stale_no_overlap_snapshot(
+                incoming_identities,
+                stored_tail,
+                stored_head,
+            )
         ):
             self._record_ingest_reconciliation(
                 action="skipped batch",
@@ -6237,11 +7061,14 @@ class LCMEngine(ContextEngine):
         for message in messages:
             redacted_message = dict(message)
             if "content" in redacted_message:
-                redacted_message["content"] = redact_sensitive_value(
+                original_content = normalize_content_value(redacted_message.get("content")) or ""
+                redacted_content = redact_sensitive_value(
                     redacted_message.get("content"),
                     self._config,
                     parse_json_strings=False,
                 )
+                redacted_message["content"] = redacted_content
+
             if "tool_calls" in redacted_message:
                 redacted_message["tool_calls"] = redact_sensitive_value(
                     redacted_message.get("tool_calls"),
@@ -6321,7 +7148,10 @@ class LCMEngine(ContextEngine):
                 if (
                     (
                         str(original_msg.get("role") or "") == "tool"
-                        and self._has_durable_persisted_output_replay_identity(original_msg)
+                        and _is_hermes_persisted_output_marker(
+                            normalize_content_value(original_msg.get("content")) or ""
+                        )
+                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
                     )
                     or (
                         self._compiled_ignore_message_patterns
@@ -6560,11 +7390,25 @@ class LCMEngine(ContextEngine):
                         active_message["content"] = self._ignored_active_replay_placeholder(original_text)
                         active_replay_messages[absolute_idx] = active_message
                     excerpt = original_text[:80].replace("\n", " ")
-                    logger.debug(
-                        "LCM ignore_message_patterns dropped %s message: %r",
-                        original_msg.get("role", "unknown"),
-                        excerpt,
-                    )
+                    if ignored_original_messages[absolute_idx]:
+                        # A raw message matched ignore_message_patterns and is
+                        # discarded here - never persisted anywhere. Count and
+                        # log it (INFO) so an over-broad pattern silently eating
+                        # substantive turns is at least visible to the operator.
+                        self._ignore_pattern_dropped_count += 1
+                        logger.info(
+                            "LCM ignore_message_patterns dropped %s message "
+                            "(not persisted; total dropped=%d): %r",
+                            original_msg.get("role", "unknown"),
+                            self._ignore_pattern_dropped_count,
+                            excerpt,
+                        )
+                    else:
+                        logger.debug(
+                            "LCM ignore_message_patterns dropped %s message: %r",
+                            original_msg.get("role", "unknown"),
+                            excerpt,
+                        )
                     continue
                 store_msg = replay_msg
                 if (
@@ -6907,7 +7751,13 @@ class LCMEngine(ContextEngine):
             if not content:
                 continue
 
-            ref = extract_externalized_ref(content)
+            # Only take the fast ref-branch when the ENTIRE row is the
+            # externalized placeholder. A ref merely embedded in surrounding
+            # text (e.g. a recall-tool result that quotes a placeholder) must
+            # fall through to the content-equality lookup below, which tombstones
+            # only when the full row content matches the stored payload -
+            # otherwise the surrounding, never-externalized text is lost.
+            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
             if ref:
                 externalized = load_externalized_payload(
                     ref,
