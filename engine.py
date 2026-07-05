@@ -541,6 +541,8 @@ class LCMEngine(ContextEngine):
         self.last_reasoning_tokens = 0
         self.cache_metrics_available = False
         self.compression_count = 0
+        # Wall-clock of the last leaf compaction (ms); surfaced via telemetry only.
+        self._last_compaction_duration_ms = 0.0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
         self.protect_last_n = self._config.fresh_tail_count
@@ -1013,12 +1015,97 @@ class LCMEngine(ContextEngine):
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        self._record_turn_compaction_telemetry()
 
     @property
     def cache_read_ratio(self) -> float:
         if self.last_prompt_tokens <= 0:
             return 0.0
         return self.last_cache_read_tokens / self.last_prompt_tokens
+
+    def _record_turn_compaction_telemetry(self) -> None:
+        """Persist a per-conversation compaction-telemetry snapshot for this turn.
+
+        Best-effort and diagnostic only: any failure is logged at debug and never
+        affects the turn. Turns with no token or cache signal are skipped so idle
+        turns do not churn the record. The since-compaction accumulators reset off
+        the monotonic ``compression_count`` (which also drops to 0 on a session
+        reset) rather than instrumenting the compaction hot path.
+        """
+        conversation_id = self._conversation_id
+        if not conversation_id:
+            return
+        prompt_tokens = self.last_prompt_tokens
+        cache_read = self.last_cache_read_tokens
+        cache_write = self.last_cache_write_tokens
+        if (
+            prompt_tokens <= 0
+            and cache_read <= 0
+            and cache_write <= 0
+            and not self.cache_metrics_available
+        ):
+            return
+        try:
+            existing = self._store.read_compaction_telemetry(conversation_id) or {}
+
+            if cache_read > 0 or cache_write > 0:
+                cache_state = "hot"
+            elif self.cache_metrics_available:
+                cache_state = "cold"
+            else:
+                cache_state = "unknown"
+            cold_streak = int(existing.get("consecutive_cold_observations", 0) or 0)
+            if cache_state == "hot":
+                cold_streak = 0
+            elif cache_state == "cold":
+                cold_streak += 1
+
+            prev_count = int(existing.get("compression_count_at_record", 0) or 0)
+            compacted = self.compression_count > prev_count
+            rebaselined = self.compression_count != prev_count  # compaction or session reset
+            if rebaselined:
+                turns_since = 0
+                peak_tokens_since = prompt_tokens
+            else:
+                turns_since = int(existing.get("turns_since_leaf_compaction", 0) or 0) + 1
+                peak_tokens_since = max(
+                    int(existing.get("peak_prompt_tokens_since_leaf_compaction", 0) or 0),
+                    prompt_tokens,
+                )
+            total_compactions = int(existing.get("total_compactions", 0) or 0)
+            if compacted:
+                total_compactions += self.compression_count - prev_count
+                last_leaf_compaction_at = time.time()
+                last_compaction_duration_ms = round(self._last_compaction_duration_ms, 3)
+            else:
+                last_leaf_compaction_at = existing.get("last_leaf_compaction_at")
+                last_compaction_duration_ms = existing.get("last_compaction_duration_ms")
+
+            record = dict(existing)
+            record.update({
+                "conversation_id": conversation_id,
+                "last_observed_prompt_tokens": prompt_tokens,
+                "last_observed_cache_read": cache_read,
+                "last_observed_cache_write": cache_write,
+                "cache_state": cache_state,
+                "consecutive_cold_observations": cold_streak,
+                "turns_since_leaf_compaction": turns_since,
+                "peak_prompt_tokens_since_leaf_compaction": peak_tokens_since,
+                # Reserved carry-forward field; no live 'medium'/'high' computation yet.
+                "activity_band": existing.get("activity_band", "low"),
+                "provider": self.provider or existing.get("provider"),
+                "model": self.model or existing.get("model"),
+                "last_api_call_at": time.time(),
+                "last_leaf_compaction_at": last_leaf_compaction_at,
+                "last_compaction_duration_ms": last_compaction_duration_ms,
+                "total_compactions": total_compactions,
+                "compression_count_at_record": self.compression_count,
+            })
+            if cache_state == "hot":
+                record["last_cache_hit_at"] = time.time()
+            self._store.write_compaction_telemetry(conversation_id, record)
+        except Exception:
+            logger.debug("LCM compaction telemetry update failed", exc_info=True)
 
     def _compression_boundary_cooldown_active(self) -> bool:
         """Return true while a boundary skip is in its short no-compress window."""
@@ -1953,6 +2040,7 @@ class LCMEngine(ContextEngine):
 
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
+        _compress_started = time.perf_counter()
 
         if self._bypasses_lcm_context_management():
             return self._compress_lcm_bypassed_session(
@@ -2361,6 +2449,10 @@ class LCMEngine(ContextEngine):
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
+        self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+        logger.info(
+            "LCM leaf compaction finished in %.1fms", self._last_compaction_duration_ms
+        )
         self._last_compression_status = "compacted"
         self._last_compression_noop_reason = ""
         if recovery_assembly_cap is None:
@@ -4493,6 +4585,35 @@ class LCMEngine(ContextEngine):
                     "last_rollover_at": lifecycle_state.last_rollover_at,
                     "last_reset_at": lifecycle_state.last_reset_at,
                     "updated_at": lifecycle_state.updated_at,
+                }
+            try:
+                telemetry = self._store.read_compaction_telemetry(conversation_id)
+            except Exception:
+                telemetry = None
+            if telemetry:
+                status["compaction_telemetry"] = {
+                    "cache_state": telemetry.get("cache_state", "unknown"),
+                    "consecutive_cold_observations": telemetry.get(
+                        "consecutive_cold_observations", 0
+                    ),
+                    "turns_since_leaf_compaction": telemetry.get(
+                        "turns_since_leaf_compaction", 0
+                    ),
+                    "peak_prompt_tokens_since_leaf_compaction": telemetry.get(
+                        "peak_prompt_tokens_since_leaf_compaction", 0
+                    ),
+                    "last_observed_prompt_tokens": telemetry.get(
+                        "last_observed_prompt_tokens", 0
+                    ),
+                    "last_observed_cache_read": telemetry.get("last_observed_cache_read", 0),
+                    "last_observed_cache_write": telemetry.get("last_observed_cache_write", 0),
+                    "activity_band": telemetry.get("activity_band", "low"),
+                    "total_compactions": telemetry.get("total_compactions", 0),
+                    "last_leaf_compaction_at": telemetry.get("last_leaf_compaction_at"),
+                    "last_compaction_duration_ms": telemetry.get("last_compaction_duration_ms"),
+                    "provider": telemetry.get("provider"),
+                    "model": telemetry.get("model"),
+                    "last_api_call_at": telemetry.get("last_api_call_at"),
                 }
         return status
 
