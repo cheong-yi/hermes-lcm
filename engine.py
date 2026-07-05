@@ -379,6 +379,7 @@ _SYNTHETIC_ASSISTANT_NOISE = {
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
 def _tool_call_id(tool_call: Any) -> str:
@@ -584,7 +585,9 @@ class LCMEngine(ContextEngine):
         self._lcm_session_last_bypassed: dict[str, bool] = {}
         self._lcm_session_last_conversation_id: dict[str, str] = {}
         self._lcm_session_last_normal_conversation_id: dict[str, str] = {}
-        self._lcm_bypass_message_prefix_fingerprints: dict[str, list[list[str]]] = {}
+        self._lcm_bypass_message_prefix_fingerprints: dict[
+            str, list[tuple[list[str], bool]]
+        ] = {}
         self._lcm_normal_message_prefix_fingerprints: dict[tuple[str, str], list[str]] = {}
         self._lcm_current_start_allows_bypass_lineage = False
         self._auxiliary_session_lock = threading.RLock()
@@ -3640,11 +3643,21 @@ class LCMEngine(ContextEngine):
     ) -> None:
         if not session_id or not messages:
             return
-        fingerprints = [self._lcm_bypass_message_fingerprint(msg) for msg in messages[:8]]
+        fingerprints = [
+            self._lcm_bypass_message_fingerprint(msg)
+            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
+        ]
         if fingerprints:
             remembered = self._lcm_bypass_message_prefix_fingerprints.setdefault(session_id, [])
-            remembered[:] = [existing for existing in remembered if existing != fingerprints]
-            remembered.append(fingerprints)
+            truncated = len(messages) > _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT
+            retained: list[tuple[list[str], bool]] = []
+            for existing_fingerprints, existing_truncated in remembered:
+                if existing_fingerprints == fingerprints:
+                    truncated = truncated or bool(existing_truncated)
+                    continue
+                retained.append((existing_fingerprints, existing_truncated))
+            retained.append((fingerprints, truncated))
+            remembered[:] = retained
 
     def _remember_lcm_normal_message_prefix(
         self,
@@ -3655,7 +3668,10 @@ class LCMEngine(ContextEngine):
     ) -> None:
         if not session_id or not messages:
             return
-        fingerprints = [self._lcm_bypass_message_fingerprint(msg) for msg in messages[:8]]
+        fingerprints = [
+            self._lcm_bypass_message_fingerprint(msg)
+            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
+        ]
         if fingerprints:
             self._lcm_normal_message_prefix_fingerprints[
                 self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
@@ -3710,13 +3726,25 @@ class LCMEngine(ContextEngine):
         session_id: str,
         messages: List[Dict[str, Any]],
     ) -> int:
-        return max(
-            (
-                self._matching_fingerprint_prefix_count(fingerprints, messages)
-                for fingerprints in self._lcm_bypass_message_prefix_fingerprints.get(session_id, [])
-            ),
-            default=0,
-        )
+        count, _truncated = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
+        return count
+
+    def _matching_lcm_bypass_prefix_evidence(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, bool]:
+        best_count = 0
+        best_truncated = False
+        for fingerprints, truncated in self._lcm_bypass_message_prefix_fingerprints.get(session_id, []):
+            count = self._matching_fingerprint_prefix_count(fingerprints, messages)
+            count_truncated = bool(truncated and count > 0 and count == len(fingerprints))
+            if count > best_count:
+                best_count = count
+                best_truncated = count_truncated
+            elif count == best_count:
+                best_truncated = best_truncated or count_truncated
+        return best_count, best_truncated
 
     def _messages_match_lcm_normal_prefix(
         self,
@@ -3808,16 +3836,17 @@ class LCMEngine(ContextEngine):
         same_id_normal_prefix_count = None
         same_id_recorded_normal_prefix_count = 0
         same_id_bypass_prefix_count = 0
+        same_id_bypass_prefix_truncated = False
         if same_id_has_bypass_lineage:
             same_id_conversation_id = (
                 self._conversation_id
                 or self._lcm_session_last_normal_conversation_id.get(session_id)
                 or None
             )
-            same_id_bypass_prefix_count = self._matching_lcm_bypass_prefix_count(
-                session_id,
-                messages,
-            )
+            (
+                same_id_bypass_prefix_count,
+                same_id_bypass_prefix_truncated,
+            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
             same_id_normal_prefix_count = self._session_end_store_prefix_count(
                 session_id,
                 messages,
@@ -3836,8 +3865,15 @@ class LCMEngine(ContextEngine):
             same_id_recorded_normal_prefix_count,
             same_id_normal_prefix_count if same_id_store_prefix_positive else 0,
         )
+        same_id_truncated_bypass_prefix_ambiguous = (
+            same_id_bypass_prefix_truncated
+            and same_id_bypass_prefix_count > 0
+            and same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
+            and len(messages) > same_id_bypass_prefix_count
+        )
         same_id_matches_stronger_normal_prefix = (
             same_id_strongest_normal_prefix_count > 0
+            and not same_id_truncated_bypass_prefix_ambiguous
             and (
                 same_id_bypass_prefix_count <= 0
                 or same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
@@ -3852,11 +3888,12 @@ class LCMEngine(ContextEngine):
         off_current_store_prefix_count = None
         off_current_recorded_prefix_count = 0
         off_current_bypass_prefix_count = 0
+        off_current_bypass_prefix_truncated = False
         if off_current_lineage:
-            off_current_bypass_prefix_count = self._matching_lcm_bypass_prefix_count(
-                session_id,
-                messages,
-            )
+            (
+                off_current_bypass_prefix_count,
+                off_current_bypass_prefix_truncated,
+            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
         if off_current_lineage and off_current_normal_conversation_id:
             off_current_store_prefix_count = self._session_end_store_prefix_count(
                 session_id,
@@ -3869,23 +3906,30 @@ class LCMEngine(ContextEngine):
                 conversation_id=off_current_normal_conversation_id,
             )
         off_current_prefix_count = None
-        off_current_store_positive_count = 0
-        if off_current_store_prefix_count is not None and off_current_store_prefix_count > 0:
-            off_current_store_positive_count = off_current_store_prefix_count
-        off_current_store_prefix_positive = off_current_store_positive_count > 0
+        off_current_store_prefix_positive = (
+            off_current_store_prefix_count is not None
+            and off_current_store_prefix_count > 0
+        )
+        off_current_store_prefix_for_append = int(off_current_store_prefix_count or 0)
+        off_current_truncated_bypass_prefix_ambiguous = (
+            off_current_bypass_prefix_truncated
+            and off_current_bypass_prefix_count > 0
+            and off_current_store_prefix_for_append >= off_current_bypass_prefix_count
+            and len(messages) > off_current_bypass_prefix_count
+        )
         if (
             off_current_store_prefix_positive
+            and not off_current_truncated_bypass_prefix_ambiguous
             and (
                 off_current_bypass_prefix_count <= 0
-                or off_current_store_positive_count > off_current_bypass_prefix_count
+                or off_current_store_prefix_for_append > off_current_bypass_prefix_count
             )
         ):
-            off_current_prefix_count = off_current_store_positive_count
+            off_current_prefix_count = off_current_store_prefix_for_append
         if (
             off_current_lineage
             and off_current_normal_conversation_id
             and off_current_store_prefix_count == 0
-            and off_current_recorded_prefix_count == 0
             and off_current_bypass_prefix_count <= 0
             and self._lcm_session_last_bypassed.get(session_id) is False
         ):

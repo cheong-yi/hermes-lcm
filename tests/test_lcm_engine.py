@@ -12944,6 +12944,179 @@ class TestSessionRollover:
         finally:
             engine.shutdown()
 
+    def test_off_current_store_mismatch_does_not_append_from_recorded_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_store_mismatch.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normal_messages = [
+                {"role": "user", "content": f"A{i}"}
+                for i in range(9)
+            ]
+            divergent_end = [
+                *normal_messages[:8],
+                {"role": "assistant", "content": "B8 must not append"},
+                {"role": "assistant", "content": "new divergent suffix must not append"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(normal_messages)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_end("shared-session", divergent_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [f"A{i}" for i in range(9)]
+            assert all(row["content"] != "B8 must not append" for row in rows)
+            assert all(row["content"] != "new divergent suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_truncated_bypass_prefix_does_not_append_ambiguous_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_truncated_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_prefix = [
+                {"role": "user", "content": f"shared prefix {i}"}
+                for i in range(9)
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                *shared_prefix,
+                {"role": "assistant", "content": "truncated bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                f"shared prefix {i}"
+                for i in range(9)
+            ]
+            assert bypass_rows == []
+            assert all(row["content"] != "truncated bypass suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_duplicate_short_bypass_snapshot_keeps_truncated_ambiguity(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_duplicate_short_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared8 = [
+                {"role": "user", "content": f"duplicate shared prefix {i}"}
+                for i in range(8)
+            ]
+            shared9 = [
+                *shared8,
+                {"role": "assistant", "content": "duplicate shared ninth"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="long-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared9)
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="short-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared9)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                *shared9,
+                {"role": "assistant", "content": "duplicate truncated bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [
+                row
+                for row in rows
+                if row["conversation_id"] in {"long-bypass-conversation", "short-bypass-conversation"}
+            ]
+            assert [row["content"] for row in normal_rows] == [
+                *(f"duplicate shared prefix {i}" for i in range(8)),
+                "duplicate shared ninth",
+            ]
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "duplicate truncated bypass suffix must not append"
+                for row in rows
+            )
+        finally:
+            engine.shutdown()
+
     @pytest.mark.parametrize("bypass_probe", ["preflight", "compress"])
     def test_shared_opener_bypass_probe_ambiguity_does_not_append_bypass_suffix(self, tmp_path, bypass_probe):
         config = LCMConfig(
@@ -13038,6 +13211,118 @@ class TestSessionRollover:
             assert normal_state is not None
             assert normal_state.current_session_id is None
             assert normal_state.last_finalized_session_id == "shared-session"
+        finally:
+            engine.shutdown()
+
+    def test_current_normal_reuse_with_truncated_bypass_prefix_does_not_append_ambiguous_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_normal_truncated_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_prefix = [
+                {"role": "user", "content": f"current shared prefix {i}"}
+                for i in range(9)
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+            engine.on_session_end("shared-session", shared_prefix)
+            assert engine._store.get_session_count("shared-session") == 0
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            late_bypass_end = [
+                *shared_prefix,
+                {"role": "assistant", "content": "current truncated bypass suffix must not persist"},
+            ]
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                f"current shared prefix {i}"
+                for i in range(9)
+            ]
+            assert bypass_rows == []
+            assert all(row["content"] != "current truncated bypass suffix must not persist" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_current_duplicate_short_bypass_snapshot_keeps_truncated_ambiguity(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_duplicate_short_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared8 = [
+                {"role": "user", "content": f"current duplicate shared prefix {i}"}
+                for i in range(8)
+            ]
+            long_bypass = [
+                *shared8,
+                {"role": "assistant", "content": "current duplicate long bypass ninth"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="long-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(long_bypass)
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="short-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            late_bypass_end = [
+                *shared8,
+                {"role": "assistant", "content": "current duplicate truncated suffix must not persist"},
+            ]
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [
+                row
+                for row in rows
+                if row["conversation_id"] in {"long-bypass-conversation", "short-bypass-conversation"}
+            ]
+            assert [row["content"] for row in normal_rows] == [
+                f"current duplicate shared prefix {i}"
+                for i in range(8)
+            ]
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "current duplicate truncated suffix must not persist"
+                for row in rows
+            )
         finally:
             engine.shutdown()
 
@@ -13156,57 +13441,6 @@ class TestSessionRollover:
             assert len(final_rows) == 1
             assert final_rows[0]["source"] == "cli"
             assert stateless_rows == []
-        finally:
-            engine.shutdown()
-
-    def test_off_current_divergent_normal_end_does_not_append_from_recorded_prefix(self, tmp_path):
-        config = LCMConfig(
-            database_path=str(tmp_path / "lcm_off_current_divergent_normal_end.db"),
-            stateless_session_patterns=["stateless"],
-        )
-        engine = LCMEngine(config=config)
-        try:
-            engine.on_session_start(
-                "shared-session",
-                platform="stateless",
-                conversation_id="bypass-conversation",
-                context_length=200000,
-            )
-            engine.ingest([{"role": "user", "content": "unrelated bypass opener"}])
-
-            engine.on_session_start(
-                "shared-session",
-                platform="cli",
-                conversation_id="normal-conversation",
-                context_length=200000,
-            )
-            normal_messages = [
-                {"role": "user", "content": f"normal prefix {idx}"}
-                for idx in range(9)
-            ]
-            engine.ingest(normal_messages)
-
-            engine.on_session_start(
-                "foreground-session",
-                platform="cli",
-                conversation_id="foreground-conversation",
-                context_length=200000,
-            )
-            divergent_end = normal_messages[:8] + [
-                {"role": "user", "content": "divergent ninth message"},
-                {"role": "assistant", "content": "corrupt suffix must not append"},
-            ]
-
-            engine.on_session_end("shared-session", divergent_end)
-
-            rows = engine._store.get_session_messages("shared-session")
-            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
-            assert [row["content"] for row in normal_rows] == [
-                msg["content"] for msg in normal_messages
-            ]
-            assert all(row["content"] != "divergent ninth message" for row in rows)
-            assert all(row["content"] != "corrupt suffix must not append" for row in rows)
-            assert engine._store.get_session_count("foreground-session") == 0
         finally:
             engine.shutdown()
 
