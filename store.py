@@ -11,7 +11,6 @@ row identity (`store_id`) for DAG/source lookup.
 
 import json
 import logging
-import os
 import sqlite3
 import threading
 import time

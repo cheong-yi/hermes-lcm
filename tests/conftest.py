@@ -4,7 +4,6 @@ Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
 import sys
-import types
 import importlib
 from pathlib import Path
 

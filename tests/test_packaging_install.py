@@ -479,8 +479,6 @@ def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeyp
     (checkout / ".git").mkdir(parents=True)
     (checkout / "untracked.txt").write_text("hi", encoding="utf-8")
 
-    called = []
-
     def fake_git(*args, **kwargs):
         cmd = args[0]
         if cmd[-2:] == ["status", "--porcelain"]:
@@ -509,7 +507,6 @@ def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
 
 def test_register_gracefully_degrades_when_legacy_host_lacks_register_tool():
     """Guard regression: register() must not raise when ctx lacks register_tool."""
-    repo_root = Path(__file__).resolve().parent.parent
     module = _load_plugin_entrypoint_module("hermes_lcm_no_register_tool")
 
     class _CtxNoTool:
@@ -555,7 +552,6 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
     register_tool signatures will NOT have tools registered — they rely on
     the native context-engine path instead.
     """
-    repo_root = Path(__file__).resolve().parent.parent
     module = _load_plugin_entrypoint_module("hermes_lcm_handler_forward")
 
     registered = {}  # tool_name -> handler

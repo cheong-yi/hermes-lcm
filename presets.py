@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 import os
 from typing import Any, Mapping
 
@@ -21,9 +21,9 @@ class LCMPreset:
     policy_path: str
     policy_version: str
     runtime_env: Mapping[str, Any]
-    unsupported_runtime_fields: Mapping[str, Any] = field(default_factory=dict)
+    unsupported_runtime_fields: Mapping[str, Any] = dataclass_field(default_factory=dict)
     applies_to: tuple[str, ...] = ()
-    provenance: Mapping[str, Any] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = dataclass_field(default_factory=dict)
     notes: str = ""
 
     @property

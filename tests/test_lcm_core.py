@@ -2309,7 +2309,7 @@ class TestMessageStore:
         assert [result["store_id"] for result in results] == [direct_id]
 
     def test_search_recency_same_timestamp_pool_is_limit_stable(self, store):
-        ids = store.append_batch(
+        store.append_batch(
             "sess1",
             [
                 {

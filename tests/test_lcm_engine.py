@@ -16652,7 +16652,7 @@ class TestSessionRollover:
         engine.on_session_end("background-review-continuation", [])
         assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
 
-        next_child = self._start_host_child(
+        self._start_host_child(
             engine,
             hermes_home,
             "background-review-session-2",
@@ -16968,7 +16968,7 @@ class TestSessionRollover:
             "background-review-continuation",
             context_length=1_000,
         )
-        real_continuation = self.HostAgentFrame(
+        self.HostAgentFrame(
             "background-review-continuation",
             "background-review-session",
             hermes_home,
@@ -17589,7 +17589,7 @@ class TestSessionRollover:
             token_estimate=17,
             source="telegram",
         )
-        stale_host_store_id = engine._store.append(
+        engine._store.append(
             "old-hermes-session",
             {"role": "user", "content": "stale host context must stay"},
             token_estimate=11,
@@ -17716,7 +17716,7 @@ class TestSessionRollover:
             token_estimate=17,
             source="telegram",
         )
-        source_node_id = engine._dag.add_node(SummaryNode(
+        engine._dag.add_node(SummaryNode(
             session_id="lcm-source",
             depth=0,
             summary="parent mismatch summary",
@@ -17776,7 +17776,7 @@ class TestSessionRollover:
             token_estimate=11,
             source="telegram",
         )
-        source_node_id = engine._dag.add_node(SummaryNode(
+        engine._dag.add_node(SummaryNode(
             session_id="lcm-source",
             depth=0,
             summary="bound summary",

@@ -397,7 +397,8 @@ class LCMConfig:
         c = cls()
         _int = _parse_int_env
         _float = _parse_float_env
-        _str = lambda key, default: os.environ.get(key, default)
+        def _str(key, default):
+            return os.environ.get(key, default)
         config_sources: dict[str, str] = {}
         config_source_warnings: list[str] = []
 

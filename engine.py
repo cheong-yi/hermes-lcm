@@ -54,7 +54,6 @@ from .ingest_protection import (
     _expected_persisted_output_chars,
     _has_inline_persisted_output_generation_metadata,
     _has_lossy_sensitive_redaction,
-    _inline_persisted_output_generation_metadata,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
     _persisted_output_inline_preview_sha256,
@@ -67,7 +66,6 @@ from .ingest_protection import (
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
-    recover_hermes_persisted_output,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_text,
     redact_sensitive_value,
@@ -7061,7 +7059,6 @@ class LCMEngine(ContextEngine):
         for message in messages:
             redacted_message = dict(message)
             if "content" in redacted_message:
-                original_content = normalize_content_value(redacted_message.get("content")) or ""
                 redacted_content = redact_sensitive_value(
                     redacted_message.get("content"),
                     self._config,
