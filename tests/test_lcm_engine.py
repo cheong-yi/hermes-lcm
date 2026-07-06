@@ -2624,6 +2624,38 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_auxiliary_native_fallback_resets_on_session_end(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        config = LCMConfig(database_path=str(tmp_path / "auxiliary-native-reset-on-end.db"))
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "auxiliary final messages"}]
+        compressor = FakeContextCompressor()
+        try:
+            instance.on_session_start("foreground-session", platform="cli", context_length=2_000)
+            instance._mark_thread_context_stateless("auxiliary-session")
+            instance._host_fallback_compressor = compressor
+            instance._host_fallback_session_id = "auxiliary-session"
+
+            instance.on_session_end("auxiliary-session", messages)
+
+            assert compressor.ended == [("auxiliary-session", messages)]
+            assert compressor.reset is True
+            assert instance._host_fallback_compressor is None
+            assert instance._host_fallback_session_id == ""
+            assert not instance._thread_context_has_auxiliary_session("auxiliary-session")
+        finally:
+            instance.shutdown()
+
     def test_bypassed_native_fallback_resets_when_same_session_id_rebinds_platform(self, tmp_path, monkeypatch):
         instances = []
 
@@ -11681,8 +11713,8 @@ class TestSessionRollover:
         def should_compress(self, engine: LCMEngine):
             return engine.should_compress()
 
-        def compress(self, engine: LCMEngine, messages):
-            return engine.compress(messages)
+        def compress(self, engine: LCMEngine, messages, **kwargs):
+            return engine.compress(messages, **kwargs)
 
         def update_from_response(self, engine: LCMEngine, usage: dict) -> None:
             engine.update_from_response(usage)
@@ -12735,6 +12767,44 @@ class TestSessionRollover:
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("foreground-branch-session") == 1
 
+    def test_active_auxiliary_reused_as_foreground_with_parent_metadata_rebinds(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_active_aux_reused_foreground.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+        aux_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "foreground-branch-session",
+            "foreground-session",
+        )
+        aux_child.update_from_response(engine, {"prompt_tokens": 25})
+        assert engine._thread_context_has_auxiliary_session("foreground-branch-session")
+
+        engine.on_session_start(
+            "foreground-branch-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="foreground-session",
+        )
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "active aux id reused as foreground persists normally"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+
     def test_explicit_parent_id_without_aux_frame_or_live_row_rebinds_foreground_branch(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -12989,7 +13059,7 @@ class TestSessionRollover:
         )
         replacement.update_from_response(engine, {"prompt_tokens": 25})
         engine.on_session_end("reused-parent", [])
-        assert engine._thread_context_has_auxiliary_session("reused-parent")
+        assert not engine._thread_context_has_auxiliary_session("reused-parent")
         assert not old_child.should_compress(engine)
 
         engine.on_session_start(
@@ -13340,6 +13410,110 @@ class TestSessionRollover:
             "reused child normal final",
         ]
 
+    def test_state_db_child_of_bypassed_reused_parent_stays_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('stateless-parent', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('state-db-child', 'stateless-parent', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_state_db_bypassed_child.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine._auxiliary_lineage_session_ids.add("stateless-parent")
+        engine._auxiliary_foreground_reused_session_ids.add("stateless-parent")
+        engine._lcm_session_last_bypassed["stateless-parent"] = True
+
+        engine.on_session_start(
+            "state-db-child",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=1_000,
+        )
+
+        assert engine.current_session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("state-db-child")
+        assert engine._store.get_session_count("state-db-child") == 0
+        assert engine.should_compress_preflight([
+            {"role": "user", "content": "state db child must stay stateless"},
+        ]) is False
+        assert engine._store.get_session_count("state-db-child") == 0
+
+    def test_state_db_grandchild_of_bypassed_reused_parent_stays_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('stateless-parent', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('intermediate-child', 'stateless-parent', 3.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('state-db-grandchild', 'intermediate-child', 4.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_state_db_bypassed_grandchild.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine._auxiliary_lineage_session_ids.add("stateless-parent")
+        engine._auxiliary_foreground_reused_session_ids.add("stateless-parent")
+        engine._lcm_session_last_bypassed["stateless-parent"] = True
+
+        engine.on_session_start(
+            "state-db-grandchild",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=1_000,
+        )
+
+        assert engine.current_session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("state-db-grandchild")
+        assert engine._store.get_session_count("state-db-grandchild") == 0
+        assert engine.should_compress_preflight([
+            {"role": "user", "content": "state db grandchild must stay stateless"},
+        ]) is False
+        assert engine._store.get_session_count("state-db-grandchild") == 0
+
     def test_side_channel_child_marks_prior_normal_id_as_foreground_reuse(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -13411,6 +13585,78 @@ class TestSessionRollover:
         assert [row["content"] for row in engine._store.get_range("prior-normal-child")] == [
             "prior normal child prefix",
             "prior normal child final",
+        ]
+
+    def test_inferred_side_channel_child_preserves_prior_normal_suffix(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_inferred_side_channel_child_prior_normal.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        stateless_parent = self._start_host_child(
+            engine,
+            hermes_home,
+            "stateless-parent",
+            "foreground-session",
+        )
+        stateless_parent.on_session_end(engine, [])
+        engine.on_session_start(
+            "stateless-parent",
+            hermes_home=str(hermes_home),
+            platform="stateless",
+            context_length=1_000,
+        )
+
+        engine.on_session_start(
+            "prior-normal-child",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            conversation_id="prior-normal-child-conversation",
+            context_length=1_000,
+        )
+        normal_prefix = [{"role": "user", "content": "inferred prior normal prefix"}]
+        engine.ingest(normal_prefix)
+        engine.on_session_start(
+            "foreground-2",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=1_000,
+        )
+        side_channel_child = self.HostAgentFrame(
+            "prior-normal-child",
+            "stateless-parent",
+            hermes_home,
+        )
+        side_channel_child.on_session_start(engine)
+        assert engine._auxiliary_lineage_suppressed_as_foreground("prior-normal-child")
+        side_channel_child.on_session_end(
+            engine,
+            normal_prefix + [
+                {"role": "assistant", "content": "inferred side-channel final"},
+            ],
+        )
+        assert [row["content"] for row in engine._store.get_range("prior-normal-child")] == [
+            "inferred prior normal prefix",
+        ]
+
+        engine.on_session_end(
+            "prior-normal-child",
+            normal_prefix + [
+                {"role": "assistant", "content": "inferred prior normal final"},
+            ],
+        )
+        assert [row["content"] for row in engine._store.get_range("prior-normal-child")] == [
+            "inferred prior normal prefix",
+            "inferred prior normal final",
         ]
 
     def test_side_channel_prefix_only_end_fails_closed_for_ambiguous_suffix(self, tmp_path):
@@ -15258,7 +15504,7 @@ class TestSessionRollover:
         assert engine._session_id == "reused-session"
         assert engine._conversation_id == "normal-conversation"
         assert engine._thread_context_session_id() == ""
-        assert engine._thread_context_has_auxiliary_session("stale-continuation")
+        assert not engine._thread_context_has_auxiliary_session("stale-continuation")
         assert [
             node.node_id for node in engine._dag.get_session_nodes("reused-session")
         ] == [foreground_node_id]
@@ -16272,12 +16518,61 @@ class TestSessionRollover:
         replacement.update_from_response(engine, {"prompt_tokens": 25})
         assert replacement.should_compress(engine)
         engine.on_session_end("background-review-session", [])
-        assert engine._thread_context_has_auxiliary_session("background-review-session")
-        assert replacement.should_compress(engine)
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not replacement.should_compress(engine)
         old_messages = [{"role": "user", "content": "old frame short payload"}]
         assert count_messages_tokens(old_messages) < engine.threshold_tokens
         assert not old_child.should_compress(engine)
         assert old_child.compress(engine, old_messages) == old_messages
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_auxiliary_compress_zero_current_tokens_uses_cached_usage(self, tmp_path, monkeypatch):
+        native_calls = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self._last_compress_aborted = False
+                self._last_summary_error = None
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                native_calls.append(current_tokens)
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted auxiliary"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_zero_current_tokens.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.update_from_response(engine, {"prompt_tokens": 30})
+        messages = [{"role": "user", "content": "tiny"}]
+
+        result = child.compress(engine, messages, current_tokens=0)
+
+        assert native_calls == [30]
+        assert result == [{"role": "user", "content": "native compacted auxiliary"}]
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("background-review-session") == 0
 
@@ -16354,6 +16649,41 @@ class TestSessionRollover:
         assert engine.should_compress()
         assert engine.compress(messages) == messages
         assert calls == [(25, None, False)]
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_stack_marked_auxiliary_update_uses_generation_usage_without_caller_frame(
+        self,
+        tmp_path,
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_stack_marked_update.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        assert engine._auxiliary_session_generations["background-review-session"]
+        stack = engine._thread_context_auxiliary_stack()
+        stack[:] = ["background-review-session"]
+        engine._thread_context.current_auxiliary_session_id = "background-review-session"
+        assert engine._thread_context_session_id() == "background-review-session"
+
+        engine.update_from_response({"prompt_tokens": 25})
+
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 25}
+        assert child.should_compress(engine)
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("background-review-session") == 0
 
@@ -16553,6 +16883,51 @@ class TestSessionRollover:
         assert engine._auxiliary_last_prompt_tokens == {}
         assert not stale_continuation.should_compress(engine)
         assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+
+    def test_retired_generation_boundary_does_not_reactivate_stale_continuation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_retired_generation_boundary_reject.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        stale_continuation = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-continuation",
+            "background-review-session",
+        )
+        stale_generation = engine._auxiliary_session_generations["background-review-continuation"]
+        stale_continuation.on_session_end(engine, [])
+        assert engine._auxiliary_generation_is_retired(
+            "background-review-continuation",
+            stale_generation,
+        )
+
+        stale_continuation.on_compression_boundary_from(
+            engine,
+            old_session_id="background-review-session",
+            context_length=1_000,
+        )
+        stale_continuation.update_from_response(engine, {"prompt_tokens": 99})
+
+        assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+        assert engine._auxiliary_last_prompt_tokens == {}
+        assert not stale_continuation.should_compress(engine)
         assert engine._store.get_session_count("background-review-session") == 0
         assert engine._store.get_session_count("background-review-continuation") == 0
 
@@ -16864,6 +17239,320 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-session") == 0
         assert engine._store.get_session_count("background-review-continuation") == 0
 
+    def test_stale_auxiliary_end_does_not_reset_live_native_fallback(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_aux_end_fallback.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        stale_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        live_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        live_child.update_from_response(engine, {"prompt_tokens": 25})
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "background-review-session"
+
+        stale_child.on_session_end(engine, [{"role": "user", "content": "stale final"}])
+
+        assert compressor.ended == []
+        assert compressor.reset is False
+        assert engine._host_fallback_compressor is compressor
+        assert engine._host_fallback_session_id == "background-review-session"
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert live_child.should_compress(engine)
+
+    def test_auxiliary_generation_replacement_resets_native_fallback(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_replacement_fallback_reset.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        old_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        old_child.update_from_response(engine, {"prompt_tokens": 25})
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "background-review-session"
+
+        live_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+
+        assert compressor.ended == [("background-review-session", [])]
+        assert compressor.reset is True
+        assert engine._host_fallback_compressor is None
+        assert engine._host_fallback_session_id == ""
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 30}
+
+    def test_auxiliary_generation_adoption_resets_native_fallback(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_adoption_fallback_reset.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        child = self.HostAgentFrame(
+            "background-review-session",
+            "foreground-session",
+            hermes_home,
+        )
+        engine._mark_thread_context_stateless("background-review-session")
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "background-review-session"
+
+        child.update_from_response(engine, {"prompt_tokens": 30})
+
+        assert compressor.ended == [("background-review-session", [])]
+        assert compressor.reset is True
+        assert engine._host_fallback_compressor is None
+        assert engine._host_fallback_session_id == ""
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 30}
+        assert "background-review-session" in engine._auxiliary_session_generations
+
+    def test_auxiliary_handoff_generation_replacement_resets_native_fallback(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_handoff_replacement_fallback_reset.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        self._start_host_child(engine, hermes_home, "parent-session", "foreground-session")
+        first_continuation = self.HostAgentFrame(
+            "reused-continuation",
+            "parent-session",
+            hermes_home,
+        )
+        first_continuation.on_compression_boundary_from(
+            engine,
+            old_session_id="parent-session",
+            context_length=1_000,
+        )
+        first_generation = engine._auxiliary_session_generations["reused-continuation"]
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "reused-continuation"
+
+        second_continuation = self.HostAgentFrame(
+            "reused-continuation",
+            "parent-session",
+            hermes_home,
+        )
+        second_continuation.on_compression_boundary_from(
+            engine,
+            old_session_id="parent-session",
+            context_length=1_000,
+        )
+
+        assert engine._auxiliary_session_generations["reused-continuation"] != first_generation
+        assert compressor.ended == [("reused-continuation", [])]
+        assert compressor.reset is True
+        assert engine._host_fallback_compressor is None
+        assert engine._host_fallback_session_id == ""
+
+    def test_stale_auxiliary_boundary_does_not_reset_live_native_fallback(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_aux_boundary_fallback.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        stale_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        live_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "background-review-session"
+
+        stale_child.on_compression_boundary(engine, "stale-continuation", context_length=1_000)
+
+        assert compressor.ended == []
+        assert compressor.reset is False
+        assert engine._host_fallback_compressor is compressor
+        assert engine._host_fallback_session_id == "background-review-session"
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("stale-continuation")
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 30}
+        engine.threshold_tokens = 20
+        assert live_child.should_compress(engine)
+
+    def test_direct_host_end_clears_guarded_replacement_with_usage(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        config = LCMConfig(database_path=str(tmp_path / "lcm_guarded_replacement_direct_end.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        old_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        old_child.update_from_response(engine, {"prompt_tokens": 25})
+        replacement_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        replacement_child.update_from_response(engine, {"prompt_tokens": 30})
+        assert "background-review-session" in engine._auxiliary_direct_end_guard_session_ids
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 30}
+
+        engine.on_session_end("background-review-session", [])
+
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._auxiliary_last_prompt_tokens == {}
+        assert "background-review-session" not in engine._auxiliary_direct_end_guard_session_ids
+        assert "background-review-session" not in engine._auxiliary_session_generations
+
+    def test_generationless_duplicate_start_preserves_live_auxiliary_generation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_duplicate_start_generation.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        previous_generation = engine._auxiliary_session_generations["background-review-session"]
+
+        child.on_session_start(
+            engine,
+            parent_session_id="foreground-session",
+            context_length=1_000,
+        )
+
+        assert engine._auxiliary_session_generations == {
+            "background-review-session": previous_generation
+        }
+        assert engine._auxiliary_retired_session_generations == {}
+        child.update_from_response(engine, {"prompt_tokens": 25})
+        assert engine._auxiliary_last_prompt_tokens == {"background-review-session": 25}
+        assert child.should_compress(engine)
+
     def test_auxiliary_handoff_reused_generationless_continuation_rejects_stale_parent(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -16924,6 +17613,426 @@ class TestSessionRollover:
         assert real_continuation.should_compress(engine)
         assert not stale_continuation.should_compress(engine)
 
+    def test_stale_generationless_boundary_preserves_live_continuation_usage(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_stale_boundary_live_usage.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+
+        parent_one = self._start_host_child(engine, hermes_home, "parent-one", "foreground-session")
+        parent_one.on_compression_boundary(engine, "shared-continuation", context_length=1_000)
+        parent_two = self._start_host_child(engine, hermes_home, "parent-two", "foreground-session")
+        parent_two.on_compression_boundary(engine, "shared-continuation", context_length=1_000)
+        real_continuation = self.HostAgentFrame(
+            "shared-continuation",
+            "parent-two",
+            hermes_home,
+        )
+        real_continuation.update_from_response(engine, {"prompt_tokens": 30})
+        assert real_continuation.should_compress(engine)
+
+        parent_one.on_compression_boundary(engine, "shared-continuation", context_length=1_000)
+
+        assert engine._auxiliary_last_prompt_tokens == {"shared-continuation": 30}
+        assert real_continuation.should_compress(engine)
+
+    def test_no_frame_stale_boundary_does_not_replace_live_auxiliary(self, tmp_path):
+        class FakeContextCompressor:
+            def __init__(self):
+                self.ended = []
+                self.reset = False
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append((session_id, messages))
+
+            def on_session_reset(self):
+                self.reset = True
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_no_frame_stale_boundary_live_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        stale_child = self._start_host_child(engine, hermes_home, "reused-child", "foreground-session")
+        stale_child.on_session_end(engine, [])
+        live_child = self._start_host_child(engine, hermes_home, "reused-child", "foreground-session")
+        live_generation = engine._auxiliary_session_generations["reused-child"]
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        compressor = FakeContextCompressor()
+        engine._host_fallback_compressor = compressor
+        engine._host_fallback_session_id = "reused-child"
+        assert live_child.should_compress(engine)
+
+        engine.on_session_start(
+            "stale-continuation",
+            hermes_home=str(hermes_home),
+            boundary_reason="compression",
+            old_session_id="reused-child",
+            platform="telegram",
+            context_length=1_000,
+        )
+
+        assert engine._thread_context_has_auxiliary_session("reused-child")
+        assert engine._thread_context_has_auxiliary_session("stale-continuation")
+        assert engine._auxiliary_session_generations["reused-child"] == live_generation
+        assert engine._auxiliary_last_prompt_tokens == {"reused-child": 30}
+        assert engine._host_fallback_compressor is compressor
+        assert engine._host_fallback_session_id == "reused-child"
+        assert compressor.ended == []
+        assert compressor.reset is False
+        assert live_child.should_compress(engine)
+        assert engine._store.get_session_count("reused-child") == 0
+        assert engine._store.get_session_count("stale-continuation") == 0
+
+    def test_auxiliary_handoff_to_foreground_reused_id_stays_active(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_handoff_foreground_reused_id.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        old_aux = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-continuation",
+            "foreground-session",
+        )
+        old_aux.update_from_response(engine, {"prompt_tokens": 25})
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+
+        engine.on_session_start(
+            "next-foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        self._start_host_child(engine, hermes_home, "parent-session", "next-foreground-session")
+        continuation = self.HostAgentFrame("reused-continuation", "parent-session", hermes_home)
+        continuation.on_compression_boundary_from(engine, old_session_id="parent-session")
+
+        assert engine._thread_context_has_auxiliary_session("reused-continuation")
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+        assert engine._auxiliary_session_generations["reused-continuation"]
+        continuation.update_from_response(engine, {"prompt_tokens": 25})
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 25}
+        engine.threshold_tokens = 20
+        engine._last_boundary_skip_time = 0
+        assert continuation.should_compress(engine)
+        assert engine._store.get_session_count("reused-continuation") == 0
+        assert engine._store.get_session_count("parent-session") == 0
+
+    def test_foreground_reused_handoff_replacement_clears_stale_usage(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_foreground_reused_handoff_replacement.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        old_aux = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-continuation",
+            "foreground-session",
+        )
+        old_aux.update_from_response(engine, {"prompt_tokens": 25})
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+
+        engine.on_session_start(
+            "next-foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        self._start_host_child(engine, hermes_home, "parent-a", "next-foreground-session")
+        first_continuation = self.HostAgentFrame("reused-continuation", "parent-a", hermes_home)
+        first_continuation.on_compression_boundary_from(engine, old_session_id="parent-a")
+        first_continuation.update_from_response(engine, {"prompt_tokens": 30})
+        first_generation = engine._auxiliary_session_generations["reused-continuation"]
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 30}
+
+        self._start_host_child(engine, hermes_home, "parent-b", "next-foreground-session")
+        second_continuation = self.HostAgentFrame("reused-continuation", "parent-b", hermes_home)
+        second_continuation.on_compression_boundary_from(engine, old_session_id="parent-b")
+
+        assert engine._auxiliary_session_generations["reused-continuation"] != first_generation
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+        assert engine._auxiliary_last_prompt_tokens == {}
+        assert not second_continuation.should_compress(engine)
+        assert not first_continuation.should_compress(engine)
+        second_continuation.update_from_response(engine, {"prompt_tokens": 30})
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 30}
+
+    def test_parent_handoff_to_foreground_reused_id_retires_displaced_generation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_parent_handoff_retires_reused_generation.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        old_aux = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-continuation",
+            "foreground-session",
+        )
+        old_aux.update_from_response(engine, {"prompt_tokens": 25})
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.on_session_start(
+            "next-foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        self._start_host_child(engine, hermes_home, "parent-a", "next-foreground-session")
+        first_continuation = self.HostAgentFrame("reused-continuation", "parent-a", hermes_home)
+        first_continuation.on_compression_boundary_from(engine, old_session_id="parent-a")
+        first_continuation.update_from_response(engine, {"prompt_tokens": 30})
+        first_generation = engine._auxiliary_session_generations["reused-continuation"]
+
+        parent_b = self._start_host_child(engine, hermes_home, "parent-b", "next-foreground-session")
+        parent_b.on_compression_boundary(engine, "reused-continuation", context_length=1_000)
+
+        assert engine._auxiliary_generation_is_retired("reused-continuation", first_generation)
+        assert engine._auxiliary_last_prompt_tokens == {}
+        first_continuation.update_from_response(engine, {"prompt_tokens": 99})
+        assert engine._auxiliary_last_prompt_tokens == {}
+        assert not first_continuation.should_compress(engine)
+        assert engine._store.get_session_count("reused-continuation") == 0
+
+    def test_stale_parent_handoff_does_not_clobber_live_reused_continuation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_parent_handoff_live_reused.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.threshold_tokens = 20
+        old_aux = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-continuation",
+            "foreground-session",
+        )
+        old_aux.update_from_response(engine, {"prompt_tokens": 25})
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        engine.on_session_start(
+            "next-foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        self._start_host_child(engine, hermes_home, "parent-a", "next-foreground-session")
+        first_continuation = self.HostAgentFrame("reused-continuation", "parent-a", hermes_home)
+        first_continuation.on_compression_boundary_from(engine, old_session_id="parent-a")
+        first_continuation.update_from_response(engine, {"prompt_tokens": 30})
+        self._start_host_child(engine, hermes_home, "parent-b", "next-foreground-session")
+        second_continuation = self.HostAgentFrame("reused-continuation", "parent-b", hermes_home)
+        second_continuation.on_compression_boundary_from(engine, old_session_id="parent-b")
+        second_continuation.update_from_response(engine, {"prompt_tokens": 40})
+        live_generation = engine._auxiliary_session_generations["reused-continuation"]
+        retired_parent_a_generations = engine._auxiliary_retired_session_generations["parent-a"]
+        assert retired_parent_a_generations
+        assert all(
+            engine._auxiliary_generation_is_retired("parent-a", generation)
+            for generation in retired_parent_a_generations
+        )
+
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            boundary_reason="compression",
+            old_session_id="parent-a",
+            platform="telegram",
+            context_length=1_000,
+        )
+
+        assert engine._auxiliary_session_generations["reused-continuation"] == live_generation
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 40}
+        second_continuation.update_from_response(engine, {"prompt_tokens": 45})
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 45}
+        assert engine._store.get_session_count("reused-continuation") == 0
+
+    def test_generationless_parent_handoff_to_foreground_reused_id_stays_active(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_generationless_handoff_foreground_reused_id.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        old_aux = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-continuation",
+            "foreground-session",
+        )
+        old_aux.update_from_response(engine, {"prompt_tokens": 25})
+        engine.on_session_start(
+            "reused-continuation",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+
+        engine.on_session_start(
+            "next-foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        parent = self._start_host_child(engine, hermes_home, "parent-session", "next-foreground-session")
+        parent.on_compression_boundary(engine, "reused-continuation", context_length=1_000)
+
+        assert engine._thread_context_has_auxiliary_session("reused-continuation")
+        assert "reused-continuation" in engine._auxiliary_foreground_reused_session_ids
+        assert "reused-continuation" not in engine._auxiliary_session_generations
+        continuation = self.HostAgentFrame("reused-continuation", "parent-session", hermes_home)
+        continuation.update_from_response(engine, {"prompt_tokens": 25})
+        assert engine._auxiliary_session_generations["reused-continuation"]
+        assert engine._auxiliary_last_prompt_tokens == {"reused-continuation": 25}
+        engine.threshold_tokens = 20
+        engine._last_boundary_skip_time = 0
+        assert continuation.should_compress(engine)
+
+    def test_stale_retired_auxiliary_boundary_does_not_clobber_live_generation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_retired_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        stale_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-child",
+            "foreground-session",
+        )
+        stale_child.update_from_response(engine, {"prompt_tokens": 25})
+
+        live_child = self.HostAgentFrame("reused-child", "foreground-session", hermes_home)
+        live_child.on_session_start(engine, context_length=1_000)
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        live_generation = engine._auxiliary_session_generations["reused-child"]
+        assert live_generation != 0
+        assert engine._auxiliary_last_prompt_tokens == {"reused-child": 30}
+
+        stale_child.on_compression_boundary(engine, "stale-continuation", context_length=1_000)
+
+        assert engine._thread_context_has_auxiliary_session("reused-child")
+        assert engine._auxiliary_session_generations["reused-child"] == live_generation
+        assert engine._auxiliary_last_prompt_tokens == {"reused-child": 30}
+        assert live_child.thread_context_session_id(engine) == "reused-child"
+
+    def test_generationless_stale_auxiliary_boundary_does_not_clobber_live_generation(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_generationless_stale_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        stale_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-child",
+            "foreground-session",
+        )
+        stale_child.update_from_response(engine, {"prompt_tokens": 25})
+
+        live_child = self.HostAgentFrame("reused-child", "foreground-session", hermes_home)
+        live_child.on_session_start(engine, context_length=1_000)
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        live_generation = engine._auxiliary_session_generations["reused-child"]
+        assert live_generation != 0
+        assert engine._auxiliary_last_prompt_tokens == {"reused-child": 30}
+
+        stale_child.on_compression_boundary(
+            engine,
+            "stale-continuation",
+            context_length=1_000,
+        )
+
+        assert engine._thread_context_has_auxiliary_session("reused-child")
+        assert not engine._thread_context_has_auxiliary_session("stale-continuation")
+        assert engine._auxiliary_session_generations["reused-child"] == live_generation
+        assert engine._auxiliary_last_prompt_tokens == {"reused-child": 30}
+        engine.threshold_tokens = 20
+        assert live_child.should_compress(engine)
+
     def test_auxiliary_handoff_reused_clean_continuation_rejects_stale_generation(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -16980,6 +18089,48 @@ class TestSessionRollover:
         assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
         assert engine._auxiliary_last_prompt_tokens == {}
         assert engine._auxiliary_session_generations == {}
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+
+    def test_live_guarded_auxiliary_boundary_without_frame_is_accepted(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_live_guarded_boundary_no_frame.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=1_000,
+        )
+        first_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        first_child.update_from_response(engine, {"prompt_tokens": 25})
+        live_child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        live_child.update_from_response(engine, {"prompt_tokens": 30})
+        assert "background-review-session" in engine._auxiliary_direct_end_guard_session_ids
+
+        engine.on_session_start(
+            "background-review-continuation",
+            hermes_home=str(hermes_home),
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=1_000,
+        )
+
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
         assert engine._store.get_session_count("background-review-session") == 0
         assert engine._store.get_session_count("background-review-continuation") == 0
 
