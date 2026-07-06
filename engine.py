@@ -29,7 +29,6 @@ from .diagnostics import _enforce_state_db_containment
 from .escalation import (
     SummaryCircuitBreaker,
     SummarySpendGuard,
-    _strip_reasoning_blocks,
     summarize_with_escalation,
 )
 from .externalize import (
@@ -81,6 +80,11 @@ from .schemas import (
     LCM_INSPECT,
     LCM_LOAD_SESSION,
     LCM_STATUS,
+)
+from .sanitize import (
+    _clean_active_assistant_message,
+    _contains_sensitive_redaction,
+    _should_drop_active_assistant_message,
 )
 from .session_patterns import (
     build_session_match_keys,
@@ -250,17 +254,6 @@ def _is_codex_gpt55_route(model: str | None, provider: str | None) -> bool:
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
-_VISIBLE_TEXT_PART_TYPES = {"text", "input_text", "output_text"}
-_INTERNAL_ASSISTANT_PART_TYPES = {
-    "analysis",
-    "chain_of_thought",
-    "internal",
-    "reasoning",
-    "redacted_thinking",
-    "scratchpad",
-    "thought",
-    "thinking",
-}
 
 
 def _strip_metadata_scalar(value: str) -> str:
@@ -1861,28 +1854,14 @@ class LCMEngine(ContextEngine):
                     return True
                 if "[LCM sensitive redaction:" in replay_text:
                     return True
-            if original_msg.get("content") != replay_msg.get("content") and self._contains_sensitive_redaction(
+            if original_msg.get("content") != replay_msg.get("content") and _contains_sensitive_redaction(
                 replay_msg.get("content")
             ):
                 return True
-            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and self._contains_sensitive_redaction(
+            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and _contains_sensitive_redaction(
                 replay_msg.get("tool_calls")
             ):
                 return True
-        return False
-
-    @staticmethod
-    def _contains_sensitive_redaction(value: Any) -> bool:
-        if isinstance(value, str):
-            return "[LCM sensitive redaction:" in value
-        if isinstance(value, dict):
-            return any(
-                LCMEngine._contains_sensitive_redaction(item)
-                for pair in value.items()
-                for item in pair
-            )
-        if isinstance(value, list):
-            return any(LCMEngine._contains_sensitive_redaction(item) for item in value)
         return False
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
@@ -6444,7 +6423,7 @@ class LCMEngine(ContextEngine):
         role, content, _tool_call_id, tool_calls = identity
         if role != "assistant" or tool_calls:
             return False
-        return cls._should_drop_active_assistant_message({
+        return _should_drop_active_assistant_message({
             "role": role,
             "content": cls._identity_content_for_active_cleanup(content),
         })
@@ -6467,7 +6446,7 @@ class LCMEngine(ContextEngine):
             except (TypeError, ValueError, json.JSONDecodeError):
                 decoded_tool_calls = tool_calls
             msg["tool_calls"] = decoded_tool_calls
-        cleaned = cls._clean_active_assistant_message(msg)
+        cleaned = _clean_active_assistant_message(msg)
         if cleaned is None:
             return None
         return (
@@ -7860,139 +7839,6 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: tool-pair sanitization ------------------------------------
 
-    @staticmethod
-    def _structured_part_text(part: Dict[str, Any]) -> str:
-        for key in ("text", "content", "value"):
-            value = part.get(key)
-            if isinstance(value, str):
-                return value
-            if isinstance(value, dict):
-                nested = value.get("value")
-                if isinstance(nested, str):
-                    return nested
-                nested = value.get("content")
-                if isinstance(nested, str):
-                    return nested
-        return ""
-
-    @classmethod
-    def _structured_part_has_visible_assistant_content(cls, part: Any) -> bool:
-        if part is None:
-            return False
-        if isinstance(part, str):
-            return bool(_strip_reasoning_blocks(part).strip())
-        if not isinstance(part, dict):
-            return bool(str(part).strip())
-
-        part_type = str(part.get("type") or "").strip().lower()
-        if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-            return False
-        if part_type in _VISIBLE_TEXT_PART_TYPES:
-            return bool(_strip_reasoning_blocks(cls._structured_part_text(part)).strip())
-
-        # Unknown non-internal content blocks may be visible (for example
-        # images/audio/annotations in provider-specific formats).  Preserve
-        # them rather than risk dropping a legitimate assistant turn.
-        return True
-
-    @classmethod
-    def _assistant_message_has_visible_content(cls, msg: Dict[str, Any]) -> bool:
-        content = msg.get("content")
-        if content is None:
-            return False
-        if isinstance(content, str):
-            return bool(_strip_reasoning_blocks(content).strip())
-        if isinstance(content, list):
-            return any(cls._structured_part_has_visible_assistant_content(part) for part in content)
-        if isinstance(content, dict):
-            return cls._structured_part_has_visible_assistant_content(content)
-        return bool(str(content).strip())
-
-    @classmethod
-    def _strip_structured_text_part(cls, part: Dict[str, Any]) -> Dict[str, Any] | None:
-        cleaned = dict(part)
-        for key in ("text", "content", "value"):
-            value = cleaned.get(key)
-            if isinstance(value, str):
-                stripped = _strip_reasoning_blocks(value)
-                if not stripped.strip():
-                    return None
-                cleaned[key] = stripped
-                return cleaned
-            if isinstance(value, dict):
-                nested = dict(value)
-                for nested_key in ("value", "content", "text"):
-                    nested_value = nested.get(nested_key)
-                    if isinstance(nested_value, str):
-                        stripped = _strip_reasoning_blocks(nested_value)
-                        if not stripped.strip():
-                            return None
-                        nested[nested_key] = stripped
-                        cleaned[key] = nested
-                        return cleaned
-        return cleaned if cls._structured_part_has_visible_assistant_content(cleaned) else None
-
-    @classmethod
-    def _sanitize_active_assistant_content(cls, content: Any) -> Any | None:
-        if content is None:
-            return None
-        if isinstance(content, str):
-            stripped = _strip_reasoning_blocks(content)
-            return stripped if stripped.strip() else None
-        if isinstance(content, list):
-            cleaned_parts: list[Any] = []
-            for part in content:
-                if isinstance(part, str):
-                    stripped = _strip_reasoning_blocks(part)
-                    if stripped.strip():
-                        cleaned_parts.append(stripped)
-                    continue
-                if isinstance(part, dict):
-                    part_type = str(part.get("type") or "").strip().lower()
-                    if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-                        continue
-                    if part_type in _VISIBLE_TEXT_PART_TYPES:
-                        cleaned_part = cls._strip_structured_text_part(part)
-                        if cleaned_part is not None:
-                            cleaned_parts.append(cleaned_part)
-                        continue
-                if cls._structured_part_has_visible_assistant_content(part):
-                    cleaned_parts.append(part)
-            return cleaned_parts or None
-        if isinstance(content, dict):
-            part_type = str(content.get("type") or "").strip().lower()
-            if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-                return None
-            if part_type in _VISIBLE_TEXT_PART_TYPES:
-                return cls._strip_structured_text_part(content)
-            return content if cls._structured_part_has_visible_assistant_content(content) else None
-        return content if str(content).strip() else None
-
-    @classmethod
-    def _clean_active_assistant_message(cls, msg: Dict[str, Any]) -> Dict[str, Any] | None:
-        if msg.get("role") != "assistant":
-            return msg
-        if "content" not in msg:
-            return msg
-        cleaned_content = cls._sanitize_active_assistant_content(msg.get("content"))
-        if cleaned_content is None:
-            if not msg.get("tool_calls"):
-                return None
-            cleaned_content = ""
-        if cleaned_content == msg.get("content"):
-            return msg
-        cleaned = dict(msg)
-        cleaned["content"] = cleaned_content
-        return cleaned
-
-    @classmethod
-    def _should_drop_active_assistant_message(cls, msg: Dict[str, Any]) -> bool:
-        if msg.get("role") != "assistant":
-            return False
-        if msg.get("tool_calls"):
-            return False
-        return cls._clean_active_assistant_message(msg) is None
-
     def _sanitize_active_context_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -8011,7 +7857,7 @@ class LCMEngine(ContextEngine):
         for msg in messages:
             msg = self._sanitize_active_preserved_objective_message(msg)
             if msg.get("role") == "assistant":
-                cleaned_msg = self._clean_active_assistant_message(msg)
+                cleaned_msg = _clean_active_assistant_message(msg)
                 if cleaned_msg is None:
                     dropped_assistant_messages += 1
                     continue
