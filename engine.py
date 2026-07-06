@@ -91,6 +91,12 @@ from .session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from .message_analysis import (
+    _assistant_tool_call_ids,
+    _is_synthetic_assistant_noise,
+    _matched_tool_call_ids,
+    _tool_call_id,
+)
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
@@ -367,58 +373,9 @@ def _temporary_sqlite_busy_timeout(
             conn.execute(f"PRAGMA busy_timeout={original}")
 
 
-_SYNTHETIC_ASSISTANT_NOISE = {
-    "ack",
-    "acknowledged",
-    "heartbeat",
-    "heartbeat ack",
-    "keepalive",
-    "keep alive",
-    "pong",
-}
-
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
-
-
-def _tool_call_id(tool_call: Any) -> str:
-    if not isinstance(tool_call, dict):
-        return ""
-    value = tool_call.get("id") or tool_call.get("tool_call_id")
-    return str(value).strip() if value else ""
-
-
-def _assistant_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
-    call_ids: set[str] = set()
-    for msg in messages:
-        if msg.get("role") != "assistant":
-            continue
-        for tool_call in msg.get("tool_calls") or []:
-            call_id = _tool_call_id(tool_call)
-            if call_id:
-                call_ids.add(call_id)
-    return call_ids
-
-
-def _matched_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
-    assistant_call_ids = _assistant_tool_call_ids(messages)
-    tool_result_ids: set[str] = set()
-    for msg in messages:
-        if msg.get("role") == "tool":
-            tool_call_id = str(msg.get("tool_call_id") or "").strip()
-            if tool_call_id:
-                tool_result_ids.add(tool_call_id)
-    return assistant_call_ids & tool_result_ids
-
-
-def _is_synthetic_assistant_noise(content: str) -> bool:
-    normalized = re.sub(r"\s+", " ", (content or "").strip()).lower()
-    if not normalized:
-        return True
-    normalized = normalized.strip("`*_ ")
-    bracketless = normalized.strip("[](){} ")
-    return normalized in _SYNTHETIC_ASSISTANT_NOISE or bracketless in _SYNTHETIC_ASSISTANT_NOISE
 
 
 class LCMEngine(ContextEngine):
