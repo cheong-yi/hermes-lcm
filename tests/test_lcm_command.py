@@ -1200,6 +1200,10 @@ def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
     class FakeStore:
         _conn = ro_conn
 
+        @property
+        def connection(self):
+            return self._conn
+
     class FakeEngine:
         _store = FakeStore()
 

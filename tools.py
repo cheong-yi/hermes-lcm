@@ -2182,7 +2182,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     runtime_identity = full_status.get("runtime_identity") or engine.get_runtime_identity()
     lifecycle = _inspect_lifecycle_state(engine, session_id, conversation_id)
 
-    store_totals_row = engine._store._conn.execute(
+    store_totals_row = engine._store.connection.execute(
         """
         SELECT COUNT(*), MIN(store_id), MAX(store_id), COALESCE(SUM(token_estimate), 0)
         FROM messages
@@ -2459,7 +2459,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1. Database integrity
     try:
-        result = engine._store._conn.execute("PRAGMA integrity_check").fetchone()
+        result = engine._store.connection.execute("PRAGMA integrity_check").fetchone()
         ok = result and result[0] == "ok"
         checks.append({
             "check": "database_integrity",
@@ -2509,7 +2509,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     })
 
     try:
-        conn = engine._store._conn
+        conn = engine._store.connection
         if conn is None:
             raise RuntimeError("LCM store connection is not initialized")
         schema_health = inspect_lcm_schema_health(
@@ -2533,7 +2533,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
     # inverted indexes point at the exact table and repair path.
     for check_name, conn, spec in (
-        ("messages_fts_integrity", engine._store._conn, build_message_fts_spec()),
+        ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
         ("nodes_fts_integrity", engine._dag._conn, build_nodes_fts_spec()),
     ):
         try:
@@ -2553,8 +2553,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 2. SQLite storage posture and payload diagnostics
     try:
-        journal_mode_row = engine._store._conn.execute("PRAGMA journal_mode").fetchone()
-        quick_check_row = engine._store._conn.execute("PRAGMA quick_check").fetchone()
+        journal_mode_row = engine._store.connection.execute("PRAGMA journal_mode").fetchone()
+        quick_check_row = engine._store.connection.execute("PRAGMA quick_check").fetchone()
         db_path = Path(engine._store.db_path)
         wal_path = Path(str(db_path) + "-wal")
         checks.append({
@@ -2569,10 +2569,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
             },
         })
-        payload_risks = scan_sqlite_payload_risks(engine._store._conn)
+        payload_risks = scan_sqlite_payload_risks(engine._store.connection)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
         externalized_integrity = scan_externalized_payload_integrity(
-            engine._store._conn,
+            engine._store.connection,
             engine._config,
             hermes_home=engine._hermes_home,
         )
@@ -2621,10 +2621,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 3. FTS index sync
     try:
-        msg_count = engine._store._conn.execute(
+        msg_count = engine._store.connection.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
-        fts_count = engine._store._conn.execute(
+        fts_count = engine._store.connection.execute(
             """
             SELECT COUNT(*)
             FROM messages_fts

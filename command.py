@@ -37,6 +37,7 @@ from .presets import (
     suggest_preset_for_engine,
     unsupported_runtime_fields_text,
 )
+from .maintenance import backup_database, rotate_backup_database
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
 
@@ -221,37 +222,8 @@ def _status_text(engine) -> str:
 
 
 def _scan_clean_candidates(engine) -> dict[str, Any]:
-    conn = engine._store._conn
     try:
-        rows = conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id, COUNT(*) AS node_count
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            ORDER BY s.session_id
-            """
-        ).fetchall()
+        rows = engine._store.scan_session_cleanup_stats()
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
@@ -306,7 +278,6 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 
 
 def _scan_retention_candidates(engine) -> dict[str, Any]:
-    conn = engine._store._conn
     now = datetime.now().timestamp()
     # SQL is scoped to the foreground session so /lcm doctor retention
     # reports the operator's real conversation rather than whatever side
@@ -327,48 +298,7 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
             "protected_count": 0,
         }
     try:
-        rows = conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total,
-                       MIN(timestamp) AS first_message_at,
-                       MAX(timestamp) AS last_message_at
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS node_count,
-                       COALESCE(SUM(token_count), 0) AS node_token_total,
-                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
-                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count,
-                   COALESCE(n.node_token_total, 0) AS node_token_total,
-                   m.first_message_at,
-                   m.last_message_at,
-                   n.first_node_at,
-                   n.last_node_at
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            WHERE s.session_id = ?
-            ORDER BY s.session_id
-            """,
-            (session_id,),
-        ).fetchall()
+        rows = engine._store.scan_session_retention_stats(session_id)
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
@@ -460,113 +390,6 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
     }
 
 
-def _flush_engine_connections(engine) -> None:
-    """Commit pending writes on every SQLite connection the engine owns.
-
-    Shared by ``_backup_database`` (timestamped backup) and
-    ``_rotate_backup_database`` (rolling backup) so the connection-flush
-    contract stays in one place.
-    """
-    engine._store._conn.commit()
-    engine._dag._conn.commit()
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
-        lifecycle_conn.commit()
-
-
-def _backup_database(engine) -> dict[str, Any]:
-    db_path = Path(engine._store.db_path)
-    if not db_path.exists():
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "error": "database file does not exist",
-        }
-
-    backup_dir = engine.backup_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"
-
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        _flush_engine_connections(engine)
-
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            engine._store._conn.backup(dest)
-        finally:
-            dest.close()
-    except (OSError, sqlite3.Error) as exc:
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "error": str(exc),
-        }
-
-    backup_size = backup_path.stat().st_size if backup_path.exists() else 0
-    return {
-        "ok": True,
-        "db_path": db_path,
-        "backup_path": backup_path,
-        "backup_size": backup_size,
-    }
-
-
-def _rotate_backup_database(engine) -> dict[str, Any]:
-    """Write a rolling rotate-latest SQLite snapshot of the LCM store.
-
-    Atomic via tmp-then-rename so the slot is never half-written. Unlike
-    ``_backup_database`` which produces timestamped files, this overwrites a
-    single rolling slot so disk usage stays bounded across repeated rotates.
-    """
-    db_path = Path(engine._store.db_path)
-    if not db_path.exists():
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "error": "database file does not exist",
-        }
-
-    backup_path = engine.rotate_backup_path()
-    backup_dir = backup_path.parent
-    tmp_path = backup_path.with_name(backup_path.name + ".tmp")
-
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        _flush_engine_connections(engine)
-
-        if tmp_path.exists():
-            tmp_path.unlink()
-        dest = sqlite3.connect(str(tmp_path))
-        try:
-            engine._store._conn.backup(dest)
-        finally:
-            dest.close()
-        # Atomic replace so the rolling slot is never half-written.
-        tmp_path.replace(backup_path)
-    except (OSError, sqlite3.Error) as exc:
-        # Best-effort cleanup of the tmp file if something failed midway.
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "backup_path": backup_path,
-            "error": str(exc),
-        }
-
-    backup_size = backup_path.stat().st_size if backup_path.exists() else 0
-    return {
-        "ok": True,
-        "db_path": db_path,
-        "backup_path": backup_path,
-        "backup_size": backup_size,
-    }
-
-
 def _rotate_text(engine) -> str:
     preview = engine.rotate_active_session(apply=False)
     if not preview.get("ok"):
@@ -642,7 +465,7 @@ def _rotate_apply_text(engine) -> str:
         ]
         return "\n".join(lines)
 
-    backup = _rotate_backup_database(engine)
+    backup = rotate_backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM rotate apply",
@@ -692,7 +515,7 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
         "messages_fts": build_message_fts_spec(),
         "nodes_fts": build_nodes_fts_spec(),
     }
-    conn = engine._store._conn
+    conn = engine._store.connection
     for label, spec in specs.items():
         try:
             structural_needs_repair = external_content_fts_needs_repair(conn, spec)
@@ -753,7 +576,7 @@ def _doctor_repair_text(engine) -> str:
 
 
 def _doctor_repair_apply_text(engine) -> str:
-    backup = _backup_database(engine)
+    backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM doctor repair apply",
@@ -763,7 +586,7 @@ def _doctor_repair_apply_text(engine) -> str:
             "note: repair apply aborted before any FTS tables were repaired",
         ])
 
-    conn = engine._store._conn
+    conn = engine._store.connection
     try:
         messages_result = repair_external_content_fts(conn, build_message_fts_spec())
         nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
@@ -852,7 +675,7 @@ def _doctor_source_apply_text(engine) -> str:
             "note: no legacy blank-source rows needed normalization",
         ])
 
-    backup = _backup_database(engine)
+    backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM doctor source apply",
@@ -896,7 +719,7 @@ def _doctor_source_apply_text(engine) -> str:
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     runtime_identity = engine.get_runtime_identity()
-    store_conn = engine._store._conn
+    store_conn = engine._store.connection
     dag_conn = engine._dag._conn
 
     issues: list[str] = []
@@ -1421,7 +1244,7 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     apply is destructive, so do the coordinated deletes on one connection to
     avoid half-cleaned state if a later table delete fails.
     """
-    conn = engine._store._conn
+    conn = engine._store.connection
     # Protect the actively-bound session id, not current_session_id. While a
     # cron tick has rebound the engine, _session_id is the row the engine is
     # actively writing to via lifecycle hooks; deleting it during cleanup
@@ -1516,7 +1339,7 @@ def _doctor_clean_apply_text(engine) -> str:
             "note: nothing was deleted",
         ])
 
-    backup = _backup_database(engine)
+    backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM doctor clean apply",
@@ -1620,7 +1443,7 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
             "note: no rows were deleted",
         ])
 
-    backup = _backup_database(engine)
+    backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM doctor clean lifecycle apply",
@@ -1663,7 +1486,7 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
 
 
 def _backup_text(engine) -> str:
-    backup = _backup_database(engine)
+    backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
             "LCM backup",
