@@ -341,6 +341,36 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert level == 1
         assert calls == ["primary-model", "fallback-model"]
 
+    def test_summary_fallback_chain_escalates_past_reasoning_only_primary(self, monkeypatch):
+        """A reasoning-only primary output is sanitized to "" by
+        _call_llm_for_summary; summarize_with_escalation must escalate to the
+        next model rather than accept the empty result."""
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                # What _call_llm_for_summary now returns for an unclosed
+                # <think> block / reasoning-only response.
+                return ""
+            return "clean fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "clean fallback summary"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
 
     def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
         from hermes_lcm import escalation

@@ -1246,6 +1246,58 @@ class TestEscalationStripReasoning:
         assert "</think>" not in result
         assert "Summary: docker rollout completed" in result
 
+    def test_sanitize_reasoning_summary_discards_unclosed_and_reasoning_only(self):
+        from hermes_lcm.escalation import _sanitize_reasoning_summary
+
+        # Clean summaries pass through (closed blocks already stripped).
+        assert _sanitize_reasoning_summary("<think>plan</think>real summary") == "real summary"
+        assert _sanitize_reasoning_summary("just a summary") == "just a summary"
+        # Unclosed reasoning block (model ran into max_tokens) -> discarded.
+        assert _sanitize_reasoning_summary("<think>reasoning that never closes ...") == ""
+        # Non-tag reasoning shapes -> discarded.
+        assert _sanitize_reasoning_summary("Thinking Process:\n1. figure out ...") == ""
+        assert _sanitize_reasoning_summary("<|start_of_think|> deliberating") == ""
+        assert _sanitize_reasoning_summary("[thinking] weighing options") == ""
+        # Empty after stripping a closed block -> discarded.
+        assert _sanitize_reasoning_summary("<think>only reasoning</think>   ") == ""
+        assert _sanitize_reasoning_summary("") == ""
+
+    def test_call_llm_for_summary_discards_unclosed_reasoning(self, monkeypatch):
+        """An unclosed <think> block (model hit max_tokens before the closing
+        tag) must not be persisted as the summary; _call_llm_for_summary returns
+        "" so the caller escalates to the next model / L2 / L3."""
+        import hermes_lcm.escalation as esc
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        unclosed = (
+            "<think>The user wants a compression. Let me restate the system "
+            "prompt: You are a summarizer that extracts decisions, files, errors"
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(unclosed)
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = esc._call_llm_for_summary(
+            prompt="please summarize",
+            max_tokens=200,
+            model="any",
+            timeout=10.0,
+        )
+
+        assert result == "", f"expected reasoning-only output discarded, got {result!r}"
 
     def test_synthesize_expansion_answer_strips_reasoning_from_response(self, monkeypatch):
         """Integration: lcm_expand_query routes through

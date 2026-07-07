@@ -35,6 +35,24 @@ _THINK_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Matches the *start* of a reasoning block with no required close. Applied to
+# text after closed <think>...</think> pairs have been stripped: if what
+# remains still begins with a reasoning marker, the model emitted an *unclosed*
+# block (typically because it ran into max_tokens before the closing tag), and
+# the leftover raw reasoning must not be persisted as the summary. Covers the
+# angle-tag family plus pipe-delimited (<|think|>), bracket ([think]), and
+# prose-header (``Thinking Process:`` / ``Chain of thought:``) shapes.
+_REASONING_START_RE = re.compile(
+    r"^\s*(?:"
+    r"<\s*(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)(?:\s[^>]*)?>"
+    r"|<\|\s*(?:start_of_)?(?:think|thinking|reasoning|thought)\s*\|>"
+    r"|\[\s*(?:think|thinking|reasoning|thought)\s*\]"
+    r"|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:"
+    r"|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
 _DEFAULT_ROUTE_KEY = "<task-default>"
 
 
@@ -151,6 +169,28 @@ def _strip_reasoning_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text)
 
 
+def _sanitize_reasoning_summary(text: str) -> str:
+    """Return a summary safe to persist, or ``""`` when the model returned only
+    reasoning.
+
+    ``_strip_reasoning_blocks`` removes *closed* ``<think>...</think>`` pairs,
+    but a reasoning model that runs into ``max_tokens`` before emitting the
+    closing tag leaves an *unclosed* block the paired-tag regex cannot match.
+    The leftover raw reasoning — which often quotes the summarizer system prompt
+    verbatim — would then be accepted as the summary purely because it is shorter
+    than the source. When the stripped remainder is empty, or still begins with
+    an (unclosed) reasoning marker, treat the result as unusable and return
+    ``""`` so the caller escalates to the next model / L2 / deterministic
+    fallback instead of persisting reasoning as the summary.
+    """
+    if not isinstance(text, str):
+        return ""
+    stripped = _strip_reasoning_blocks(text).strip()
+    if not stripped or _REASONING_START_RE.match(stripped):
+        return ""
+    return stripped
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -169,7 +209,13 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
-        return _strip_reasoning_blocks(content).strip()
+        sanitized = _sanitize_reasoning_summary(content)
+        if content.strip() and not sanitized:
+            logger.warning(
+                "LCM summary discarded reasoning-only output (model=%s); escalating",
+                model or "<default>",
+            )
+        return sanitized
     except Exception as e:
         logger.warning("LLM summarization failed: %s", e)
         return None
