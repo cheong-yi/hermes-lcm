@@ -4,7 +4,15 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-- Began a behaviour-preserving decomposition of the ~9k-line `engine.py` into cohesive modules: stateful method clusters became `*Mixin` classes (`compaction.py`, `reconcile.py`, `aux_session.py`, `placeholder_ledger.py`) mixed back into `LCMEngine`, and pure/helper groups became plain modules (`engine_registry.py`, `codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`, `message_analysis.py`). No behaviour or public-surface change; documented in `docs/architecture.md`.
+## v0.19.0 - 2026-07-07
+
+Release focus: data-safety hardening, operator diagnostics, import tooling, benchmarking, and the WS5 engine decomposition.
+
+- Hardened lossless storage and replay boundaries: GC tombstones preserve surrounding text, ingest failures surface in status/doctor, ignored-message drops are counted, persisted Hermes tool outputs and redacted durable retries replay losslessly, and auxiliary bypass/session fallback edge cases are covered. (#298, #308, #310, #312, #313)
+- Strengthened storage and downgrade safety with serialized lifecycle/DAG writes, monotonic frontiers, path-contained externalized payloads, ReDoS-safe redaction, wrapped-base64 handling, a summary spend guard, and a schema-too-new open guard. (#300, #301, #302)
+- Added operator and migration surfaces: read-only `lcm_inspect`, JSONL session export import, compression no-op status, compaction telemetry, benchmark-backed preset validation, and steady-state hot-path benchmarks. (#295, #303, #306, #307, #309, #320)
+- Added CI-backed ruff linting and release/validation-friendly tooling updates, including follow-up JSONL import hardening and metadata JSON access through `MessageStore`. (#314, #315, #316)
+- Began and documented the behaviour-preserving WS5 decomposition of the ~9k-line `engine.py`: stateful method clusters became `*Mixin` classes (`compaction.py`, `reconcile.py`, `aux_session.py`, `placeholder_ledger.py`) mixed back into `LCMEngine`, and pure/helper groups became plain modules (`engine_registry.py`, `codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`, `message_analysis.py`). (#323, #324, #325, #326, #327, #328, #329, #330, #331, #332, #333, #334, #335, #336, #337, #338, #339)
 
 ## v0.18.1 - 2026-06-30
 
