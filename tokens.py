@@ -91,6 +91,50 @@ def count_tokens(text) -> int:
     return _count_tokens_core(text)
 
 
+def truncate_text_to_tokens(text: str, max_tokens: int, *, from_end: bool = False) -> str:
+    """Truncate ``text`` to at most ``max_tokens`` tokens.
+
+    Keeps the head, or the tail when ``from_end`` is set. Uses the tiktoken
+    encoder for an exact cut when available, so the result honours the token
+    budget even for CJK / dense scripts — a flat ``chars * 4`` budget overshoots
+    those ~2-4x. Falls back to a script-density-aware char budget (the inverse of
+    :func:`_fallback_token_estimate`) when tiktoken is unavailable.
+    """
+    if max_tokens <= 0 or not text:
+        return ""
+    enc = _get_encoder()
+    if enc is not None:
+        try:
+            tokens = enc.encode(text)
+            if len(tokens) <= max_tokens:
+                return text
+            kept = tokens[-max_tokens:] if from_end else tokens[:max_tokens]
+            return enc.decode(kept)
+        except Exception:
+            pass
+    if count_tokens(text) <= max_tokens:
+        return text
+    length = len(text)
+    non_ascii = 0 if text.isascii() else sum(1 for ch in text if ord(ch) > 127)
+    ratio = (non_ascii / length) if length else 0.0
+    if ratio >= 0.5:
+        divisor = 1.5
+    elif ratio >= 0.2:
+        divisor = 2.5
+    else:
+        divisor = _CHARS_PER_TOKEN
+    char_budget = max(1, int(max_tokens * divisor))
+    # The estimate is approximate; correct any overshoot in a few bounded steps
+    # so the returned slice never exceeds the token budget.
+    for _ in range(8):
+        candidate = text[-char_budget:] if from_end else text[:char_budget]
+        estimated = count_tokens(candidate)
+        if estimated <= max_tokens or char_budget <= 1:
+            return candidate
+        char_budget = max(1, int(char_budget * max_tokens / estimated) - 1)
+    return text[-char_budget:] if from_end else text[:char_budget]
+
+
 def count_message_tokens(msg: Dict[str, Any]) -> int:
     """Estimate tokens for a single OpenAI-format message."""
     total = 4  # role + overhead

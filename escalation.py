@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .model_routing import apply_lcm_model_route
-from .tokens import count_tokens
+from .tokens import count_tokens, truncate_text_to_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -378,25 +378,34 @@ CONTENT:
 {text}"""
 
 
+_L3_TRUNCATION_MARKER = (
+    "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n"
+)
+
+
 def _deterministic_truncate(text: str, max_tokens: int) -> str:
     """Level 3: no LLM, just truncate deterministically.
 
-    Takes the first and last portions to preserve start context and
-    most recent state. Guaranteed to converge.
+    Keeps the first and last portions to preserve start context and most recent
+    state. Guaranteed to converge. Budgeted in *tokens* via the tiktoken encoder
+    (not a flat chars*4 estimate), so the result honours ``max_tokens`` even for
+    CJK / dense scripts, where chars*4 overshoots ~2-4x and would defeat the very
+    budget L3 exists to guarantee.
     """
     if count_tokens(text) <= max_tokens:
         return text
 
-    # Rough char budget (4 chars/token)
-    char_budget = max_tokens * 4
-    if len(text) <= char_budget:
-        return text
+    marker_tokens = count_tokens(_L3_TRUNCATION_MARKER)
+    if max_tokens <= marker_tokens + 4:
+        # Budget too small to afford the head/tail marker; single head cut.
+        return truncate_text_to_tokens(text, max_tokens)
 
-    head_budget = int(char_budget * 0.4)
-    tail_budget = int(char_budget * 0.4)
-    middle = "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n"
-
-    return text[:head_budget] + middle + text[-tail_budget:]
+    body_budget = max_tokens - marker_tokens
+    head_tokens = body_budget // 2
+    tail_tokens = body_budget - head_tokens
+    head = truncate_text_to_tokens(text, head_tokens)
+    tail = truncate_text_to_tokens(text, tail_tokens, from_end=True)
+    return head + _L3_TRUNCATION_MARKER + tail
 
 
 def summarize_with_escalation(
