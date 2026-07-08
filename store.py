@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
@@ -285,8 +286,10 @@ class MessageStore:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
-        if "source" not in columns:
-            self._conn.execute("ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''")
+        add_column_if_missing(
+            self._conn, columns, "source",
+            "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
         )
@@ -295,8 +298,10 @@ class MessageStore:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
-        if "conversation_id" not in columns:
-            self._conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''")
+        add_column_if_missing(
+            self._conn, columns, "conversation_id",
+            "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
         )

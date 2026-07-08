@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from . import tokens as _token_module
 from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
 
@@ -33,6 +34,24 @@ _THINK_BLOCK_RE = re.compile(
     r".*?"
     r"</(?P=tag)\s*>",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Matches the *start* of a reasoning block with no required close. Applied to
+# text after closed <think>...</think> pairs have been stripped: if what
+# remains still begins with a reasoning marker, the model emitted an *unclosed*
+# block (typically because it ran into max_tokens before the closing tag), and
+# the leftover raw reasoning must not be persisted as the summary. Covers the
+# angle-tag family plus pipe-delimited (<|think|>), bracket ([think]), and
+# prose-header (``Thinking Process:`` / ``Chain of thought:``) shapes.
+_REASONING_START_RE = re.compile(
+    r"^\s*(?:"
+    r"<\s*(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)(?:\s[^>]*)?>"
+    r"|<\|\s*(?:start_of_)?(?:think|thinking|reasoning|thought)\s*\|>"
+    r"|\[\s*(?:think|thinking|reasoning|thought)\s*\]"
+    r"|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:"
+    r"|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:"
+    r")",
+    re.IGNORECASE,
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
@@ -151,6 +170,28 @@ def _strip_reasoning_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text)
 
 
+def _sanitize_reasoning_summary(text: str) -> str:
+    """Return a summary safe to persist, or ``""`` when the model returned only
+    reasoning.
+
+    ``_strip_reasoning_blocks`` removes *closed* ``<think>...</think>`` pairs,
+    but a reasoning model that runs into ``max_tokens`` before emitting the
+    closing tag leaves an *unclosed* block the paired-tag regex cannot match.
+    The leftover raw reasoning — which often quotes the summarizer system prompt
+    verbatim — would then be accepted as the summary purely because it is shorter
+    than the source. When the stripped remainder is empty, or still begins with
+    an (unclosed) reasoning marker, treat the result as unusable and return
+    ``""`` so the caller escalates to the next model / L2 / deterministic
+    fallback instead of persisting reasoning as the summary.
+    """
+    if not isinstance(text, str):
+        return ""
+    stripped = _strip_reasoning_blocks(text).strip()
+    if not stripped or _REASONING_START_RE.match(stripped):
+        return ""
+    return stripped
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -169,7 +210,13 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
-        return _strip_reasoning_blocks(content).strip()
+        sanitized = _sanitize_reasoning_summary(content)
+        if content.strip() and not sanitized:
+            logger.warning(
+                "LCM summary discarded reasoning-only output (model=%s); escalating",
+                model or "<default>",
+            )
+        return sanitized
     except Exception as e:
         logger.warning("LLM summarization failed: %s", e)
         return None
@@ -378,25 +425,89 @@ CONTENT:
 {text}"""
 
 
+_L3_TRUNCATION_MARKER = (
+    "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n"
+)
+
+
+def _truncate_text_to_tokens(text: str, max_tokens: int, *, from_end: bool = False) -> str:
+    """Truncate ``text`` to at most ``max_tokens`` tokens for L3 fallback."""
+    if max_tokens <= 0 or not text:
+        return ""
+    enc = _token_module._get_encoder()
+    if enc is not None:
+        try:
+            tokens = enc.encode(text)
+            if len(tokens) <= max_tokens:
+                return text
+            kept = tokens[-max_tokens:] if from_end else tokens[:max_tokens]
+            return enc.decode(kept)
+        except Exception:
+            pass
+    if count_tokens(text) <= max_tokens:
+        return text
+    length = len(text)
+    non_ascii = 0 if text.isascii() else sum(1 for ch in text if ord(ch) > 127)
+    ratio = (non_ascii / length) if length else 0.0
+    if ratio >= 0.5:
+        divisor = 1.5
+    elif ratio >= 0.2:
+        divisor = 2.5
+    else:
+        divisor = _token_module._CHARS_PER_TOKEN
+    char_budget = max(1, int(max_tokens * divisor))
+    # The estimate is approximate; correct any overshoot in a few bounded steps
+    # so the returned slice never exceeds the token budget.
+    for _ in range(8):
+        candidate = text[-char_budget:] if from_end else text[:char_budget]
+        estimated = count_tokens(candidate)
+        if estimated <= max_tokens or char_budget <= 1:
+            return candidate
+        char_budget = max(1, int(char_budget * max_tokens / estimated) - 1)
+    return text[-char_budget:] if from_end else text[:char_budget]
+
+
 def _deterministic_truncate(text: str, max_tokens: int) -> str:
     """Level 3: no LLM, just truncate deterministically.
 
-    Takes the first and last portions to preserve start context and
-    most recent state. Guaranteed to converge.
+    Keeps the first and last portions to preserve start context and most recent
+    state. Guaranteed to converge. Budgeted in *tokens* via the tiktoken encoder
+    (not a flat chars*4 estimate), so the result honours ``max_tokens`` even for
+    CJK / dense scripts, where chars*4 overshoots ~2-4x and would defeat the very
+    budget L3 exists to guarantee.
     """
     if count_tokens(text) <= max_tokens:
         return text
 
-    # Rough char budget (4 chars/token)
-    char_budget = max_tokens * 4
-    if len(text) <= char_budget:
-        return text
+    marker_tokens = count_tokens(_L3_TRUNCATION_MARKER)
+    if max_tokens <= marker_tokens + 4:
+        # Budget too small to afford the head/tail marker; single head cut.
+        return _truncate_text_to_tokens(text, max_tokens)
 
-    head_budget = int(char_budget * 0.4)
-    tail_budget = int(char_budget * 0.4)
-    middle = "\n\n[...deterministic truncation — details available via lcm_expand...]\n\n"
+    def assemble(body_tokens: int) -> str:
+        head_tokens = body_tokens // 2
+        tail_tokens = body_tokens - head_tokens
+        head = _truncate_text_to_tokens(text, head_tokens)
+        tail = _truncate_text_to_tokens(text, tail_tokens, from_end=True)
+        return head + _L3_TRUNCATION_MARKER + tail
 
-    return text[:head_budget] + middle + text[-tail_budget:]
+    # ``count_tokens`` is exact with tiktoken, but the no-tiktoken fallback is
+    # intentionally a script-density estimate and is not additive: counting the
+    # CJK head, ASCII marker, and CJK tail separately can fit while the combined
+    # string exceeds ``max_tokens``. Binary search the body budget against the
+    # final assembled result so L3 is bounded under both counters.
+    best = _L3_TRUNCATION_MARKER
+    low = 0
+    high = max_tokens - marker_tokens
+    while low <= high:
+        body_tokens = (low + high) // 2
+        candidate = assemble(body_tokens)
+        if count_tokens(candidate) <= max_tokens:
+            best = candidate
+            low = body_tokens + 1
+        else:
+            high = body_tokens - 1
+    return best
 
 
 def summarize_with_escalation(
