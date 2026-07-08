@@ -106,6 +106,7 @@ from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
+from .reset_state import ResetStateMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
     normalize_content_value,
@@ -136,7 +137,7 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, ContextEngine):
+class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -1823,52 +1824,6 @@ class LCMEngine(CompactionMixin, ReconcileMixin, AuxiliarySessionMixin, Placehol
             return
         if self._has_raw_backlog_debt():
             self._lifecycle.clear_debt(self._conversation_id)
-
-    def _reset_session_counters(self) -> None:
-        """Reset session-scoped counters and token tracking.
-
-        Safe to call on boundary skip because it does not affect compaction progress.
-        """
-        self.compression_count = 0
-        self.last_prompt_tokens = 0
-        self.last_completion_tokens = 0
-        self.last_total_tokens = 0
-        self.last_input_tokens = 0
-        self.last_output_tokens = 0
-        self.last_cache_read_tokens = 0
-        self.last_cache_write_tokens = 0
-        self.last_reasoning_tokens = 0
-        self.cache_metrics_available = False
-        self._context_probed = False
-        self._context_probe_persistable = False
-        self._last_overflow_recovery_failed = False
-        self._last_condensation_suppressed_reason = ""
-        self._last_compression_status = "idle"
-        self._last_compression_noop_reason = ""
-        self._last_boundary_skip_time = 0
-
-    def _reset_compaction_progress(self) -> None:
-        """Reset process-local compaction markers for a fresh/unproven session."""
-        self._last_compacted_store_id = 0
-        self._ingest_cursor = 0
-        self._ingest_cursor_needs_reconcile = False
-        self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
-
-    def _reset_session_scoped_runtime_state(self) -> None:
-        """Reset all session-scoped runtime state.
-
-        Calls both _reset_session_counters and _reset_compaction_progress.
-        Proven carry-over paths must restore/advance state from the verified
-        source lifecycle after rebinding.
-        """
-        self._reset_session_counters()
-        self._reset_compaction_progress()
-        self._generated_ignored_active_replay_placeholder_hashes = set()
-        self._generated_ignored_active_replay_placeholder_message_ids = set()
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
