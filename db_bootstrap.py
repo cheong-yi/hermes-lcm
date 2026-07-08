@@ -98,6 +98,33 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA mmap_size=268435456")
 
 
+def add_column_if_missing(
+    conn: sqlite3.Connection,
+    existing_columns: set[str],
+    column: str,
+    alter_sql: str,
+) -> None:
+    """Idempotently add a column, tolerating a concurrent process that won the race.
+
+    In the multi-agent deployment (gateway + CLI sessions + sub-agents) every
+    process opens its own connection to the same ``lcm.db`` and runs startup
+    migrations concurrently.  A plain check-``PRAGMA table_info``-then-``ALTER``
+    races: two processes both observe the column as absent (each within its own
+    connection snapshot) and both issue ``ALTER TABLE ... ADD COLUMN``.  The loser
+    then raised ``sqlite3.OperationalError: duplicate column name``, which
+    propagated out of ``_init_db`` and crashed store construction.  Swallowing
+    exactly that error makes the migration idempotent under concurrency; any other
+    OperationalError still propagates.
+    """
+    if column in existing_columns:
+        return
+    try:
+        conn.execute(alter_sql)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 def ensure_metadata_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -198,22 +225,30 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
     }
-    if "debt_kind" not in columns:
-        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_kind TEXT")
-    if "debt_size_estimate" not in columns:
-        conn.execute(
-            "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_size_estimate INTEGER NOT NULL DEFAULT 0"
-        )
-    if "debt_updated_at" not in columns:
-        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_updated_at REAL")
-    if "last_maintenance_attempt_at" not in columns:
-        conn.execute(
-            "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL"
-        )
-    if "last_rollover_at" not in columns:
-        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL")
-    if "last_reset_at" not in columns:
-        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL")
+    add_column_if_missing(
+        conn, columns, "debt_kind",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_kind TEXT",
+    )
+    add_column_if_missing(
+        conn, columns, "debt_size_estimate",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_size_estimate INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, columns, "debt_updated_at",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_updated_at REAL",
+    )
+    add_column_if_missing(
+        conn, columns, "last_maintenance_attempt_at",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL",
+    )
+    add_column_if_missing(
+        conn, columns, "last_rollover_at",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL",
+    )
+    add_column_if_missing(
+        conn, columns, "last_reset_at",
+        "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL",
+    )
 
 
 def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
@@ -225,8 +260,10 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
     }
-    if "conversation_id" not in columns:
-        conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''")
+    add_column_if_missing(
+        conn, columns, "conversation_id",
+        "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
     )

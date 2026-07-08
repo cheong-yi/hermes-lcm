@@ -12,11 +12,15 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
-from hermes_lcm.db_bootstrap import configure_connection
+from hermes_lcm.db_bootstrap import (
+    configure_connection,
+    ensure_message_origin_columns,
+)
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -174,3 +178,80 @@ class TestGracefulClose:
         lc = LifecycleStateStore(db)
         lc._conn = None
         lc.close()  # should not raise
+
+
+# --------------------------------------------------------------------------- #
+#  Concurrent-startup migration race (idempotent ADD COLUMN)
+# --------------------------------------------------------------------------- #
+
+
+def _seed_pre_conversation_id_messages(path: Path) -> None:
+    """Create a ``messages`` table as a pre-v5 build left it: without the
+    ``conversation_id`` column the column migration later adds. Scoped to the
+    column DDL only (no FTS), so the test isolates the ADD COLUMN race."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestConcurrentStartupMigration:
+    """Concurrent process startup must not crash on duplicate-column ALTERs.
+
+    Regression for the pre-fix race: gateway + CLI + sub-agents open independent
+    connections to one ``lcm.db`` after an upgrade and all run the column
+    migrations; the loser hit ``sqlite3.OperationalError: duplicate column name``
+    and crashed store construction. ``add_column_if_missing`` makes the ALTER
+    idempotent so every process migrates successfully.
+    """
+
+    def test_concurrent_column_migration_is_idempotent(self, tmp_path: Path):
+        db_path = tmp_path / "concurrent.db"
+        _seed_pre_conversation_id_messages(db_path)
+
+        thread_count = 8
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(thread_count)
+
+        def migrate() -> None:
+            # Each thread is a stand-in for a separate process: its own
+            # connection to the same file, its own busy_timeout, racing the same
+            # ``ALTER TABLE messages ADD COLUMN conversation_id``.
+            conn = sqlite3.connect(str(db_path), timeout=30.0)
+            try:
+                configure_connection(conn)
+                barrier.wait()  # maximise overlap on the migration DDL
+                ensure_message_origin_columns(conn)
+                conn.commit()
+            except BaseException as exc:  # noqa: BLE001 - re-asserted below
+                with lock:
+                    errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=migrate) for _ in range(thread_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent column migration raised: {errors!r}"
+        conn = sqlite3.connect(str(db_path))
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        conn.close()
+        assert columns.count("conversation_id") == 1

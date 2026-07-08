@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
@@ -211,10 +212,14 @@ class SummaryDAG:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
         }
-        if "earliest_at" not in columns:
-            self._conn.execute("ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL")
-        if "latest_at" not in columns:
-            self._conn.execute("ALTER TABLE summary_nodes ADD COLUMN latest_at REAL")
+        add_column_if_missing(
+            self._conn, columns, "earliest_at",
+            "ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL",
+        )
+        add_column_if_missing(
+            self._conn, columns, "latest_at",
+            "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
         )
