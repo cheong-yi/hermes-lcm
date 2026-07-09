@@ -944,6 +944,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         else:
             logger.warning(message, *args)
 
+    def _maybe_reclassify_current_session_as_auxiliary_at_ingest(self) -> bool:
+        """Defense-in-depth for host markers that arrive after session binding.
+
+        Older Hermes Agent background-review forks seed ``_memory_write_origin``
+        too late for ``on_session_start`` frame-walk detection. By first ingest
+        the marker is present on the running agent frame, so re-check only while
+        the bound session is still empty. That keeps normal foreground session
+        starts/resets writable and avoids reclassifying sessions after real data
+        has already been stored.
+        """
+        session_id = str(self._session_id or "")
+        if not session_id:
+            return False
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+            return False
+        if self._ingest_cursor > 0:
+            return False
+        try:
+            stored_count = self._store.get_session_count(session_id)
+        except Exception:
+            logger.debug("LCM first-ingest auxiliary recheck count probe failed", exc_info=True)
+            return False
+        if stored_count != 0:
+            return False
+        if not self._in_process_auxiliary_caller_generation(session_id):
+            return False
+
+        self._mark_thread_context_stateless(session_id)
+        if self._foreground_session_id == session_id:
+            self._foreground_session_id = ""
+            self._foreground_session_platform = ""
+            self._foreground_conversation_id = ""
+        logger.info(
+            "LCM reclassified session %s as auxiliary at first ingest after bind-time detection missed",
+            session_id,
+        )
+        return True
+
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
@@ -957,6 +995,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
+        if self._maybe_reclassify_current_session_as_auxiliary_at_ingest():
+            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            return
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
