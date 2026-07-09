@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -41,6 +42,45 @@ class _ForegroundAgent(_FakeAgent):
 def _engine(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "lcm.db"))
     return LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+
+
+def _record_state_db_branch(tmp_path, session_id: str, parent_session_id: str) -> None:
+    path = tmp_path / "home" / "state.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions(
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                model_config TEXT,
+                started_at REAL,
+                ended_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO sessions(id, parent_session_id, model_config, started_at, ended_at)
+            VALUES (?, ?, ?, 1, NULL)
+            """,
+            (parent_session_id, "", "{}"),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO sessions(id, parent_session_id, model_config, started_at, ended_at)
+            VALUES (?, ?, ?, 2, NULL)
+            """,
+            (
+                session_id,
+                parent_session_id,
+                json.dumps({"_branched_from": parent_session_id}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _load_plugin_entrypoint_module(module_name: str):
@@ -373,6 +413,43 @@ def test_uningested_foreground_survives_late_review_child_from_stale_parent(tmp_
         first_foreground.ingest_history_as_foreground(
             [{"role": "user", "content": "first foreground turn"}]
         )
+
+        second_foreground.start_session()
+        assert engine.current_session_id == "foreground-b"
+        assert engine.bound_session_id == "foreground-b"
+        assert engine._store.get_session_count("foreground-b") == 0
+
+        stale_review.start_session()
+        stale_review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "late stale-parent review replay"}]
+        )
+
+        assert engine._store.get_session_count("foreground-a") == 1
+        assert engine._store.get_session_count("foreground-b") == 0
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine.current_session_id == "foreground-b"
+        assert engine.current_conversation_id == "conversation:foreground-b"
+        assert engine.bound_session_id == "review-session"
+    finally:
+        engine.shutdown()
+
+
+def test_uningested_branched_foreground_survives_late_review_child_from_stale_parent(tmp_path):
+    engine = _engine(tmp_path)
+    first_foreground = _ForegroundAgent(engine, "foreground-a")
+    second_foreground = _ForegroundAgent(
+        engine,
+        "foreground-b",
+        parent_session_id="foreground-a",
+    )
+    stale_review = _FakeAgent(engine, "review-session", parent_session_id="foreground-a")
+
+    try:
+        first_foreground.start_session()
+        first_foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "first foreground turn"}]
+        )
+        _record_state_db_branch(tmp_path, "foreground-b", "foreground-a")
 
         second_foreground.start_session()
         assert engine.current_session_id == "foreground-b"

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -972,6 +973,57 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._foreground_rebind_session_id == self._session_id:
             self._clear_foreground_rebind_candidate()
 
+    def _session_has_foreground_branch_marker(
+        self,
+        session_id: str,
+        parent_session_id: str,
+    ) -> bool:
+        """Return True when Hermes state.db records ``session_id`` as a real branch.
+
+        An un-ingested foreground branch and a provisional late-marked auxiliary
+        child can both expose the same in-process parent id before either has
+        durable LCM rows. The canonical host signal for real foreground branches
+        is the ``sessions.model_config._branched_from`` marker in state.db; use
+        it to decide whether a displaced un-ingested candidate is safe to restore.
+        """
+        session_id = str(session_id or "")
+        parent_session_id = str(parent_session_id or "")
+        if not session_id or not parent_session_id:
+            return False
+        path = self._state_db_path()
+        if not path.exists():
+            return False
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT parent_session_id, model_config
+                    FROM sessions
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("LCM foreground branch marker probe failed", exc_info=True)
+            return False
+        if not row:
+            return False
+        row_parent_id = str(row[0] or "")
+        if row_parent_id != parent_session_id:
+            return False
+        try:
+            model_config = json.loads(row[1] or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(model_config, dict):
+            return False
+        return str(model_config.get("_branched_from") or "") == parent_session_id
+
     def _remember_foreground_rebind_candidate(self, session_id: str) -> None:
         """Remember the foreground view displaced by a provisional normal bind.
 
@@ -999,8 +1051,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 include_explicit=False,
                 require_auxiliary_frame=False,
             )
-            if parent_session_id == self._foreground_rebind_session_id or (
-                parent_session_id and not self._foreground_rebind_parent_session_id
+            if (
+                parent_session_id == self._foreground_rebind_session_id
+                or (parent_session_id and not self._foreground_rebind_parent_session_id)
+                or (
+                    parent_session_id
+                    and parent_session_id == self._foreground_rebind_parent_session_id
+                    and self._session_has_foreground_branch_marker(
+                        self._foreground_rebind_session_id,
+                        self._foreground_rebind_parent_session_id,
+                    )
+                )
             ):
                 self._foreground_rebind_previous_session_id = self._foreground_session_id
                 self._foreground_rebind_previous_platform = self._foreground_session_platform
