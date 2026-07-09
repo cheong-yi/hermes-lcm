@@ -966,6 +966,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_rebind_previous_platform = ""
         self._foreground_rebind_previous_conversation_id = ""
 
+    def _clear_foreground_rebind_candidate_if_bound_session_confirmed(self) -> None:
+        if self._foreground_rebind_session_id == self._session_id:
+            self._clear_foreground_rebind_candidate()
+
     def _remember_foreground_rebind_candidate(self, session_id: str) -> None:
         """Remember the foreground view displaced by a provisional normal bind.
 
@@ -1078,8 +1082,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 self._ingest_messages(messages)
                 self._record_ingest_success()
-                if self._foreground_rebind_session_id == self._session_id:
-                    self._clear_foreground_rebind_candidate()
+                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
@@ -2970,6 +2973,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             try:
                 self._ingest_messages(messages)
                 self._record_ingest_success()
+                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             except Exception as e:
                 self._record_ingest_failure("tool-call ingest", e)
 
