@@ -982,6 +982,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
         if self._foreground_rebind_session_id == session_id:
             return
+        if (
+            self._foreground_rebind_session_id
+            and self._foreground_rebind_previous_session_id
+            and self._foreground_session_id == self._foreground_rebind_session_id
+        ):
+            self._foreground_rebind_session_id = session_id
+            return
         if self._foreground_session_id and self._foreground_session_id != session_id:
             self._foreground_rebind_session_id = session_id
             self._foreground_rebind_previous_session_id = self._foreground_session_id
