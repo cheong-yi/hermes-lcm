@@ -1078,6 +1078,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 self._ingest_messages(messages)
                 self._record_ingest_success()
+                if self._foreground_rebind_session_id == self._session_id:
+                    self._clear_foreground_rebind_candidate()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
