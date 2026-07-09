@@ -283,6 +283,37 @@ def test_stacked_late_auxiliary_binds_restore_original_foreground(tmp_path):
         engine.shutdown()
 
 
+def test_nested_late_auxiliary_binds_restore_original_foreground(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    first_review = _FakeAgent(engine, "review-session-a", parent_session_id="foreground-session")
+    nested_review = _FakeAgent(engine, "review-session-b", parent_session_id="review-session-a")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+
+        first_review.start_session()
+        assert engine.current_session_id == "review-session-a"
+
+        nested_review.start_session()
+        assert engine.current_session_id == "review-session-b"
+
+        nested_review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "nested background review replay"}]
+        )
+
+        assert engine._store.get_session_count("review-session-a") == 0
+        assert engine._store.get_session_count("review-session-b") == 0
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+        assert engine.bound_session_id == "review-session-b"
+    finally:
+        engine.shutdown()
+
+
 def test_confirmed_foreground_ingest_clears_late_auxiliary_restore_candidate(tmp_path):
     engine = _engine(tmp_path)
     first_foreground = _ForegroundAgent(engine, "foreground-a")

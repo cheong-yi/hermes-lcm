@@ -1051,16 +1051,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 include_explicit=False,
                 require_auxiliary_frame=False,
             )
+            rebind_candidate_is_foreground_branch = bool(
+                self._foreground_rebind_parent_session_id
+                and self._session_has_foreground_branch_marker(
+                    self._foreground_rebind_session_id,
+                    self._foreground_rebind_parent_session_id,
+                )
+            )
             if (
-                parent_session_id == self._foreground_rebind_session_id
+                (
+                    parent_session_id == self._foreground_rebind_session_id
+                    and (
+                        not self._foreground_rebind_parent_session_id
+                        or rebind_candidate_is_foreground_branch
+                    )
+                )
                 or (parent_session_id and not self._foreground_rebind_parent_session_id)
                 or (
                     parent_session_id
                     and parent_session_id == self._foreground_rebind_parent_session_id
-                    and self._session_has_foreground_branch_marker(
-                        self._foreground_rebind_session_id,
-                        self._foreground_rebind_parent_session_id,
-                    )
+                    and rebind_candidate_is_foreground_branch
                 )
             ):
                 self._foreground_rebind_previous_session_id = self._foreground_session_id
