@@ -430,10 +430,12 @@ class ReconcileMixin:
         sole initial user as a raw provider anchor, inserts generated summary
         scaffolding, then appends the durable post-frontier tail. Overflow
         recovery may reduce that shape to only the annotated system and user
-        anchor. These replays are not contiguous store suffixes, so generic
-        restart reconciliation cannot prove them. Require the exact generated
-        shape plus both durable-head and full post-frontier tail coverage before
-        advancing the cursor.
+        anchor, omitting even a durable fresh tail that does not fit the assembly
+        cap. These replays are not contiguous store suffixes, so generic restart
+        reconciliation cannot prove them. Accept that exact two-message anchor
+        only when a durable compaction frontier proves it came from compaction;
+        otherwise require both durable-head and full visible post-frontier tail
+        coverage before advancing the cursor.
         """
         if len(candidate_messages) < 2 or len(stored_head) < 2:
             return False
@@ -459,7 +461,13 @@ class ReconcileMixin:
             if not self._is_replayed_context_scaffold_message(message)
             and not self._matches_ignore_message_patterns(message)
         ]
-        return visible_after_anchor == stored_uncompacted_tail
+        has_durable_compaction_frontier = (
+            int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
+        )
+        return (
+            len(candidate_messages) == 2
+            and has_durable_compaction_frontier
+        ) or visible_after_anchor == stored_uncompacted_tail
 
     def _find_reconciled_cursor_for_store_tail(
         self,

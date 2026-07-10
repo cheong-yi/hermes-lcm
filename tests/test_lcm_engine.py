@@ -4064,6 +4064,86 @@ class TestEngineABC:
         assert len(rows) == len(messages)
         assert [row["content"] for row in rows].count(user_query) == 1
 
+    @pytest.mark.parametrize(
+        "followup",
+        [
+            None,
+            {"role": "user", "content": "new delta after omitted-tail replay"},
+        ],
+        ids=["no-delta", "new-delta"],
+    )
+    def test_two_message_overflow_anchor_with_omitted_fresh_tail_reconciles_restart(
+        self,
+        tmp_path,
+        monkeypatch,
+        followup,
+    ):
+        db_path = tmp_path / f"two-message-overflow-omitted-tail-{followup is not None}.db"
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "two-message-overflow-omitted-tail-session",
+            platform="cli",
+            conversation_id="two-message-overflow-omitted-tail-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (
+                "Overflow summary " + "x" * 1000 + "\nExpand for details about: overflow anchor",
+                1,
+            ),
+        )
+
+        user_query = "preserve this provider anchor across omitted-tail replay"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "durable omitted fresh tail " + "z" * 4000},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            uncompacted_rows = engine._store.get_session_messages_after(
+                "two-message-overflow-omitted-tail-session",
+                after_store_id=engine._last_compacted_store_id,
+                limit=len(messages),
+            )
+        finally:
+            engine.shutdown()
+
+        assert [msg.get("role") for msg in active_context] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+        assert [row["content"] for row in uncompacted_rows] == [messages[-1]["content"]]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "two-message-overflow-omitted-tail-session",
+            platform="cli",
+            conversation_id="two-message-overflow-omitted-tail-conversation",
+            context_length=200000,
+        )
+        replay = active_context + ([followup] if followup is not None else [])
+        try:
+            after_restart._ingest_messages(replay)
+            rows = after_restart._store.get_session_messages(
+                "two-message-overflow-omitted-tail-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + (1 if followup is not None else 0)
+        assert [row["content"] for row in rows].count(user_query) == 1
+        if followup is not None:
+            assert rows[-1]["content"] == followup["content"]
+
     def test_overflow_recovery_keeps_sole_user_inside_fresh_tail(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=32,
