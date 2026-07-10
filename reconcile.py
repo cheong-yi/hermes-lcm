@@ -422,16 +422,16 @@ class ReconcileMixin:
         self,
         candidate_messages: list[Dict[str, Any]],
         stored_head: list[tuple[str, str, str, str]],
-        stored_tail: list[tuple[str, str, str, str]],
+        stored_uncompacted_tail: list[tuple[str, str, str, str]],
     ) -> bool:
         """Recognize compacted replay with a raw initial-user provider anchor.
 
         Normal compaction annotates the durable system prompt, preserves the
         sole initial user as a raw provider anchor, inserts generated summary
-        scaffolding, then appends a durable tail suffix. That replay is not a
-        contiguous store suffix, so generic restart reconciliation cannot prove
-        it. Require the exact generated shape plus both durable-head and
-        durable-tail evidence before advancing the cursor.
+        scaffolding, then appends the durable post-frontier tail. That replay is
+        not a contiguous store suffix, so generic restart reconciliation cannot
+        prove it. Require the exact generated shape plus both durable-head and
+        full post-frontier tail coverage before advancing the cursor.
         """
         if len(candidate_messages) < 3 or len(stored_head) < 2:
             return False
@@ -457,14 +457,15 @@ class ReconcileMixin:
             if not self._is_replayed_context_scaffold_message(message)
             and not self._matches_ignore_message_patterns(message)
         ]
-        return self._matches_store_tail_suffix(stored_tail, visible_after_anchor)
+        return visible_after_anchor == stored_uncompacted_tail
 
     def _find_reconciled_cursor_for_store_tail(
         self,
         messages: List[Dict[str, Any]],
         stored_tail: list[tuple[str, str, str, str]],
         *,
-        stored_head: list[tuple[str, str, str, str]] | None = None,
+        stored_head: list[tuple[str, str, str, str]],
+        stored_uncompacted_tail: list[tuple[str, str, str, str]],
         stored_tail_rows: list[Dict[str, Any]] | None = None,
         allow_empty_prefix: bool,
         session_count: int,
@@ -524,8 +525,8 @@ class ReconcileMixin:
             ]
             if self._matches_leading_user_anchor_snapshot(
                 candidate_messages,
-                stored_head or [],
-                stored_tail,
+                stored_head,
+                stored_uncompacted_tail,
             ):
                 return cursor
             if not candidate_prefix:
@@ -893,10 +894,21 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_head_rows
         ]
+        uncompacted_rows = self._store.get_session_messages_after(
+            self._session_id,
+            after_store_id=max(0, int(self._last_compacted_store_id or 0)),
+            limit=session_count,
+        )
+        stored_uncompacted_tail = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in uncompacted_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
             stored_head=stored_head,
+            stored_uncompacted_tail=stored_uncompacted_tail,
             stored_tail_rows=stored_tail_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),

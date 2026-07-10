@@ -3774,10 +3774,17 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
-    def _single_initial_user_restart_fixture(self, tmp_path, monkeypatch, db_name):
+    def _single_initial_user_restart_fixture(
+        self,
+        tmp_path,
+        monkeypatch,
+        db_name,
+        *,
+        fresh_tail_count=4,
+    ):
         db_path = tmp_path / db_name
         config = LCMConfig(
-            fresh_tail_count=4,
+            fresh_tail_count=fresh_tail_count,
             leaf_chunk_tokens=1,
             database_path=str(db_path),
         )
@@ -3866,6 +3873,32 @@ class TestEngineABC:
         assert len(rows) == len(messages) + 1
         assert [row["content"] for row in rows].count(user_query) == 1
         assert rows[-1]["content"] == followup["content"]
+        assert all("[Recent Summary" not in row["content"] for row in rows)
+
+    def test_single_initial_user_anchor_restart_repeated_assistant_persists_delta_once(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        after_restart, active_context, messages, user_query = self._single_initial_user_restart_fixture(
+            tmp_path,
+            monkeypatch,
+            "single-initial-user-restart-repeated-assistant.db",
+            fresh_tail_count=0,
+        )
+        repeated_assistant = {"role": "assistant", "content": messages[-1]["content"]}
+        try:
+            assert [message["role"] for message in active_context] == ["system", "user", "assistant"]
+            assert after_restart._is_replayed_context_scaffold_message(active_context[-1])
+            after_restart._ingest_messages(active_context + [repeated_assistant])
+            rows = after_restart._store.get_session_messages("single-initial-user-restart-session")
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert [row["content"] for row in rows].count(repeated_assistant["content"]) == 2
+        assert rows[-1]["content"] == repeated_assistant["content"]
         assert all("[Recent Summary" not in row["content"] for row in rows)
 
     def test_overflow_recovery_keeps_single_initial_user_anchor(self, tmp_path):
