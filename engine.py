@@ -1522,8 +1522,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         durable_users = self._store.get_session_nonblank_role_messages(
             self._session_id,
             "user",
-            limit=2,
+            limit=max(2, self._store.get_session_count(self._session_id)),
         )
+        durable_users = [
+            message for message in durable_users
+            if self._is_prompt_bearing_user_message(message)
+        ]
         if durable_users:
             if len(durable_users) != 1:
                 return system_anchor_count

@@ -4630,6 +4630,36 @@ class TestEngineABC:
         finally:
             engine.shutdown()
 
+    def test_non_prompt_bearing_durable_user_does_not_disable_sole_real_user_anchor(
+        self,
+        tmp_path,
+    ):
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "durable-synthetic-user.db")))
+        engine._session_id = "durable-synthetic-user-session"
+        user_query = "preserve the only real user query"
+        generated_summary = {
+            "role": "user",
+            "content": "[Recent Summary (d0, node 1)]\nold scaffold\n[Expand for details: old scaffold]",
+        }
+        engine._store.append_batch(
+            engine._session_id,
+            [
+                {"role": "user", "content": user_query},
+                generated_summary,
+            ],
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "tail"},
+        ]
+
+        try:
+            assert not engine._is_prompt_bearing_user_message(generated_summary)
+            assert engine._leading_anchor_count(messages) == 2
+        finally:
+            engine.shutdown()
+
     def test_generated_user_summary_is_not_duplicated_by_later_compaction(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=1,
