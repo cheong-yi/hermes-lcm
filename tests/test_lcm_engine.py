@@ -4131,6 +4131,83 @@ class TestEngineABC:
             row["role"] == "assistant" and row["content"] == repeated_content for row in rows
         ) == 2
 
+    @pytest.mark.parametrize(
+        "followup",
+        [
+            None,
+            {"role": "user", "content": "new delta after scaffolded frontier-zero replay"},
+        ],
+        ids=["no-delta", "new-delta"],
+    )
+    def test_frontier_zero_overflow_anchor_restart_skips_generated_summary_scaffold(
+        self,
+        tmp_path,
+        followup,
+    ):
+        db_path = tmp_path / f"frontier-zero-overflow-anchor-scaffold-{followup is not None}.db"
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "frontier-zero-overflow-anchor-scaffold-session",
+            platform="cli",
+            conversation_id="frontier-zero-overflow-anchor-scaffold-conversation",
+            context_length=200000,
+        )
+
+        user_query = "preserve this raw provider anchor before the frontier advances"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "latest derived output " + "z" * 4000},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            assert engine.last_compression_status == "overflow_recovery"
+            assert engine._last_compacted_store_id == 0
+        finally:
+            engine.shutdown()
+
+        summary_scaffold = {
+            "role": "assistant",
+            "content": (
+                "[Recent Summary (d0, node 12)]\n"
+                "Earlier details.\n"
+                "[Expand for details: hint-12]"
+            ),
+        }
+        assert [message.get("role") for message in active_context] == ["system", "user"]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "frontier-zero-overflow-anchor-scaffold-session",
+            platform="cli",
+            conversation_id="frontier-zero-overflow-anchor-scaffold-conversation",
+            context_length=200000,
+        )
+        try:
+            assert after_restart._last_compacted_store_id == 0
+            assert after_restart._is_replayed_context_scaffold_message(summary_scaffold)
+            replay = active_context + [summary_scaffold] + ([followup] if followup is not None else [])
+            after_restart._ingest_messages(replay)
+            rows = after_restart._store.get_session_messages(
+                "frontier-zero-overflow-anchor-scaffold-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + (1 if followup is not None else 0)
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert all("[Recent Summary" not in row["content"] for row in rows)
+        if followup is not None:
+            assert rows[-1]["content"] == followup["content"]
+
     def test_two_message_overflow_anchor_restart_does_not_duplicate_durable_rows(
         self,
         tmp_path,

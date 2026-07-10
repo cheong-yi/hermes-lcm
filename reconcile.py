@@ -458,9 +458,10 @@ class ReconcileMixin:
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
             return False
         if has_raw_durable_system_anchor:
-            if len(candidate_messages) != 2:
-                return False
-            return True
+            return all(
+                self._is_replayed_context_scaffold_message(message)  # type: ignore[attr-defined]
+                for message in candidate_messages[2:]
+            )
         if candidate_messages[2:] and not any(
             self._is_replayed_context_scaffold_message(message)
             for message in candidate_messages[2:]
