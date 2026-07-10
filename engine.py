@@ -1493,10 +1493,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         usually compactable because replaying one forever can make stale
         requests look current after later compaction. The exception is the
         narrow Qwen-family chat-template invariant: when a system prompt is
-        followed by the session's only prompt-bearing user query outside the
-        fresh tail, compacting it can leave active context with no raw user-role
-        query at all. Preserve exactly that initial system+user window and keep
-        no-system, later-user, and multi-user sessions compactable.
+        followed by the session's only prompt-bearing user query, compaction or
+        overflow recovery can leave active context with no raw user-role query
+        at all. Preserve exactly that initial system+user window, including when
+        it falls inside the fresh tail, and keep no-system, later-user, and
+        multi-user sessions compactable.
         """
         if not messages:
             return 0
@@ -1505,14 +1506,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if isinstance(messages[0], dict) and messages[0].get("role") == "system"
             else 0
         )
-        fresh_tail_start = max(0, len(messages) - self._config.fresh_tail_count)
-        if fresh_tail_start <= system_anchor_count:
-            return system_anchor_count
         if system_anchor_count == 0:
             return 0
 
         first_user_index = system_anchor_count
-        if first_user_index >= fresh_tail_start or not self._is_prompt_bearing_user_message(
+        if first_user_index >= len(messages) or not self._is_prompt_bearing_user_message(
             messages[first_user_index]
         ):
             return system_anchor_count
@@ -1521,10 +1519,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for message in messages[first_user_index + 1:]
         ):
             return system_anchor_count
+        durable_users = self._store.get_session_nonblank_role_messages(
+            self._session_id,
+            "user",
+            limit=2,
+        )
+        if durable_users:
+            if len(durable_users) != 1:
+                return system_anchor_count
+            if (
+                self._message_replay_identity(messages[first_user_index])
+                != self._message_replay_identity(durable_users[0], stored_row=True)
+            ):
+                return system_anchor_count
         return first_user_index + 1
 
     def _is_prompt_bearing_user_message(self, message: Dict[str, Any]) -> bool:
         if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if self._is_replayed_context_scaffold_message(message):
             return False
         if self._is_preserved_todo_context_message(message):
             return False
@@ -1532,6 +1545,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._is_context_summary_content(content):
             return False
         content_text = text_content_for_pattern_matching(content) or ""
+        if not content_text.strip():
+            return False
         if content_text.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return False
         return not (
@@ -4692,9 +4707,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             if self._preserved_objective_context_content(message):
                 return None
-            if message.get("role") != "user":
-                continue
-            if self._is_preserved_todo_context_message(message):
+            if not self._is_prompt_bearing_user_message(message):
                 continue
             if any(message == selected for selected in selected_tail_messages):
                 return None
@@ -4775,7 +4788,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_selected = list(reversed(kept_tail_reversed))
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
-            anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
+            anchor_part = self._latest_user_context_anchor(
+                anchor_source,
+                leading_msgs + tail_selected,
+            )
 
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
@@ -5032,6 +5048,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         minimum_candidate_len = leading_anchor_count
         if len(candidate) == minimum_candidate_len and tail_messages:
+            if any(self._is_prompt_bearing_user_message(message) for message in candidate):
+                return candidate
             fallback = list(leading_anchor_messages or ([system_msg] if system_msg is not None else [])) + [tail_messages[-1]]
             return self._sanitize_active_context_messages(fallback)
         return candidate

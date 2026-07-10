@@ -3774,6 +3774,100 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
+    def _single_initial_user_restart_fixture(self, tmp_path, monkeypatch, db_name):
+        db_path = tmp_path / db_name
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(db_path),
+        )
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "single-initial-user-restart-session",
+            platform="cli",
+            conversation_id="single-initial-user-restart-conversation",
+            context_length=200000,
+        )
+
+        def mock_summary(**kwargs):
+            return "Assistant/tool chain summary.\nExpand for details about: restart anchor", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        user_query = "diagnose restart replay without duplicating durable rows"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {
+                "role": "assistant",
+                "content": "checking logs",
+                "tool_calls": [{"id": "call_logs", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_logs", "content": "log output " + "x" * 200},
+            {
+                "role": "assistant",
+                "content": "checking replay",
+                "tool_calls": [{"id": "call_replay", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_replay", "content": "replay output"},
+            {"role": "assistant", "content": "still investigating"},
+            {"role": "assistant", "content": "final diagnostic"},
+        ]
+        active_context = before_restart.compress(messages)
+        assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
+        assert before_restart._store.get_session_count("single-initial-user-restart-session") == len(messages)
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "single-initial-user-restart-session",
+            platform="cli",
+            conversation_id="single-initial-user-restart-conversation",
+            context_length=200000,
+        )
+        return after_restart, active_context, messages, user_query
+
+    def test_single_initial_user_anchor_restart_no_delta_does_not_duplicate_durable_rows(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        after_restart, active_context, messages, user_query = self._single_initial_user_restart_fixture(
+            tmp_path,
+            monkeypatch,
+            "single-initial-user-restart-no-delta.db",
+        )
+        try:
+            after_restart._ingest_messages(active_context)
+            rows = after_restart._store.get_session_messages("single-initial-user-restart-session")
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages)
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert all("[Recent Summary" not in row["content"] for row in rows)
+
+    def test_single_initial_user_anchor_restart_one_followup_only_persists_delta(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        after_restart, active_context, messages, user_query = self._single_initial_user_restart_fixture(
+            tmp_path,
+            monkeypatch,
+            "single-initial-user-restart-followup.db",
+        )
+        followup = {"role": "user", "content": "follow-up after restart"}
+        try:
+            after_restart._ingest_messages(active_context + [followup])
+            rows = after_restart._store.get_session_messages("single-initial-user-restart-session")
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert rows[-1]["content"] == followup["content"]
+        assert all("[Recent Summary" not in row["content"] for row in rows)
+
     def test_overflow_recovery_keeps_single_initial_user_anchor(self, tmp_path):
         db_path = tmp_path / "single-initial-user-overflow-anchor.db"
         config = LCMConfig(
@@ -3808,6 +3902,105 @@ class TestEngineABC:
         assert engine.last_compression_status == "overflow_recovery"
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
+
+    def test_overflow_recovery_keeps_sole_user_inside_fresh_tail(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=32,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=40,
+            database_path=str(tmp_path / "single-user-inside-fresh-tail.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "single-user-inside-fresh-tail-session"
+        engine.compression_count = 1
+        monkeypatch.setattr(lcm_engine, "count_message_tokens", lambda msg: len(msg.get("content", "")))
+        monkeypatch.setattr(
+            lcm_engine,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+        user_query = "u" * 20
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "a" * 40},
+        ]
+
+        try:
+            assert engine._leading_anchor_count(messages) == 2
+            active_context = engine.compress(messages, current_tokens=70)
+        finally:
+            engine.shutdown()
+
+        assert [msg.get("role") for msg in active_context] == ["system", "user"]
+        assert active_context[1]["content"] == user_query
+
+    def test_generated_and_blank_user_messages_are_not_prompt_bearing_anchors(self, tmp_path):
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "synthetic-user-anchor.db")))
+        generated_summary = {
+            "role": "user",
+            "content": "[Recent Summary (d0, node 1)]\nold scaffold\n[Expand for details: old scaffold]",
+        }
+        blank_user = {"role": "user", "content": "  \n\t"}
+        try:
+            assert not engine._is_prompt_bearing_user_message(generated_summary)
+            assert not engine._is_prompt_bearing_user_message(blank_user)
+            assert engine._leading_anchor_count([
+                {"role": "system", "content": "sys"},
+                generated_summary,
+                {"role": "assistant", "content": "tail"},
+            ]) == 1
+            assert engine._leading_anchor_count([
+                {"role": "system", "content": "sys"},
+                blank_user,
+                {"role": "assistant", "content": "tail"},
+            ]) == 1
+        finally:
+            engine.shutdown()
+
+    def test_generated_user_summary_is_not_duplicated_by_later_compaction(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "generated-user-summary-second-compaction.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "generated-user-summary-session"
+        node = SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="old scaffold",
+            token_count=2,
+            source_token_count=20,
+            source_ids=[],
+            source_type="messages",
+            expand_hint="old scaffold",
+        )
+        node_id = engine._dag.add_node(node)
+        generated_summary = (
+            f"[Recent Summary (d0, node {node_id})]\n"
+            "old scaffold\n"
+            "[Expand for details: old scaffold]"
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("new assistant summary\nExpand for details about: new work", 1),
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": generated_summary},
+            {"role": "assistant", "content": "derived backlog " + "x" * 200},
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+
+        try:
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        active_text = "\n".join(str(msg.get("content", "")) for msg in active_context)
+        assert active_text.count(generated_summary) == 1
 
     def test_later_user_keeps_initial_user_compactable(self, tmp_path, monkeypatch):
         db_path = tmp_path / "later-user-keeps-initial-compactable.db"
@@ -20598,7 +20791,7 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=90)
 
-        assert result == [messages[0], messages[-1]]
+        assert result == [messages[0], messages[1]]
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
@@ -20635,7 +20828,7 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=100)
 
-        assert result == [messages[0], messages[-1]]
+        assert result == [messages[0], messages[1]]
         assert lcm_engine_module.count_messages_tokens(result) < 70
 
     def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):

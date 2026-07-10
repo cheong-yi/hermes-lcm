@@ -604,6 +604,21 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_session_nonblank_role_messages(
+        self,
+        session_id: str,
+        role: str,
+        limit: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Get the earliest nonblank messages for one role in a session."""
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE session_id = ? AND role = ? AND TRIM(COALESCE(content, '')) <> ''
+               ORDER BY store_id LIMIT ?""",
+            (session_id, role, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000) -> List[Dict[str, Any]]:

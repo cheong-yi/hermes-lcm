@@ -418,11 +418,53 @@ class ReconcileMixin:
                 sanitized_tail.append(cleaned_identity)
         return sanitized_tail
 
+    def _matches_leading_user_anchor_snapshot(
+        self,
+        candidate_messages: list[Dict[str, Any]],
+        stored_head: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str]],
+    ) -> bool:
+        """Recognize compacted replay with a raw initial-user provider anchor.
+
+        Normal compaction annotates the durable system prompt, preserves the
+        sole initial user as a raw provider anchor, inserts generated summary
+        scaffolding, then appends a durable tail suffix. That replay is not a
+        contiguous store suffix, so generic restart reconciliation cannot prove
+        it. Require the exact generated shape plus both durable-head and
+        durable-tail evidence before advancing the cursor.
+        """
+        if len(candidate_messages) < 3 or len(stored_head) < 2:
+            return False
+        if (
+            str(candidate_messages[0].get("role") or "") != "system"
+            or not self._is_replayed_context_scaffold_message(candidate_messages[0])
+            or not self._is_prompt_bearing_user_message(candidate_messages[1])
+        ):
+            return False
+        if stored_head[0][0] != "system" or stored_head[1][0] != "user":
+            return False
+        if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
+            return False
+        if not any(
+            self._is_replayed_context_scaffold_message(message)
+            for message in candidate_messages[2:]
+        ):
+            return False
+
+        visible_after_anchor = [
+            self._message_replay_identity(message)
+            for message in candidate_messages[2:]
+            if not self._is_replayed_context_scaffold_message(message)
+            and not self._matches_ignore_message_patterns(message)
+        ]
+        return self._matches_store_tail_suffix(stored_tail, visible_after_anchor)
+
     def _find_reconciled_cursor_for_store_tail(
         self,
         messages: List[Dict[str, Any]],
         stored_tail: list[tuple[str, str, str, str]],
         *,
+        stored_head: list[tuple[str, str, str, str]] | None = None,
         stored_tail_rows: list[Dict[str, Any]] | None = None,
         allow_empty_prefix: bool,
         session_count: int,
@@ -480,6 +522,12 @@ class ReconcileMixin:
                 self._message_replay_identity(msg)
                 for msg in candidate_identity_messages
             ]
+            if self._matches_leading_user_anchor_snapshot(
+                candidate_messages,
+                stored_head or [],
+                stored_tail,
+            ):
+                return cursor
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
                 if allow_empty_prefix and (
@@ -840,9 +888,15 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        stored_head_rows = self._store.get_session_messages(self._session_id, limit=2)
+        stored_head = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_head_rows
+        ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
+            stored_head=stored_head,
             stored_tail_rows=stored_tail_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
