@@ -428,12 +428,14 @@ class ReconcileMixin:
 
         Normal compaction annotates the durable system prompt, preserves the
         sole initial user as a raw provider anchor, inserts generated summary
-        scaffolding, then appends the durable post-frontier tail. That replay is
-        not a contiguous store suffix, so generic restart reconciliation cannot
-        prove it. Require the exact generated shape plus both durable-head and
-        full post-frontier tail coverage before advancing the cursor.
+        scaffolding, then appends the durable post-frontier tail. Overflow
+        recovery may reduce that shape to only the annotated system and user
+        anchor. These replays are not contiguous store suffixes, so generic
+        restart reconciliation cannot prove them. Require the exact generated
+        shape plus both durable-head and full post-frontier tail coverage before
+        advancing the cursor.
         """
-        if len(candidate_messages) < 3 or len(stored_head) < 2:
+        if len(candidate_messages) < 2 or len(stored_head) < 2:
             return False
         if (
             str(candidate_messages[0].get("role") or "") != "system"
@@ -445,7 +447,7 @@ class ReconcileMixin:
             return False
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
             return False
-        if not any(
+        if candidate_messages[2:] and not any(
             self._is_replayed_context_scaffold_message(message)
             for message in candidate_messages[2:]
         ):

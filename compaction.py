@@ -647,7 +647,11 @@ class CompactionMixin:
             )
             self._dag.add_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
+            if consumed_store_ids:
+                self._last_compacted_store_id = max(
+                    self._last_compacted_store_id,
+                    max(consumed_store_ids),
+                )
             self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]

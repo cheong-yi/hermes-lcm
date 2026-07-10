@@ -3774,10 +3774,12 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
-    def test_second_compaction_keeps_former_initial_user_source_lineage(self, tmp_path, monkeypatch):
+    def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=1,
             database_path=str(tmp_path / "former-initial-user-lineage.db"),
         )
         engine = LCMEngine(config=config)
@@ -3816,6 +3818,7 @@ class TestEngineABC:
             )[0]
             original_store_id = original_row["store_id"]
             assert engine._last_compacted_store_id > original_store_id
+            first_frontier = engine._last_compacted_store_id
             assert first_active_context[1]["content"] == original_user
 
             second_messages = first_active_context + [
@@ -3827,6 +3830,7 @@ class TestEngineABC:
             engine.compress(second_messages)
 
             second_node = engine._dag.get_session_nodes(engine._session_id)[-1]
+            assert engine._last_compacted_store_id >= first_frontier
             expanded = json.loads(
                 engine.handle_tool_call("lcm_expand", {"node_id": second_node.node_id})
             )
@@ -3997,6 +4001,68 @@ class TestEngineABC:
         assert engine.last_compression_status == "overflow_recovery"
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
+
+    def test_two_message_overflow_anchor_restart_does_not_duplicate_durable_rows(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "two-message-overflow-anchor-restart.db"
+        config = LCMConfig(
+            fresh_tail_count=0,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "two-message-overflow-anchor-session",
+            platform="cli",
+            conversation_id="two-message-overflow-anchor-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (
+                "Overflow summary " + "x" * 1000 + "\nExpand for details about: overflow anchor",
+                1,
+            ),
+        )
+
+        user_query = "render this request with at least one user message"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "latest derived output " + "z" * 4000},
+        ]
+        try:
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert [msg.get("role") for msg in active_context] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "two-message-overflow-anchor-session",
+            platform="cli",
+            conversation_id="two-message-overflow-anchor-conversation",
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(active_context)
+            rows = after_restart._store.get_session_messages(
+                "two-message-overflow-anchor-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages)
+        assert [row["content"] for row in rows].count(user_query) == 1
 
     def test_overflow_recovery_keeps_sole_user_inside_fresh_tail(self, tmp_path, monkeypatch):
         config = LCMConfig(
