@@ -463,12 +463,6 @@ class ReconcileMixin:
                 self._is_replayed_context_scaffold_message(message)  # type: ignore[attr-defined]
                 for message in candidate_messages[2:]
             )
-        if candidate_messages[2:] and not any(
-            self._is_replayed_context_scaffold_message(message)
-            for message in candidate_messages[2:]
-        ):
-            return False
-
         visible_after_anchor = [
             self._message_replay_identity(message)
             for message in candidate_messages[2:]

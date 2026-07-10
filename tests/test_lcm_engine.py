@@ -4423,6 +4423,84 @@ class TestEngineABC:
             for row in rows
         )
 
+    def test_anchor_with_full_fresh_tail_and_no_scaffold_reconciles_restart(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "anchor-full-tail-no-scaffold-restart.db"
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "anchor-full-tail-no-scaffold-session",
+            platform="cli",
+            conversation_id="anchor-full-tail-no-scaffold-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (
+                "Oversized restart summary "
+                + "x" * 1000
+                + "\nExpand for details about: restart",
+                1,
+            ),
+        )
+
+        user_query = "preserve this provider anchor with the complete fresh tail"
+        fresh_tail = "durable fresh tail"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": fresh_tail},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            uncompacted_rows = engine._store.get_session_messages_after(
+                "anchor-full-tail-no-scaffold-session",
+                after_store_id=engine._last_compacted_store_id,
+                limit=len(messages),
+            )
+        finally:
+            engine.shutdown()
+
+        assert [message.get("role") for message in active_context] == [
+            "system",
+            "user",
+            "assistant",
+        ]
+        assert engine._is_replayed_context_scaffold_message(active_context[0])
+        assert not engine._is_replayed_context_scaffold_message(active_context[-1])
+        assert active_context[-1]["content"] == fresh_tail
+        assert [row["content"] for row in uncompacted_rows] == [fresh_tail]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "anchor-full-tail-no-scaffold-session",
+            platform="cli",
+            conversation_id="anchor-full-tail-no-scaffold-conversation",
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(active_context)
+            rows = after_restart._store.get_session_messages(
+                "anchor-full-tail-no-scaffold-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages)
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert [row["content"] for row in rows].count(fresh_tail) == 1
+
     def test_anchor_summary_with_omitted_tail_preserves_repeated_new_delta(
         self,
         tmp_path,
