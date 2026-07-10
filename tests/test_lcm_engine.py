@@ -4423,6 +4423,80 @@ class TestEngineABC:
             for row in rows
         )
 
+    def test_anchor_summary_with_omitted_tail_preserves_repeated_new_delta(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "anchor-summary-omitted-tail-repeated-delta.db"
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "anchor-summary-omitted-tail-repeated-delta-session",
+            platform="cli",
+            conversation_id="anchor-summary-omitted-tail-repeated-delta-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Compact restart summary.\nExpand for details about: restart", 1),
+        )
+
+        repeated_content = "durable omitted fresh tail " + "z" * 4000
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "preserve the repeated delta after omitted-tail replay"},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": repeated_content},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            uncompacted_rows = engine._store.get_session_messages_after(
+                "anchor-summary-omitted-tail-repeated-delta-session",
+                after_store_id=engine._last_compacted_store_id,
+                limit=len(messages),
+            )
+        finally:
+            engine.shutdown()
+
+        assert [message.get("role") for message in active_context] == [
+            "system",
+            "user",
+            "assistant",
+        ]
+        assert engine._is_replayed_context_scaffold_message(active_context[-1])
+        assert [row["content"] for row in uncompacted_rows] == [repeated_content]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "anchor-summary-omitted-tail-repeated-delta-session",
+            platform="cli",
+            conversation_id="anchor-summary-omitted-tail-repeated-delta-conversation",
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(
+                active_context + [{"role": "assistant", "content": repeated_content}]
+            )
+            rows = after_restart._store.get_session_messages(
+                "anchor-summary-omitted-tail-repeated-delta-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + 1
+        assert sum(
+            row["role"] == "assistant" and row["content"] == repeated_content
+            for row in rows
+        ) == 2
+
     def test_overflow_recovery_keeps_sole_user_inside_fresh_tail(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=32,
@@ -5264,6 +5338,56 @@ class TestEngineABC:
             "skipped stale no-overlap snapshot"
         )
         assert "skipped stale no-overlap snapshot" in caplog.text
+
+    def test_existing_session_restart_skips_stale_no_overlap_prefix_longer_than_three(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "restart-stale-no-overlap-prefix-longer-than-three.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "stale-long-prefix-session",
+            platform="cli",
+            conversation_id="stale-long-prefix-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "old startup question"},
+            {"role": "assistant", "content": "old startup answer"},
+            {"role": "user", "content": "old startup follow-up"},
+            {"role": "assistant", "content": "old startup follow-up answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "stale-long-prefix-session",
+            platform="cli",
+            conversation_id="stale-long-prefix-conversation",
+            context_length=200000,
+        )
+        stale_runtime_snapshot = persisted_messages[:5]
+
+        after_restart._ingest_messages(stale_runtime_snapshot)
+
+        rows = after_restart._store.get_session_messages(
+            "stale-long-prefix-session",
+            limit=len(persisted_messages) + len(stale_runtime_snapshot),
+        )
+        assert len(rows) == len(persisted_messages)
+        assert after_restart._ingest_cursor == len(stale_runtime_snapshot)
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "skipped stale no-overlap snapshot"
+        )
 
     def test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload(self, tmp_path):
         db_path = tmp_path / "restart-stale-externalized-head.db"

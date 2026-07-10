@@ -44,6 +44,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .tokens import count_messages_tokens
 
 import logging
 
@@ -477,9 +478,19 @@ class ReconcileMixin:
         has_durable_compaction_frontier = (
             int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
         )
+        assembly_cap = self._effective_assembly_token_cap()  # type: ignore[attr-defined]
+        # A tail row that assembly could not fit cannot be replay evidence here;
+        # an identical post-restart row is an ambiguous new delta and must survive.
+        has_feasible_full_tail_replay = (
+            visible_after_anchor == stored_uncompacted_tail
+            and (
+                assembly_cap is None
+                or count_messages_tokens(candidate_messages) <= assembly_cap
+            )
+        )
         return (
             not visible_after_anchor and has_durable_compaction_frontier
-        ) or visible_after_anchor == stored_uncompacted_tail
+        ) or has_feasible_full_tail_replay
 
     def _find_reconciled_cursor_for_store_tail(
         self,
@@ -913,7 +924,7 @@ class ReconcileMixin:
         ]
         stored_head_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
             self._session_id,  # type: ignore[attr-defined]
-            limit=3,
+            limit=tail_limit,
         )
         stored_head = [
             self._message_replay_identity(row, stored_row=True)
