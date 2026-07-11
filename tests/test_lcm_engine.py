@@ -4015,6 +4015,83 @@ class TestEngineABC:
         assert [row["content"] for row in rows].count(user_query) == 1
         assert all("[Recent Summary" not in row["content"] for row in rows)
 
+    def test_reused_session_raw_anchor_restart_does_not_duplicate_current_conversation(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "reused-session-raw-anchor-restart.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=10_000,
+            database_path=str(db_path),
+        )
+        session_id = "reused-session-raw-anchor"
+        old_messages = [
+            {"role": "system", "content": "Old conversation system."},
+            {"role": "user", "content": "old conversation request"},
+            {"role": "assistant", "content": "old conversation response"},
+        ]
+        old_engine = LCMEngine(config=config)
+        old_engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="old-conversation",
+            context_length=200000,
+        )
+        try:
+            old_engine.compress(old_messages)
+        finally:
+            old_engine.shutdown()
+
+        current_messages = [
+            {"role": "system", "content": "Current conversation system."},
+            {"role": "user", "content": "current conversation request"},
+        ]
+        current_engine = LCMEngine(config=config)
+        current_engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="current-conversation",
+            context_length=200000,
+        )
+        try:
+            active_context = current_engine.compress(current_messages)
+            assert current_engine.last_compression_status == "noop"
+            assert current_engine.last_compression_noop_reason == (
+                "no eligible raw backlog outside fresh tail"
+            )
+            assert active_context == current_messages
+        finally:
+            current_engine.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="current-conversation",
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(active_context)
+            rows = after_restart._store.get_session_messages(session_id)
+            reconciliation = after_restart._last_ingest_reconciliation
+        finally:
+            after_restart.shutdown()
+
+        assert reconciliation["action"] == "advanced cursor"
+        assert reconciliation["cursor"] == len(current_messages)
+        assert reconciliation["session_count"] == len(current_messages)
+        assert len(rows) == len(old_messages) + len(current_messages)
+        assert [row["content"] for row in rows].count(current_messages[0]["content"]) == 1
+        assert [row["content"] for row in rows].count(current_messages[1]["content"]) == 1
+        assert [row["conversation_id"] for row in rows] == [
+            "old-conversation",
+            "old-conversation",
+            "old-conversation",
+            "current-conversation",
+            "current-conversation",
+        ]
+
     def test_single_initial_user_anchor_restart_one_followup_only_persists_delta(
         self,
         tmp_path,

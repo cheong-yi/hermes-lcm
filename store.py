@@ -594,13 +594,23 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_messages(self, session_id: str,
-                             limit: int = 10000) -> List[Dict[str, Any]]:
+                             limit: int = 10000,
+                             conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
+        where = "session_id = ?"
+        args: list[Any] = [session_id]
+        if conversation_clause:
+            where += f" AND {conversation_clause}"
+            args.extend(conversation_args)
+        args.append(limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
+               WHERE {where}
                ORDER BY store_id LIMIT ?""",
-            (session_id, limit),
+            args,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -631,39 +641,68 @@ class MessageStore:
 
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
+                                   limit: int = 10000,
+                                   conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
+        where = "session_id = ? AND store_id > ?"
+        args: list[Any] = [session_id, after_store_id]
+        if conversation_clause:
+            where += f" AND {conversation_clause}"
+            args.extend(conversation_args)
+        args.append(limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
+               WHERE {where}
                ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
+            args,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_session_tail(self, session_id: str, limit: int = 1000,
+                         conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
+        where = "session_id = ?"
+        args: list[Any] = [session_id]
+        if conversation_clause:
+            where += f" AND {conversation_clause}"
+            args.extend(conversation_args)
+        args.append(limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                FROM (
                    SELECT {_MESSAGE_SELECT_COLUMNS}
                    FROM messages
-                   WHERE session_id = ?
+                   WHERE {where}
                    ORDER BY store_id DESC
                    LIMIT ?
                )
                ORDER BY store_id""",
-            (session_id, limit),
+            args,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_count(self, session_id: str) -> int:
+    def get_session_count(self, session_id: str,
+                          conversation_id: str | None = None) -> int:
         """Count messages in a session."""
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
+        where = "session_id = ?"
+        args: list[Any] = [session_id]
+        if conversation_clause:
+            where += f" AND {conversation_clause}"
+            args.extend(conversation_args)
         row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            (session_id,),
+            f"SELECT COUNT(*) FROM messages WHERE {where}",
+            args,
         ).fetchone()
         return row[0] if row else 0
 

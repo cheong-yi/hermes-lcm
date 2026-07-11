@@ -879,8 +879,20 @@ class ReconcileMixin:
         if not self._session_id or not messages:
             return 0
 
+        conversation_id = getattr(self, "_conversation_id", "")
         try:
-            session_count = self._store.get_session_count(self._session_id)
+            session_count = self._store.get_session_count(  # type: ignore[attr-defined]
+                self._session_id,  # type: ignore[attr-defined]
+                conversation_id=conversation_id,
+            )
+            # Legacy rows may predate conversation provenance. Preserve the
+            # existing session-wide reconciliation path when the active
+            # conversation has no attributed durable rows to prove its scope.
+            if conversation_id and session_count <= 0:
+                conversation_id = ""
+                session_count = self._store.get_session_count(  # type: ignore[attr-defined]
+                    self._session_id  # type: ignore[attr-defined]
+                )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
@@ -915,7 +927,11 @@ class ReconcileMixin:
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        stored_rows = self._store.get_session_tail(  # type: ignore[attr-defined]
+            self._session_id,  # type: ignore[attr-defined]
+            limit=tail_limit,
+            conversation_id=conversation_id,
+        )
         if not stored_rows:
             return 0
         stored_tail_rows = [
@@ -930,6 +946,7 @@ class ReconcileMixin:
         stored_head_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
             self._session_id,  # type: ignore[attr-defined]
             limit=tail_limit,
+            conversation_id=conversation_id,
         )
         stored_head = [
             self._message_replay_identity(row, stored_row=True)
@@ -939,6 +956,7 @@ class ReconcileMixin:
             self._session_id,
             after_store_id=max(0, int(self._last_compacted_store_id or 0)),
             limit=session_count,
+            conversation_id=conversation_id,
         )
         stored_uncompacted_tail = [
             self._message_replay_identity(row, stored_row=True)
