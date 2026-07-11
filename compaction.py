@@ -439,10 +439,14 @@ class CompactionMixin:
                     pressure_messages[candidate_start:fresh_tail_start],
                 )
             )
+            compactable_store_ids_by_message_id = self._get_store_id_map_for_messages(
+                working_messages[leading_anchor_count:]
+            )
             raw_compactable_pairs = [
                 (working_msg, pressure_msg)
                 for working_msg, pressure_msg in compactable_pairs
                 if not self._is_replayed_context_scaffold_message(working_msg)  # type: ignore[attr-defined]
+                or id(working_msg) in compactable_store_ids_by_message_id
             ]
             if len(raw_compactable_pairs) != len(compactable_pairs):
                 dropped_replayed_scaffold_messages = True

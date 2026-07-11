@@ -3886,6 +3886,56 @@ class TestEngineABC:
             == 1
         )
 
+    def test_compaction_preserves_literal_summary_shaped_user_source_lineage(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = LCMEngine(
+            config=LCMConfig(
+                fresh_tail_count=1,
+                leaf_chunk_tokens=1,
+                database_path=str(tmp_path / "literal-summary-shaped-user-lineage.db"),
+            )
+        )
+        engine.on_session_start(
+            "literal-summary-shaped-user-lineage-session",
+            platform="cli",
+            conversation_id="literal-summary-shaped-user-lineage-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Compacted literal summary paste.\nExpand for details about: paste", 1),
+        )
+        literal_summary = (
+            "[Recent Summary (d0, node 999)]\n"
+            "This is literal user-authored content, not generated replay scaffolding.\n"
+            "[Expand for details: literal paste]"
+        )
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": literal_summary},
+            {"role": "assistant", "content": "acknowledging the literal paste"},
+            {"role": "user", "content": "fresh tail"},
+        ]
+
+        try:
+            engine.compress(messages)
+            literal_row = next(
+                row
+                for row in engine._store.get_session_messages(engine._session_id)
+                if row["content"] == literal_summary
+            )
+            node = engine._dag.get_session_nodes(engine._session_id)[-1]
+            expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node.node_id}))
+        finally:
+            engine.shutdown()
+
+        assert literal_row["store_id"] in node.source_ids
+        assert any(item["content"] == literal_summary for item in expanded["expanded"])
+
     def _single_initial_user_restart_fixture(
         self,
         tmp_path,
@@ -6747,6 +6797,10 @@ class TestMessageFiltering:
             {"role": "user", "content": "SECRET ignored objective must not be preserved"},
             {"role": "user", "content": "fresh visible request"},
         ]
+        # Model a scaffold carried from the prior active replay rather than a
+        # new raw message that merely has scaffold-shaped literal content.
+        engine._remember_active_replay_messages(messages[:1], messages[:1])
+        engine._ingest_cursor = 1
 
         result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
         result_text = "\n".join(str(msg.get("content", "")) for msg in result)
