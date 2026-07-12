@@ -4901,6 +4901,52 @@ class TestEngineABC:
             message["content"] for message in [*snapshot, *durable_suffix, fresh_delta]
         ]
 
+    def test_restart_snapshot_prefix_uses_full_alignment_before_suppressing_suffix(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "snapshot-prefix-repeated-terminal-identity.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "snapshot-prefix-repeated-terminal-identity-session"
+        conversation_id = "snapshot-prefix-repeated-terminal-identity-conversation"
+        snapshot = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Repeated durable user."},
+        ]
+        durable_suffix = [
+            {"role": "assistant", "content": "Durable response."},
+            dict(snapshot[-1]),
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(
+                session_id,
+                [*snapshot, *durable_suffix],
+                conversation_id=conversation_id,
+            )
+            before._write_active_replay_snapshot(snapshot)
+        finally:
+            before.shutdown()
+
+        fresh_delta = {"role": "assistant", "content": "Fresh response after replay."}
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages([*snapshot, *durable_suffix, fresh_delta])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        expected = [*snapshot, *durable_suffix, fresh_delta]
+        assert [row["content"] for row in rows] == [message["content"] for message in expected]
+        assert sum(row["content"] == durable_suffix[0]["content"] for row in rows) == 1
+        assert sum(row["content"] == snapshot[-1]["content"] for row in rows) == 2
+        assert rows[-1]["content"] == fresh_delta["content"]
+
     def test_new_system_message_with_lcm_annotation_phrases_persists_exactly_once(self, tmp_path):
         db_path = tmp_path / "literal-lcm-system-phrases.db"
         config = LCMConfig(database_path=str(db_path))

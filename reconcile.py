@@ -313,9 +313,9 @@ class ReconcileMixin:
                 ]
                 snapshot_endpoint = next(
                     (
-                        index
-                        for index in range(len(durable) - 1, -1, -1)
-                        if durable[index] == snapshot[-1]
+                        start + len(snapshot) - 1
+                        for start in range(len(durable) - len(snapshot), -1, -1)
+                        if durable[start : start + len(snapshot)] == snapshot
                     ),
                     None,
                 )
