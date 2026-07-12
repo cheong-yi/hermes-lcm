@@ -3712,7 +3712,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             except Exception:
                 return exact_annotation
-            if not rows or rows[0].get("role") != "system":
+            if not rows:
+                return False
+            if rows[0].get("role") != "system":
                 return exact_annotation
             stored_content = normalize_content_value(rows[0].get("content")) or ""
             restored_stored_content = self._identity_content_for_active_cleanup(stored_content)
@@ -3976,6 +3978,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        reconciled_replay_message_indexes: set[int] = set()
+        self._reconciled_replay_message_indexes = set()
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
@@ -4030,6 +4034,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            reconciled_replay_message_indexes = self._reconciled_replay_message_indexes
+            self._reconciled_replay_message_indexes = set()
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
@@ -4141,7 +4147,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
-                if absolute_idx in self._reconciled_replay_message_indexes:
+                if absolute_idx in reconciled_replay_message_indexes:
                     continue
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""

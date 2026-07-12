@@ -4936,19 +4936,26 @@ class TestEngineABC:
         after.on_session_start(
             session_id, platform="cli", conversation_id=conversation_id, context_length=200000
         )
+        later_delta = {"role": "assistant", "content": "Later delta after compaction."}
         try:
             after._ingest_messages(incoming)
-            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+            reconciled_rows = after._store.get_session_messages(
+                session_id, conversation_id=conversation_id
+            )
             reconciliation = after._last_ingest_reconciliation
+            compacted = after._finalize_forced_overflow_result(incoming, [changed_system])
+            after._ingest_messages([*compacted, later_delta])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
         finally:
             after.shutdown()
 
-        assert len(rows) == len(durable) + 2
+        assert len(reconciled_rows) == len(durable) + 2
         assert reconciliation["action"] == "advanced cursor"
-        assert sum(row["content"] == durable[1]["content"] for row in rows) == 1
-        assert sum(row["content"] == durable[2]["content"] for row in rows) == 1
-        assert sum(row["content"] == changed_system["content"] for row in rows) == 1
-        assert sum(row["content"] == appended_turn["content"] for row in rows) == 1
+        assert sum(row["content"] == durable[1]["content"] for row in reconciled_rows) == 1
+        assert sum(row["content"] == durable[2]["content"] for row in reconciled_rows) == 1
+        assert sum(row["content"] == changed_system["content"] for row in reconciled_rows) == 1
+        assert sum(row["content"] == appended_turn["content"] for row in reconciled_rows) == 1
+        assert sum(row["content"] == later_delta["content"] for row in rows) == 1
 
     def test_restart_changed_system_partial_snapshot_resemblance_remains_new_content(
         self,
@@ -5094,6 +5101,46 @@ class TestEngineABC:
             and "Genuinely new structured system message." in row["content"]
             for row in rows
         ) == 1
+
+    def test_new_annotated_system_persists_when_only_legacy_blank_conversation_rows_exist(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "fresh-annotated-system-legacy-blank-conversation.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "fresh-annotated-system-legacy-blank-conversation-session"
+        conversation_id = "fresh-annotated-system-new-conversation"
+        legacy = LCMEngine(config=config)
+        try:
+            legacy._store.append_batch(
+                session_id,
+                [{"role": "user", "content": "Legacy blank-conversation user."}],
+                conversation_id="",
+            )
+            fresh_system = {
+                "role": "system",
+                "content": legacy._append_lcm_note_to_content("Genuinely new system message."),
+            }
+        finally:
+            legacy.shutdown()
+
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            assert not after._is_replayed_context_scaffold_message(fresh_system)
+            after._ingest_messages(
+                [fresh_system, {"role": "user", "content": "New conversation user."}]
+            )
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert [(row["role"], row["content"]) for row in rows] == [
+            ("system", fresh_system["content"]),
+            ("user", "New conversation user."),
+        ]
 
     @pytest.mark.parametrize(
         "followup",
