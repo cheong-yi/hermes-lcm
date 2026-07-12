@@ -308,18 +308,19 @@ class ReconcileMixin:
             ),
         )
 
-        # A real new system delta may precede the replayed durable user anchor.
-        # Keep that delta while suppressing only the exact historical suffix.
+        # A real new system delta may precede the replayed durable user anchor,
+        # and a real new turn may follow the exact emitted snapshot. Keep both
+        # deltas while suppressing only the identity-proven historical segment.
         if (
-            len(incoming) == len(snapshot)
-            and len(incoming) > 1
+            len(incoming) >= len(snapshot)
+            and len(snapshot) > 1
             and incoming[0][0] == "system"
             and snapshot[0][0] == "system"
             and incoming[0] != snapshot[0]
-            and incoming[1:] == snapshot[1:]
+            and incoming[1 : len(snapshot)] == snapshot[1:]
         ):
             self._historical_active_replay_matched = True
-            self._reconciled_replay_message_indexes = set(range(1, len(incoming)))
+            self._reconciled_replay_message_indexes = set(range(1, len(snapshot)))
             return 0
         return None
 

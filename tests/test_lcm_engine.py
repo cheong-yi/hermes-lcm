@@ -4906,6 +4906,98 @@ class TestEngineABC:
         ) == 1
         assert sum(row["content"] == durable[1]["content"] for row in rows) == 1
 
+    def test_restart_changed_system_snapshot_with_appended_turn_suppresses_only_replay(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "changed-system-snapshot-appended-turn.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "changed-system-snapshot-appended-turn-session"
+        conversation_id = "changed-system-snapshot-appended-turn-conversation"
+        durable = [
+            {"role": "system", "content": "Original system."},
+            {"role": "user", "content": "Durable user turn."},
+            {"role": "assistant", "content": "Durable assistant turn."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            before._write_active_replay_snapshot(durable)
+        finally:
+            before.shutdown()
+
+        changed_system = {"role": "system", "content": "Changed system."}
+        appended_turn = {"role": "user", "content": "New turn after restart."}
+        incoming = [changed_system, *durable[1:], appended_turn]
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages(incoming)
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+            reconciliation = after._last_ingest_reconciliation
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(durable) + 2
+        assert reconciliation["action"] == "advanced cursor"
+        assert sum(row["content"] == durable[1]["content"] for row in rows) == 1
+        assert sum(row["content"] == durable[2]["content"] for row in rows) == 1
+        assert sum(row["content"] == changed_system["content"] for row in rows) == 1
+        assert sum(row["content"] == appended_turn["content"] for row in rows) == 1
+
+    def test_restart_changed_system_partial_snapshot_resemblance_remains_new_content(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "changed-system-partial-snapshot-resemblance.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "changed-system-partial-snapshot-resemblance-session"
+        conversation_id = "changed-system-partial-snapshot-resemblance-conversation"
+        durable = [
+            {"role": "system", "content": "Original system."},
+            {"role": "user", "content": "Repeated-looking user turn."},
+            {"role": "assistant", "content": "Original assistant turn."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            before._write_active_replay_snapshot(durable)
+        finally:
+            before.shutdown()
+
+        incoming = [
+            {"role": "system", "content": "Changed system."},
+            dict(durable[1]),
+            {"role": "assistant", "content": "Genuinely new assistant turn."},
+            {"role": "user", "content": "Genuinely new user turn."},
+        ]
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages(incoming)
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+            reconciliation = after._last_ingest_reconciliation
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(durable) + len(incoming)
+        assert reconciliation["reason"] == "persisted ambiguous delta"
+        assert sum(row["content"] == durable[1]["content"] for row in rows) == 2
+        assert [row["content"] for row in rows[-2:]] == [
+            "Genuinely new assistant turn.",
+            "Genuinely new user turn.",
+        ]
+
     def test_restart_skips_generated_structured_system_annotation(self, tmp_path):
         db_path = tmp_path / "structured-lcm-system-replay.db"
         config = LCMConfig(database_path=str(db_path))
