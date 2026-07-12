@@ -305,6 +305,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        self._historical_active_replay_matched = False
+        self._reconciled_replay_message_indexes: set[int] = set()
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -3670,6 +3672,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
         )
+        if self._historical_active_replay_matched:
+            self._write_active_replay_snapshot(active_replay_messages)
         return active_replay_messages
 
     def _cached_active_replay_messages(
@@ -3688,9 +3692,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         role = str(msg.get("role") or "")
         content = normalize_content_value(msg.get("content")) or ""
         if role == "system":
-            return (
-                "[Note: This conversation uses Lossless Context Management (LCM)." in content
-                and "Earlier turns have been compacted into hierarchical summaries below." in content
+            current_note = self._append_lcm_note_to_content("")
+            legacy_note = (
+                "\n\n[Note: This conversation uses Lossless Context Management (LCM). "
+                "Earlier turns have been compacted into hierarchical summaries below.]"
+            )
+            exact_annotation = any(
+                content == note.strip() or content.endswith(note)
+                for note in (current_note, legacy_note)
+                if isinstance(note, str)
+            )
+            if not exact_annotation:
+                return False
+            try:
+                rows = self._store.get_session_messages(
+                    self._session_id,
+                    limit=1,
+                    conversation_id=self._conversation_id,
+                )
+            except Exception:
+                return exact_annotation
+            if not rows or rows[0].get("role") != "system":
+                return exact_annotation
+            expected_messages = []
+            for note in (current_note, legacy_note):
+                expected = dict(rows[0])
+                expected["content"] = str(rows[0].get("content") or "") + str(note)
+                expected_messages.append(expected)
+            return any(
+                self._message_replay_identity(msg)
+                == self._message_replay_identity(expected, stored_row=True)
+                for expected in expected_messages
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
@@ -3705,6 +3737,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _is_known_generated_summary_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         content = normalize_content_value(msg.get("content")) or ""
+        generated_summaries: set[str] = set()
         for match in re.finditer(
             r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary "
             r"\(d\d+, node (\d+)\)\]",
@@ -3723,9 +3756,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 f"{node.summary}\n"
                 f"[Expand for details: {node.expand_hint}]"
             )
-            if generated in content:
-                return True
-        return False
+            generated_summaries.add(generated)
+        if content in generated_summaries:
+            return True
+        parts = content.split("\n\n---\n\n")
+        return bool(parts) and all(part in generated_summaries for part in parts)
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):
@@ -4089,6 +4124,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
+                if absolute_idx in self._reconciled_replay_message_indexes:
+                    continue
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
@@ -4798,7 +4835,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             if self._preserved_objective_context_content(message):
                 return None
-            if not self._is_prompt_bearing_user_message(message):
+            if not self._is_prompt_bearing_user_message(
+                message,
+                allow_literal_summary_scaffold=True,
+            ):
                 continue
             if any(message == selected for selected in selected_tail_messages):
                 return None
@@ -4938,8 +4978,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 combined = "\n\n---\n\n".join(selected_parts)
                 result.append({"role": summary_role, "content": combined})
 
-        # Fresh tail
-        result.extend(tail_selected)
+        # Fresh tail.  A generated assistant summary followed by an assistant
+        # tail is not provider-valid.  Coalesce at that boundary while retaining
+        # the tail's tool_calls so following tool results stay contiguous.
+        if (
+            result
+            and tail_selected
+            and result[-1].get("role") == "assistant"
+            and tail_selected[0].get("role") == "assistant"
+        ):
+            summary_text = text_content_for_pattern_matching(result[-1].get("content")) or ""
+            merged_tail = copy.deepcopy(tail_selected[0])
+            tail_content = merged_tail.get("content")
+            if isinstance(tail_content, list):
+                merged_tail["content"] = [
+                    {"type": "text", "text": summary_text},
+                    *copy.deepcopy(tail_content),
+                ]
+            else:
+                tail_text = "" if tail_content is None else str(tail_content)
+                merged_tail["content"] = summary_text + ("\n\n" + tail_text if tail_text else "")
+            result[-1] = merged_tail
+            result.extend(tail_selected[1:])
+        else:
+            result.extend(tail_selected)
 
         # ── Active-context cleanup / tool-pair guardrail ──
         # Drop assistant turns that carry only blank/internal structured content,
@@ -5026,6 +5088,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     effective_cap,
                     count_messages_tokens(compressed),
                 )
+        if compressed != original_messages:
+            self._write_active_replay_snapshot(compressed)
         return compressed
 
     def _should_force_overflow_recovery(

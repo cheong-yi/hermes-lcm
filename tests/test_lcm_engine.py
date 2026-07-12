@@ -4786,6 +4786,126 @@ class TestEngineABC:
             row["role"] == "assistant" and row["content"] == repeated_content for row in rows
         ) == 2
 
+    @pytest.mark.parametrize("frontier_positive", [False, True], ids=["frontier-zero", "positive-frontier"])
+    @pytest.mark.parametrize(
+        "restart_cap", [180, 800, 0, 100], ids=["unchanged", "increased", "disabled", "decreased"]
+    )
+    @pytest.mark.parametrize("delta_kind", ["none", "new", "repeated"])
+    def test_restart_reconciles_exact_emitted_snapshot_independent_of_current_cap(
+        self, tmp_path, frontier_positive, restart_cap, delta_kind
+    ):
+        db_path = tmp_path / f"snapshot-{frontier_positive}-{restart_cap}-{delta_kind}.db"
+        session_id = "cap-independent-snapshot-session"
+        conversation_id = "cap-independent-snapshot-conversation"
+        messages = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Current durable request."},
+            {"role": "assistant", "content": "omitted repeated content"},
+            {"role": "assistant", "content": "visible durable suffix"},
+        ]
+        emitted = [messages[0], messages[1], messages[-1]]
+        before = LCMEngine(config=LCMConfig(database_path=str(db_path), max_assembly_tokens=180))
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            store_ids = before._store.append_batch(
+                session_id, messages, conversation_id=conversation_id
+            )
+            if frontier_positive:
+                before._lifecycle.advance_frontier(conversation_id, session_id, store_ids[2])
+            before._write_active_replay_snapshot(emitted)
+        finally:
+            before.shutdown()
+
+        delta = None
+        if delta_kind == "new":
+            delta = {"role": "user", "content": "new request after restart"}
+        elif delta_kind == "repeated":
+            delta = {"role": "assistant", "content": messages[2]["content"]}
+        incoming = emitted + ([delta] if delta is not None else [])
+
+        after = LCMEngine(
+            config=LCMConfig(database_path=str(db_path), max_assembly_tokens=restart_cap)
+        )
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages(incoming)
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(messages) + (delta is not None)
+        if delta is not None:
+            assert rows[-1]["role"] == delta["role"]
+            assert rows[-1]["content"] == delta["content"]
+        if delta_kind == "repeated":
+            assert sum(row["content"] == messages[2]["content"] for row in rows) == 2
+
+        repeated_restart = LCMEngine(
+            config=LCMConfig(database_path=str(db_path), max_assembly_tokens=restart_cap)
+        )
+        repeated_restart.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            repeated_restart._ingest_messages(incoming)
+            repeated_rows = repeated_restart._store.get_session_messages(
+                session_id, conversation_id=conversation_id
+            )
+        finally:
+            repeated_restart.shutdown()
+        assert len(repeated_rows) == len(rows)
+
+    def test_new_system_message_with_lcm_annotation_phrases_persists_exactly_once(self, tmp_path):
+        db_path = tmp_path / "literal-lcm-system-phrases.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "literal-lcm-system-phrases-session"
+        conversation_id = "literal-lcm-system-phrases-conversation"
+        durable = [
+            {"role": "system", "content": "Original system."},
+            {"role": "user", "content": "Durable user anchor."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            emitted_system = dict(durable[0])
+            emitted_system["content"] = before._append_lcm_note_to_content(durable[0]["content"])
+            before._write_active_replay_snapshot([emitted_system, durable[1]])
+        finally:
+            before.shutdown()
+
+        literal_system = {
+            "role": "system",
+            "content": (
+                "New literal system delta.\n"
+                "[Note: This conversation uses Lossless Context Management (LCM).\n"
+                "Earlier turns have been compacted into hierarchical summaries below."
+            ),
+        }
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            assert not after._is_replayed_context_scaffold_message(literal_system)
+            after._ingest_messages([literal_system, durable[1]])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(durable) + 1
+        assert sum(
+            row["role"] == "system" and row["content"] == literal_system["content"]
+            for row in rows
+        ) == 1
+        assert sum(row["content"] == durable[1]["content"] for row in rows) == 1
+
     @pytest.mark.parametrize(
         "followup",
         [

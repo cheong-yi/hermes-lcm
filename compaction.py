@@ -775,6 +775,10 @@ class CompactionMixin:
             self._write_generated_ignored_placeholder_hash_ordinals(
                 self._generated_placeholder_digest_ordinals_for_active_replay(sanitized_messages)
             )
+            if dropped_replayed_scaffold_messages and sanitized_messages != messages:
+                snapshot_writer = getattr(self, "_write_active_replay_snapshot", None)
+                if callable(snapshot_writer):
+                    snapshot_writer(sanitized_messages)
             return sanitized_messages
 
         # Step 6: Check if condensation is needed
@@ -853,5 +857,9 @@ class CompactionMixin:
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
         )
+        if compressed != messages:
+            snapshot_writer = getattr(self, "_write_active_replay_snapshot", None)
+            if callable(snapshot_writer):
+                snapshot_writer(compressed)
 
         return compressed

@@ -4328,6 +4328,75 @@ class TestAssemblyBudgetSelection:
         assert "SMALL_RECENT_SUMMARY" in contents
         assert "HUGE_DURABLE_SUMMARY" not in contents
 
+    @pytest.mark.parametrize("with_tool_call", [False, True], ids=["plain-assistant", "tool-call"])
+    def test_anchored_summary_coalesces_with_assistant_tail_for_valid_roles(
+        self, tmp_path, monkeypatch, with_tool_call
+    ):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=2_000)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session", depth=0,
+            summary="DAG summary for the active request.", token_count=10,
+            source_token_count=100, source_ids=[1], source_type="messages",
+            expand_hint="active request",
+        ))
+        assistant = {"role": "assistant", "content": "Current assistant tail."}
+        tail = [assistant]
+        if with_tool_call:
+            assistant = {
+                "role": "assistant", "content": "Calling terminal.",
+                "tool_calls": [{"id": "call_tail", "function": {"name": "terminal", "arguments": "{}"}}],
+            }
+            tail = [assistant, {"role": "tool", "tool_call_id": "call_tail", "content": "terminal output"}]
+
+        assembled = engine._assemble_context(
+            None, tail,
+            leading_anchor_messages=[
+                {"role": "system", "content": "System anchor."},
+                {"role": "user", "content": "Exact preserved user anchor."},
+            ],
+        )
+
+        assert [message["role"] for message in assembled] == (
+            ["system", "user", "assistant", "tool"] if with_tool_call
+            else ["system", "user", "assistant"]
+        )
+        assert "DAG summary for the active request." in assembled[2]["content"]
+        assert assistant["content"] in assembled[2]["content"]
+        if with_tool_call:
+            assert assembled[2]["tool_calls"] == assistant["tool_calls"]
+            assert assembled[3]["tool_call_id"] == "call_tail"
+
+    def test_latest_literal_local_summary_rendering_remains_current_objective(
+        self, tmp_path, monkeypatch
+    ):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=240)
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="assembly-session", depth=0,
+            summary="Exact local summary body.", token_count=10,
+            source_token_count=100, source_ids=[1], source_type="messages",
+            expand_hint="local details",
+        ))
+        literal_latest = (
+            f"[Recent Summary (d0, node {node_id})]\nExact local summary body.\n"
+            "[Expand for details: local details]\n"
+            "Now implement this NEW literal user request."
+        )
+        engine._pending_context_anchor_messages = [
+            {"role": "user", "content": "STALE_OLDER_OBJECTIVE"},
+            {"role": "assistant", "content": "large derived output " * 200},
+            {"role": "user", "content": literal_latest},
+            {"role": "assistant", "content": "oversized latest assistant " * 200},
+        ]
+
+        assembled = engine._assemble_context(
+            {"role": "system", "content": "System anchor."},
+            [{"role": "assistant", "content": "oversized latest assistant " * 200}],
+        )
+
+        combined = "\n".join(str(message.get("content", "")) for message in assembled)
+        assert literal_latest in combined
+        assert "STALE_OLDER_OBJECTIVE" not in combined
+
 
 class TestIngestExternalization:
     def _engine(self, tmp_path: Path, **config_overrides):

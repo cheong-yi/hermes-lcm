@@ -243,6 +243,86 @@ class ReconcileMixin:
             tool_calls_identity,
         )
 
+    def _active_replay_snapshot_key(self) -> str:
+        return f"active_replay_snapshot:{self._session_id}"
+
+    def _write_active_replay_snapshot(self, messages: List[Dict[str, Any]]) -> None:
+        if not self._session_id:
+            return
+        payload = {
+            "conversation_id": str(getattr(self, "_conversation_id", "") or ""),
+            "identities": [list(self._message_replay_identity(message)) for message in messages],
+        }
+        try:
+            self._store.write_metadata_json(
+                [self._active_replay_snapshot_key()],
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                skip_unchanged=True,
+            )
+        except Exception:
+            logger.debug("LCM active replay snapshot write failed", exc_info=True)
+
+    def _historical_active_replay_cursor(self, messages: List[Dict[str, Any]]) -> int | None:
+        """Return a replay cursor proven by the exact last emitted snapshot.
+
+        Assembly caps are runtime policy and may change between processes.  The
+        durable emitted identity is therefore the only safe proof for a partial
+        tail replay (especially when a new delta repeats durable content).
+        """
+        self._historical_active_replay_matched = False
+        self._reconciled_replay_message_indexes = set()
+        try:
+            payload = self._store.read_metadata_json(self._active_replay_snapshot_key())
+        except Exception:
+            logger.debug("LCM active replay snapshot read failed", exc_info=True)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("conversation_id") or "") != str(
+            getattr(self, "_conversation_id", "") or ""
+        ):
+            return None
+        raw_identities = payload.get("identities")
+        if not isinstance(raw_identities, list) or not raw_identities:
+            return None
+        snapshot = [tuple(identity) for identity in raw_identities if isinstance(identity, list)]
+        if len(snapshot) != len(raw_identities):
+            return None
+        incoming = [self._message_replay_identity(message) for message in messages]
+        if len(incoming) >= len(snapshot) and incoming[: len(snapshot)] == snapshot:
+            self._historical_active_replay_matched = True
+            return len(snapshot)
+        logger.debug(
+            "LCM historical active replay mismatch: incoming=%d snapshot=%d first_diff=%s",
+            len(incoming),
+            len(snapshot),
+            next(
+                (
+                    index
+                    for index, (incoming_identity, snapshot_identity) in enumerate(
+                        zip(incoming, snapshot)
+                    )
+                    if incoming_identity != snapshot_identity
+                ),
+                None,
+            ),
+        )
+
+        # A real new system delta may precede the replayed durable user anchor.
+        # Keep that delta while suppressing only the exact historical suffix.
+        if (
+            len(incoming) == len(snapshot)
+            and len(incoming) > 1
+            and incoming[0][0] == "system"
+            and snapshot[0][0] == "system"
+            and incoming[0] != snapshot[0]
+            and incoming[1:] == snapshot[1:]
+        ):
+            self._historical_active_replay_matched = True
+            self._reconciled_replay_message_indexes = set(range(1, len(incoming)))
+            return 0
+        return None
+
     @staticmethod
     def _matches_store_tail_suffix(
         stored_tail: list[tuple[str, str, str, str]],
@@ -970,6 +1050,19 @@ class ReconcileMixin:
                     )
                     return cursor
             return 0
+
+        historical_cursor = self._historical_active_replay_cursor(messages)
+        if historical_cursor is not None:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="exact historical active replay snapshot",
+                cursor=historical_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=0,
+                effective_incoming=historical_cursor,
+            )
+            return historical_cursor
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
         stored_rows = self._store.get_session_tail(  # type: ignore[attr-defined]
