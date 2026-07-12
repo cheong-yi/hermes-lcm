@@ -3918,6 +3918,85 @@ class TestEngineABC:
             == 1
         )
 
+    def test_second_compaction_keeps_legacy_blank_former_anchor_lineage_after_rebind(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=40,
+            database_path=str(tmp_path / "legacy-former-anchor-lineage.db"),
+        )
+        session_id = "legacy-former-anchor-lineage-session"
+        conversation_id = "legacy-former-anchor-lineage-conversation"
+        summaries = iter([
+            "First-stage assistant summary.\nExpand for details about: initial work",
+            "Second-stage user summary.\nExpand for details about: original request",
+        ])
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (next(summaries), 1),
+        )
+        original_user = "diagnose the legacy Qwen template failure"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": original_user},
+            {"role": "assistant", "content": "checking logs " + "detail " * 30},
+            {"role": "assistant", "content": "checking template " + "detail " * 30},
+            {"role": "assistant", "content": "still investigating " + "detail " * 30},
+            {"role": "assistant", "content": "first-stage tail " + "detail " * 30},
+        ]
+
+        before_rebind = LCMEngine(config=config)
+        before_rebind.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        try:
+            first_active_context = before_rebind.compress(messages)
+            original_row = before_rebind._store.get_session_nonblank_role_messages(
+                session_id,
+                "user",
+                limit=1,
+            )[0]
+            original_store_id = original_row["store_id"]
+            before_rebind._store._conn.execute(
+                "UPDATE messages SET conversation_id = '' WHERE session_id = ?",
+                (session_id,),
+            )
+            before_rebind._store._conn.commit()
+        finally:
+            before_rebind.shutdown()
+
+        after_rebind = LCMEngine(config=config)
+        after_rebind.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        second_messages = first_active_context + [
+            {"role": "user", "content": "now inspect the durable legacy lineage"},
+            {"role": "assistant", "content": "checking source ids"},
+            {"role": "assistant", "content": "checking expansion"},
+        ]
+        try:
+            assert after_rebind._leading_anchor_count(second_messages) == 1
+            after_rebind.compress(second_messages)
+            second_node = after_rebind._dag.get_session_nodes(session_id)[-1]
+            expanded = json.loads(
+                after_rebind.handle_tool_call("lcm_expand", {"node_id": second_node.node_id})
+            )
+        finally:
+            after_rebind.shutdown()
+
+        assert original_store_id in second_node.source_ids
+        assert any(item["content"] == original_user for item in expanded["expanded"])
+
     def test_compaction_preserves_literal_summary_shaped_user_source_lineage(
         self,
         tmp_path,

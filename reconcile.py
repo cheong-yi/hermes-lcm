@@ -1088,14 +1088,17 @@ class ReconcileMixin:
         ):
             return {}
 
-        durable_users = self._store.get_session_nonblank_role_messages(
-            self._session_id,
-            "user",
-            limit=max(1, self._store.get_session_count(self._session_id)),
-            conversation_id=getattr(self, "_conversation_id", ""),
+        conversation_id = getattr(self, "_conversation_id", "")
+        durable_limit = max(
+            1,
+            self._store.get_session_count(self._session_id),  # type: ignore[attr-defined]
         )
-        if not durable_users:
-            return {}
+        durable_users = self._store.get_session_nonblank_role_messages(  # type: ignore[attr-defined]
+            self._session_id,  # type: ignore[attr-defined]
+            "user",
+            limit=durable_limit,
+            conversation_id=conversation_id,
+        )
         durable_prompt_users = [
             message for message in durable_users
             if self._is_prompt_bearing_user_message(message)
@@ -1104,13 +1107,37 @@ class ReconcileMixin:
             message for message in messages
             if self._is_prompt_bearing_user_message(message)
         ]
-        if [
-            self._message_replay_identity(message, stored_row=True)
-            for message in durable_prompt_users
-        ] != [
+        active_prompt_identities = [
             self._message_replay_identity(message)
             for message in active_prompt_users
-        ]:
+        ]
+        durable_prompt_identities = [
+            self._message_replay_identity(message, stored_row=True)
+            for message in durable_prompt_users
+        ]
+        if conversation_id and durable_prompt_identities != active_prompt_identities:
+            # A rebound legacy session can have the preserved initial user on
+            # blank-provenance rows and later turns on the current conversation.
+            # Full ordered replay equality below remains the lineage proof.
+            legacy_users = self._store.get_session_nonblank_role_messages(  # type: ignore[attr-defined]
+                self._session_id,  # type: ignore[attr-defined]
+                "user",
+                limit=durable_limit,
+                legacy_blank_conversation_only=True,
+            )
+            durable_prompt_users = sorted(
+                [
+                    message
+                    for message in [*legacy_users, *durable_users]
+                    if self._is_prompt_bearing_user_message(message)  # type: ignore[attr-defined]
+                ],
+                key=lambda message: int(message["store_id"]),
+            )
+            durable_prompt_identities = [
+                self._message_replay_identity(message, stored_row=True)
+                for message in durable_prompt_users
+            ]
+        if durable_prompt_identities != active_prompt_identities:
             return {}
 
         initial_user = durable_prompt_users[0]
