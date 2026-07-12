@@ -3698,7 +3698,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "Earlier turns have been compacted into hierarchical summaries below.]"
             )
             exact_annotation = any(
-                content == note.strip() or content.endswith(note)
+                self._content_has_exact_lcm_annotation(msg.get("content"), note)
                 for note in (current_note, legacy_note)
                 if isinstance(note, str)
             )
@@ -3714,15 +3714,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return exact_annotation
             if not rows or rows[0].get("role") != "system":
                 return exact_annotation
-            expected_messages = []
-            for note in (current_note, legacy_note):
-                expected = dict(rows[0])
-                expected["content"] = str(rows[0].get("content") or "") + str(note)
-                expected_messages.append(expected)
+            stored_content = normalize_content_value(rows[0].get("content")) or ""
+            restored_stored_content = self._identity_content_for_active_cleanup(stored_content)
+            expected_current = dict(rows[0])
+            expected_current["content"] = self._append_lcm_note_to_content(restored_stored_content)
+            expected_legacy = dict(rows[0])
+            expected_legacy["content"] = stored_content + legacy_note
             return any(
                 self._message_replay_identity(msg)
                 == self._message_replay_identity(expected, stored_row=True)
-                for expected in expected_messages
+                for expected in (expected_current, expected_legacy)
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
@@ -3734,6 +3735,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 content,
             )
         )
+
+    @staticmethod
+    def _content_has_exact_lcm_annotation(content: Any, note: str) -> bool:
+        if isinstance(content, str):
+            if content == note.strip() or content.endswith(note):
+                return True
+            try:
+                decoded = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if normalize_content_value(decoded) != content:
+                return False
+            content = decoded
+        if not isinstance(content, list) or not content:
+            return False
+        return content[-1] == {"type": "text", "text": note.lstrip()}
 
     def _is_known_generated_summary_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         content = normalize_content_value(msg.get("content")) or ""

@@ -4906,6 +4906,103 @@ class TestEngineABC:
         ) == 1
         assert sum(row["content"] == durable[1]["content"] for row in rows) == 1
 
+    def test_restart_skips_generated_structured_system_annotation(self, tmp_path):
+        db_path = tmp_path / "structured-lcm-system-replay.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "structured-lcm-system-replay-session"
+        conversation_id = "structured-lcm-system-replay-conversation"
+        durable = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "Original structured system."},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/system.png"}},
+                ],
+            },
+            {"role": "user", "content": "Durable user anchor."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            emitted = before._assemble_context(durable[0], [durable[1]])
+        finally:
+            before.shutdown()
+
+        assert isinstance(emitted[0]["content"], list)
+        assert emitted[0]["content"][-1]["text"].startswith(
+            "[Note: This conversation uses Lossless Context Management (LCM)."
+        )
+        replayed_system = dict(emitted[0])
+        replayed_system["content"] = json.dumps(
+            emitted[0]["content"], ensure_ascii=False, sort_keys=True
+        )
+
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            assert after._is_replayed_context_scaffold_message(replayed_system)
+            after._ingest_messages([replayed_system, *emitted[1:]])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(durable) + 1
+        assert sum(row["role"] == "system" for row in rows) == 1
+        assert all(
+            "Earlier turns have been compacted into hierarchical summaries below."
+            not in row["content"]
+            for row in rows
+            if row["role"] == "system"
+        )
+
+    def test_new_structured_system_with_exact_lcm_annotation_persists(self, tmp_path):
+        db_path = tmp_path / "fresh-structured-lcm-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "fresh-structured-lcm-system-session"
+        conversation_id = "fresh-structured-lcm-system-conversation"
+        durable = [
+            {"role": "system", "content": [{"type": "text", "text": "Original system."}]},
+            {"role": "user", "content": "Durable user anchor."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            fresh_system = {
+                "role": "system",
+                "content": before._append_lcm_note_to_content(
+                    [{"type": "text", "text": "Genuinely new structured system message."}]
+                ),
+            }
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            assert not after._is_replayed_context_scaffold_message(fresh_system)
+            after._ingest_messages([fresh_system, durable[1]])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert len(rows) == len(durable) + 2
+        assert sum(row["role"] == "system" for row in rows) == 2
+        assert sum(
+            row["role"] == "system"
+            and "Genuinely new structured system message." in row["content"]
+            for row in rows
+        ) == 1
+
     @pytest.mark.parametrize(
         "followup",
         [
