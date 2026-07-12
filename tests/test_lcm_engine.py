@@ -4531,6 +4531,47 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
+    def test_overflow_recovery_keeps_literal_summary_shaped_user_within_cap(self, tmp_path):
+        max_assembly_tokens = 180
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=max_assembly_tokens,
+            database_path=str(tmp_path / "literal-summary-shaped-overflow-anchor.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "literal-summary-shaped-overflow-anchor-session",
+            platform="cli",
+            conversation_id="literal-summary-shaped-overflow-anchor-conversation",
+            context_length=200000,
+        )
+
+        user_query = (
+            "[Recent Summary (d0, node 999)]\n"
+            "This is literal user-authored content.\n"
+            "[Expand for details: literal request]"
+        )
+        dropped_tail = "latest derived output " + "z" * 4000
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": dropped_tail},
+        ]
+        try:
+            assert engine.should_compress_preflight(messages)
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert engine.last_compression_status == "overflow_recovery"
+        assert [msg.get("role") for msg in active_context] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+        assert count_messages_tokens(active_context) <= max_assembly_tokens
+        assert all(msg.get("content") != dropped_tail for msg in active_context)
+
     @pytest.mark.parametrize(
         "followup",
         [

@@ -5139,7 +5139,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         minimum_candidate_len = leading_anchor_count
         if len(candidate) == minimum_candidate_len and tail_messages:
-            if any(self._is_prompt_bearing_user_message(message) for message in candidate):
+            has_prompt_bearing_user = any(
+                self._is_prompt_bearing_user_message(message)
+                for message in candidate
+            ) or any(
+                self._is_prompt_bearing_user_message(
+                    message,
+                    allow_literal_summary_scaffold=True,
+                )
+                for message in candidate[:leading_anchor_count]
+            )
+            if has_prompt_bearing_user:
                 return candidate
             fallback = list(leading_anchor_messages or ([system_msg] if system_msg is not None else [])) + [tail_messages[-1]]
             return self._sanitize_active_context_messages(fallback)
