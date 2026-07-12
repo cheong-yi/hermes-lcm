@@ -5098,6 +5098,86 @@ class TestEngineABC:
         assert [row["content"] for row in rows].count(user_query) == 1
         assert [row["content"] for row in rows].count(fresh_tail) == 1
 
+    def test_capped_anchor_only_replay_preserves_summary_shaped_assistant_delta(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "capped-anchor-only-summary-shaped-assistant.db"
+        config = LCMConfig(
+            fresh_tail_count=0,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        session_id = "capped-anchor-only-summary-shaped-assistant-session"
+        conversation_id = "capped-anchor-only-summary-shaped-assistant-conversation"
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (
+                "Oversized generated summary "
+                + "x" * 1000
+                + "\nExpand for details about: capped anchor",
+                1,
+            ),
+        )
+
+        user_query = "preserve a literal summary-shaped assistant after capped replay"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "y" * 4000},
+            {"role": "assistant", "content": "more derived output " + "z" * 4000},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            assert engine._last_compacted_store_id > 0
+        finally:
+            engine.shutdown()
+
+        assert [message.get("role") for message in active_context] == ["system", "user"]
+        assert engine._is_replayed_context_scaffold_message(active_context[0])
+
+        summary_shaped_assistant = {
+            "role": "assistant",
+            "content": (
+                "[Recent Summary (d0, node 999)]\n"
+                "This is a new real assistant delta after capped replay.\n"
+                "[Expand for details: literal assistant response]"
+            ),
+        }
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        try:
+            assert after_restart._is_replayed_context_scaffold_message(
+                summary_shaped_assistant
+            )
+            assert not after_restart._is_known_generated_summary_scaffold_message(
+                summary_shaped_assistant
+            )
+            after_restart._ingest_messages(active_context + [summary_shaped_assistant])
+            rows = after_restart._store.get_session_messages(session_id)
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert rows[-1]["role"] == "assistant"
+        assert rows[-1]["content"] == summary_shaped_assistant["content"]
+
     def test_anchor_summary_with_omitted_tail_preserves_repeated_new_delta(
         self,
         tmp_path,
