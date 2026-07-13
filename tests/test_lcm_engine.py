@@ -11500,6 +11500,257 @@ class TestEngineCompress:
         assert engine.get_status()["condensation_suppressed_reason"] == ""
 
 
+class TestSingleUserPromptAnchor:
+    @staticmethod
+    def _tool_chain(count=8, content_size=160):
+        messages = []
+        for index in range(count):
+            call_id = f"call_anchor_{index}"
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": f"working step {index} " + "a" * content_size,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": f"result {index} " + "b" * content_size,
+                },
+            ])
+        return messages
+
+    @staticmethod
+    def _mock_summary(**_kwargs):
+        return "Earlier tool work.\nExpand for details about: tool chain", 1
+
+    def test_normal_compaction_keeps_only_real_user_as_stable_raw_prefix(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "single-user-anchor.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("single-user-anchor", platform="cli", context_length=200_000)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", self._mock_summary)
+        user_prompt = {"role": "user", "content": "the only real user prompt"}
+        messages = [
+            {"role": "system", "content": "stable system prompt"},
+            user_prompt,
+            *self._tool_chain(),
+        ]
+
+        try:
+            result = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert result[0]["role"] == "system"
+        assert "stable system prompt" in result[0]["content"]
+        assert result[1] == user_prompt
+        summary = next(msg for msg in result if "Earlier tool work" in str(msg.get("content")))
+        assert summary["role"] == "user"
+
+    def test_normal_compaction_does_not_emit_adjacent_assistant_messages(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "single-user-role-alternation.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("single-user-role-alternation", platform="cli", context_length=200_000)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", self._mock_summary)
+        messages = [
+            {"role": "system", "content": "stable system prompt"},
+            {"role": "user", "content": "the only real user prompt"},
+            *self._tool_chain(),
+        ]
+
+        try:
+            result = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        roles = [message.get("role") for message in result]
+        assert all(
+            previous != current or current != "assistant"
+            for previous, current in zip(roles, roles[1:])
+        )
+        for index, message in enumerate(result):
+            call_ids = [call.get("id") for call in message.get("tool_calls", [])]
+            for offset, call_id in enumerate(call_ids, start=1):
+                assert result[index + offset].get("role") == "tool"
+                assert result[index + offset].get("tool_call_id") == call_id
+
+    def test_forced_overflow_recovery_keeps_system_and_only_real_user(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=100,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=80,
+            database_path=str(tmp_path / "single-user-overflow-anchor.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("single-user-overflow-anchor", platform="cli", context_length=200_000)
+        user_prompt = {"role": "user", "content": "the only overflow user prompt"}
+        messages = [
+            {"role": "system", "content": "overflow system prompt"},
+            user_prompt,
+            *self._tool_chain(content_size=240),
+        ]
+
+        try:
+            result = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert result[0]["role"] == "system"
+        assert result[1] == user_prompt
+        assert len(result) < len(messages)
+
+    def test_no_system_history_keeps_first_user_compactable(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "no-system-user-anchor.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("no-system-user-anchor", platform="cli", context_length=200_000)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", self._mock_summary)
+        first_user = {"role": "user", "content": "old gateway request"}
+
+        try:
+            result = engine.compress([first_user, *self._tool_chain()])
+        finally:
+            engine.shutdown()
+
+        assert first_user not in result
+
+    def test_later_real_user_keeps_stale_initial_user_compactable(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "later-real-user-anchor.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("later-real-user-anchor", platform="cli", context_length=200_000)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", self._mock_summary)
+        stale_user = {"role": "user", "content": "stale initial request"}
+        later_user = {"role": "user", "content": "new current request"}
+        messages = [
+            {"role": "system", "content": "system"},
+            stale_user,
+            {"role": "assistant", "content": "old response " + "x" * 200},
+            later_user,
+            {
+                "role": "assistant",
+                "content": "new response",
+                "tool_calls": [{"id": "call_later", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_later", "content": "new result"},
+        ]
+
+        try:
+            result = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert stale_user not in result
+        assert later_user in result
+
+    @pytest.mark.parametrize(
+        "pseudo_content",
+        [
+            "CONTEXT SUMMARY\nSynthetic summary text",
+            "[Recent Summary (d0, node 1)]\nSynthetic summary\n[Expand for details: old work]",
+            "[Current user objective preserved from compacted history]\nsynthetic objective",
+            "[Your active task list was preserved across context compression]\n- synthetic todo",
+            "",
+        ],
+    )
+    def test_summary_and_synthetic_pseudo_users_are_not_permanent_anchors(
+        self,
+        engine,
+        pseudo_content,
+    ):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": pseudo_content},
+            {"role": "assistant", "content": "derived response"},
+        ]
+
+        assert engine._leading_anchor_count(messages) == 1
+
+    def test_ignored_pseudo_user_is_not_a_permanent_anchor(self, tmp_path, monkeypatch):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+        engine = LCMEngine(config=LCMConfig(
+            ignore_message_patterns=["IGNORE_ANCHOR"],
+            database_path=str(tmp_path / "ignored-user-anchor.db"),
+        ))
+        try:
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "IGNORE_ANCHOR synthetic notification"},
+                {"role": "assistant", "content": "derived response"},
+            ]
+
+            assert engine._leading_anchor_count(messages) == 1
+        finally:
+            engine.shutdown()
+
+    def test_pseudo_user_after_only_real_prompt_does_not_disqualify_anchor(self, engine):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "the only real prompt"},
+            {
+                "role": "user",
+                "content": "[Current user objective preserved from compacted history]\nsynthetic objective",
+            },
+            {"role": "assistant", "content": "derived response"},
+        ]
+
+        assert engine._leading_anchor_count(messages) == 2
+
+    def test_assembly_cap_keeps_stable_system_user_prefix(self, engine):
+        system = {"role": "system", "content": "stable system"}
+        user_prompt = {"role": "user", "content": "stable real prompt"}
+        tail = [
+            {"role": "assistant", "content": f"derived {index} " + "x" * 180}
+            for index in range(8)
+        ]
+
+        first = engine._assemble_context(
+            system,
+            [user_prompt, *tail],
+            assembly_cap_override=80,
+            include_lcm_note=False,
+            preserve_leading_user=True,
+        )
+        second = engine._assemble_context(
+            system,
+            [user_prompt, *tail, {"role": "assistant", "content": "new derived " + "y" * 180}],
+            assembly_cap_override=80,
+            include_lcm_note=False,
+            preserve_leading_user=True,
+        )
+
+        assert first[:2] == [system, user_prompt]
+        assert second[:2] == first[:2]
+
+
 class TestPostCompactionIngestion:
     """Regression tests for issue #1 — messages must be persisted after
     compaction even though the active context is shorter than the store."""
@@ -19929,7 +20180,7 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, **_kwargs: [system_msg, *tail_messages],
         )
 
         compressed = engine.compress(self._make_backlog_messages())
@@ -19956,7 +20207,7 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, **_kwargs: [system_msg, *tail_messages],
         )
 
         first = engine.compress(self._make_backlog_messages())
@@ -19991,7 +20242,7 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, **_kwargs: [system_msg, *tail_messages],
         )
 
         engine.compress(self._make_backlog_messages())
@@ -20023,7 +20274,7 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, **_kwargs: [system_msg, *tail_messages],
         )
 
         compressed = engine.compress(messages, current_tokens=90)
@@ -20058,7 +20309,7 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, **_kwargs: [system_msg, *tail_messages],
         )
 
         engine.compress(messages, current_tokens=90)
@@ -20456,7 +20707,7 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=90)
 
-        assert result == [messages[0], messages[-1]]
+        assert result == messages[:2]
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
@@ -20493,7 +20744,7 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=100)
 
-        assert result == [messages[0], messages[-1]]
+        assert result == messages[:2]
         assert lcm_engine_module.count_messages_tokens(result) < 70
 
     def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):

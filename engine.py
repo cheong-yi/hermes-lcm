@@ -1486,18 +1486,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return []
         return messages[leading_anchor_count:fresh_tail_start]
 
-    @staticmethod
-    def _leading_anchor_count(messages: List[Dict[str, Any]]) -> int:
+    def _is_real_user_prompt_message(self, message: Dict[str, Any]) -> bool:
+        """Return whether a user record is real prompt-bearing conversation."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        content = normalize_content_value(message.get("content")) or ""
+        if not content.strip():
+            return False
+        if (
+            self._is_context_summary_content(message.get("content"))
+            or self._is_replayed_context_scaffold_message(message)
+            or self._is_preserved_todo_context_message(message)
+        ):
+            return False
+        pattern_text = text_content_for_pattern_matching(message.get("content")) or ""
+        if (
+            self._matches_ignore_message_patterns(message)
+            or self._mapped_stored_row_matches_ignore_message_patterns(message)
+            or self._is_volatile_ignored_quarantine_placeholder(message, pattern_text)
+            or self._is_ignored_active_replay_placeholder(message, pattern_text)
+        ):
+            return False
+        return True
+
+    def _leading_anchor_count(self, messages: List[Dict[str, Any]]) -> int:
         """Return the number of non-compactable leading messages.
 
-        Only the system prompt is a safe permanent anchor. Hermes gateway
-        sessions can begin with a user message when core passes conversation
-        history without a system prompt; preserving that first user turn as raw
-        active context lets stale requests look current after later compaction.
+        A system prompt followed by the session's only real user prompt keeps
+        both as a stable raw prefix. Once a later real user turn exists, the
+        initial prompt becomes stale and is compactable again. Gateway sessions
+        without a system prompt retain the historical zero-anchor behavior.
         """
-        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        if not messages or not isinstance(messages[0], dict) or messages[0].get("role") != "system":
+            return 0
+        if len(messages) < 2 or not self._is_real_user_prompt_message(messages[1]):
             return 1
-        return 0
+        if any(self._is_real_user_prompt_message(message) for message in messages[2:]):
+            return 1
+        return 2
 
     def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
         backlog = self._raw_backlog_messages(messages)
@@ -4666,19 +4692,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
         include_lcm_note: bool = True,
+        preserve_leading_user: bool = False,
     ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
         Structure:
-          [leading anchor, normally system prompt]
+          [leading anchors: system + sole real user prompt when applicable]
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
         """
         result = []
 
-        # Leading anchor with optional LCM annotation. Only a true system prompt
-        # is a safe permanent anchor; gateway sessions can start directly with
-        # user messages, and those user turns must remain compactable.
+        retained_user_msg: Optional[Dict[str, Any]] = None
+        if (
+            preserve_leading_user
+            and system_msg is not None
+            and system_msg.get("role") == "system"
+            and tail_messages
+            and self._is_real_user_prompt_message(tail_messages[0])
+        ):
+            retained_user_msg = tail_messages[0].copy()
+            tail_messages = tail_messages[1:]
+
+        # Leading anchors with optional LCM annotation. A true system prompt is
+        # always stable. Its immediately following user prompt is also stable
+        # only while it remains the session's sole real user turn.
         leading_msg = system_msg.copy() if system_msg is not None else None
         if leading_msg is not None:
             if (
@@ -4690,6 +4728,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     leading_msg.get("content", "")
                 )
             result.append(leading_msg)
+        if retained_user_msg is not None:
+            result.append(retained_user_msg)
 
         assembly_cap = (
             assembly_cap_override
@@ -4704,7 +4744,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
-            used = count_message_tokens(leading_msg) if leading_msg is not None else 0
+            used = count_messages_tokens(result)
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
@@ -4731,6 +4771,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
+        next_role = tail_selected[0].get("role") if tail_selected else None
         if not result or result[-1].get("role") == "system":
             # The summary becomes the first provider-visible message: either no
             # leading anchor exists (gateway-style assembly) or the system
@@ -4740,7 +4781,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # compaction.
             summary_role = "user"
         else:
-            summary_role = "assistant" if last_role != "assistant" else "user"
+            # Keep an assistant-leading fresh tail attached to its tool results.
+            # An assistant summary immediately before that tail creates adjacent
+            # provider-facing assistant turns, which some templates reject.
+            summary_role = "user" if "assistant" in {last_role, next_role} else "assistant"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
@@ -4953,6 +4997,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
+        preserve_leading_user: bool = False,
     ) -> List[Dict[str, Any]]:
         if tail_messages:
             first = tail_messages[0]
@@ -4964,6 +5009,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     tail_messages[1:],
                     assembly_cap_override=assembly_cap_override,
                     include_lcm_note=False,
+                    preserve_leading_user=preserve_leading_user,
                 )
                 if any(
                     (msg.get("content") or "") == content
@@ -4976,6 +5022,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_messages,
             assembly_cap_override=assembly_cap_override,
             include_lcm_note=False,
+            preserve_leading_user=preserve_leading_user,
         )
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
