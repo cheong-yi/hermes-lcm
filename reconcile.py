@@ -244,6 +244,11 @@ class ReconcileMixin:
         )
 
     def _active_replay_snapshot_key(self) -> str:
+        session_id = str(getattr(self, "_session_id", "") or "")
+        conversation_id = str(getattr(self, "_conversation_id", "") or "")
+        return f"active_replay_snapshot_v2:{len(session_id)}:{session_id}:{conversation_id}"
+
+    def _legacy_active_replay_snapshot_key(self) -> str:
         return f"active_replay_snapshot:{self._session_id}"
 
     def _write_active_replay_snapshot(self, messages: List[Dict[str, Any]]) -> None:
@@ -324,16 +329,24 @@ class ReconcileMixin:
         """
         self._historical_active_replay_matched = False
         self._reconciled_replay_message_indexes = set()
-        try:
-            payload = self._store.read_metadata_json(self._active_replay_snapshot_key())
-        except Exception:
-            logger.debug("LCM active replay snapshot read failed", exc_info=True)
-            return None
-        if not isinstance(payload, dict):
-            return None
-        if str(payload.get("conversation_id") or "") != str(
-            getattr(self, "_conversation_id", "") or ""
+        conversation_id = str(getattr(self, "_conversation_id", "") or "")
+        payload = None
+        for key in (
+            self._active_replay_snapshot_key(),
+            self._legacy_active_replay_snapshot_key(),
         ):
+            try:
+                candidate = self._store.read_metadata_json(key)  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("LCM active replay snapshot read failed", exc_info=True)
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("conversation_id") or "") != conversation_id:
+                continue
+            payload = candidate
+            break
+        if payload is None:
             return None
         raw_identities = payload.get("identities")
         if not isinstance(raw_identities, list) or not raw_identities:
@@ -1414,8 +1427,12 @@ class ReconcileMixin:
         active context has more occurrences of an identical replay identity than
         the store has, the surplus earliest active occurrences are treated as
         synthetic/carry-over and left unmapped so they cannot steal later stored
-        literal copies with the same content.
+        literal copies with the same content. A proven pre-frontier former anchor
+        is mapped before this scan so it cannot consume a repeated post-frontier
+        user row and strand the durable suffix between them.
         """
+        ids_by_message_id = self._get_formerly_anchored_user_source_map(messages)
+        pre_mapped_message_ids = set(ids_by_message_id)
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
         while True:
@@ -1429,6 +1446,8 @@ class ReconcileMixin:
             next_candidate_after = page[-1]["store_id"]
         active_identity_counts: dict[tuple[Any, ...], int] = {}
         for msg in messages:
+            if id(msg) in pre_mapped_message_ids:
+                continue
             identity = self._message_replay_identity(msg)
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
@@ -1545,6 +1564,8 @@ class ReconcileMixin:
             local_surplus_skips = dict(surplus_skips)
             probe_idx = start_store_idx
             for remaining_msg in messages[message_start_idx:]:
+                if id(remaining_msg) in pre_mapped_message_ids:
+                    continue
                 msg_content = normalize_content_value(remaining_msg.get("content")) or ""
                 if (
                     remaining_msg.get("store_id") is None
@@ -1570,9 +1591,10 @@ class ReconcileMixin:
                 probe_idx = match_idx + 1
             return matched_message_ids
 
-        ids_by_message_id: dict[int, int] = {}
         store_idx = 0
         for msg_idx, msg in enumerate(messages):
+            if id(msg) in pre_mapped_message_ids:
+                continue
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
@@ -1623,7 +1645,4 @@ class ReconcileMixin:
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 
-        ids_by_message_id.update(
-            self._get_formerly_anchored_user_source_map(messages)
-        )
         return ids_by_message_id

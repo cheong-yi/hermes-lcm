@@ -4901,6 +4901,48 @@ class TestEngineABC:
             message["content"] for message in [*snapshot, *durable_suffix, fresh_delta]
         ]
 
+    def test_active_replay_snapshots_are_scoped_by_conversation(self, tmp_path):
+        db_path = tmp_path / "conversation-scoped-active-replay-snapshot.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "shared-replay-snapshot-session"
+        conversation_a = "shared-replay-snapshot-conversation-a"
+        conversation_b = "shared-replay-snapshot-conversation-b"
+        snapshot_a = [
+            {"role": "system", "content": "Conversation A system."},
+            {"role": "user", "content": "Conversation A request."},
+        ]
+        snapshot_b = [
+            {"role": "system", "content": "Conversation B system."},
+            {"role": "user", "content": "Conversation B request."},
+        ]
+
+        writer_a = LCMEngine(config=config)
+        writer_a.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_a, context_length=200000
+        )
+        try:
+            writer_a._write_active_replay_snapshot(snapshot_a)
+        finally:
+            writer_a.shutdown()
+
+        writer_b = LCMEngine(config=config)
+        writer_b.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_b, context_length=200000
+        )
+        try:
+            writer_b._write_active_replay_snapshot(snapshot_b)
+        finally:
+            writer_b.shutdown()
+
+        reader_a = LCMEngine(config=config)
+        reader_a.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_a, context_length=200000
+        )
+        try:
+            assert reader_a._historical_active_replay_cursor(snapshot_a) == len(snapshot_a)
+        finally:
+            reader_a.shutdown()
+
     def test_restart_compacted_snapshot_reconciles_durable_suffix_and_new_delta(self, tmp_path):
         db_path = tmp_path / "compacted-snapshot-durable-suffix.db"
         config = LCMConfig(database_path=str(db_path))
@@ -12370,6 +12412,70 @@ class TestEngineCompress:
         assert durable[-1]["content"] in json.dumps(expanded)
         assert "Generated replay material." not in nodes[-1].summary
 
+    def test_generated_summary_scaffold_restores_none_content_tool_call_tail(self, engine):
+        tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_none_content",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{\"command\":\"true\"}"},
+            }],
+        }
+        tool_call_store_id = engine._store.append(engine._session_id, tool_call)
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="Generated tool-call replay material.",
+            token_count=4,
+            source_token_count=4,
+            source_ids=[tool_call_store_id],
+            source_type="messages",
+            expand_hint="earlier tool work",
+        ))
+        coalesced = {
+            **tool_call,
+            "content": (
+                f"[Recent Summary (d0, node {node_id})]\n"
+                "Generated tool-call replay material.\n"
+                "[Expand for details: earlier tool work]"
+            ),
+        }
+        restored = engine._strip_coalesced_generated_summary_scaffold(
+            coalesced
+        )
+
+        assert coalesced["content"].startswith("[Recent Summary")
+        assert coalesced["tool_calls"] == tool_call["tool_calls"]
+        assert restored["content"] is None
+        assert restored["tool_calls"] == tool_call["tool_calls"]
+
+    def test_generated_summary_scaffold_preserves_genuine_assistant_quotation(self, engine):
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="Exact generated summary text.",
+            token_count=4,
+            source_token_count=4,
+            source_ids=[],
+            source_type="messages",
+            expand_hint="quoted summary details",
+        ))
+        summary = (
+            f"[Recent Summary (d0, node {node_id})]\n"
+            "Exact generated summary text.\n"
+            "[Expand for details: quoted summary details]"
+        )
+        quotation = {
+            "role": "assistant",
+            "content": summary + "\n\nThis is genuine assistant commentary about the summary.",
+        }
+        engine._store.append(engine._session_id, quotation)
+
+        restored = engine._strip_coalesced_generated_summary_scaffold(quotation)
+
+        assert restored == quotation
+
     def test_compaction_restores_assistant_tool_tail_coalesced_with_preserved_objective(
         self,
         tmp_path,
@@ -14294,6 +14400,46 @@ class TestStoreIdMapping:
         assert pre_frontier_sources == {}
         assert ids_by_message_id[id(active_duplicate)] == later_duplicate_id
         assert ids_by_message_id[id(active_later_user)] == later_user_id
+
+    def test_former_anchor_mapping_precedes_repeated_user_suffix_scan(self, engine):
+        engine._conversation_id = "former-anchor-conversation"
+        initial_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "repeat"},
+            conversation_id=engine._conversation_id,
+        )
+        engine._last_compacted_store_id = initial_store_id
+        intervening_assistant_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "intervening durable answer"},
+            conversation_id=engine._conversation_id,
+        )
+        later_duplicate_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "repeat"},
+            conversation_id=engine._conversation_id,
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "repeat"},
+            conversation_id="other-conversation-sharing-session",
+        )
+        former_anchor = {"role": "user", "content": "repeat"}
+        intervening_assistant = {
+            "role": "assistant",
+            "content": "intervening durable answer",
+        }
+        later_duplicate = {"role": "user", "content": "repeat"}
+
+        ids_by_message_id = engine._get_store_id_map_for_messages([
+            former_anchor,
+            intervening_assistant,
+            later_duplicate,
+        ])
+
+        assert ids_by_message_id[id(former_anchor)] == initial_store_id
+        assert ids_by_message_id[id(intervening_assistant)] == intervening_assistant_id
+        assert ids_by_message_id[id(later_duplicate)] == later_duplicate_id
 
     def test_singleton_externalized_placeholder_does_not_skip_later_visible_row(self, engine):
         placeholder = (

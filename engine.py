@@ -3818,35 +3818,77 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return msg
         content = msg.get("content")
         content_text = normalize_content_value(content) or ""
-        if content_text.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
-            # Objective text has no closing delimiter, so recover the exact tail
-            # from its durable row instead of guessing where user content ends.
+
+        durable_rows: Optional[list[Dict[str, Any]]] = None
+
+        def matching_durable_rows() -> list[Dict[str, Any]]:
+            nonlocal durable_rows
+            if durable_rows is not None:
+                return durable_rows
             try:
-                durable_rows = self._store.get_session_messages(
+                rows = self._store.get_session_messages(
                     self._session_id,
                     conversation_id=self._conversation_id,
                 )
             except Exception:
-                durable_rows = []
+                rows = []
             incoming_tool_calls = self._stable_tool_calls_identity(msg.get("tool_calls"))
             incoming_tool_call_id = str(msg.get("tool_call_id") or "")
-            for row in reversed(durable_rows):
-                if str(row.get("role") or "") != "assistant":
+            durable_rows = [
+                row
+                for row in reversed(rows)
+                if str(row.get("role") or "") == "assistant"
+                and self._stable_tool_calls_identity(row.get("tool_calls"))
+                == incoming_tool_calls
+                and str(row.get("tool_call_id") or "") == incoming_tool_call_id
+            ]
+            return durable_rows
+
+        def durable_content(row: Dict[str, Any]) -> Any:
+            normalized = normalize_content_value(row.get("content"))
+            if normalized is None:
+                return None
+            return self._identity_content_for_active_cleanup(normalized)
+
+        def normalized_content(value: Any) -> Any:
+            return normalize_content_value(value)
+
+        def has_exact_durable_content(value: Any) -> bool:
+            target = normalized_content(value)
+            return any(
+                normalized_content(durable_content(row)) == target
+                for row in matching_durable_rows()
+            )
+
+        def has_durable_tail(value: Any) -> bool:
+            target = normalized_content(value)
+            for row in matching_durable_rows():
+                if normalized_content(durable_content(row)) == target:
+                    return True
+                if value is None:
                     continue
-                if self._stable_tool_calls_identity(row.get("tool_calls")) != incoming_tool_calls:
-                    continue
-                if str(row.get("tool_call_id") or "") != incoming_tool_call_id:
-                    continue
-                durable_content = self._identity_content_for_active_cleanup(
-                    normalize_content_value(row.get("content")) or ""
+                cleaned_identity = self._active_cleanup_replay_identity(
+                    self._message_replay_identity(row, stored_row=True)
                 )
+                if cleaned_identity is not None and cleaned_identity[1] == (target or ""):
+                    return True
+            return False
+
+        if content_text.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            # Objective text has no closing delimiter, so recover the exact tail
+            # from its durable row instead of guessing where user content ends.
+            if has_exact_durable_content(content):
+                return msg
+            incoming_tool_calls = self._stable_tool_calls_identity(msg.get("tool_calls"))
+            for row in matching_durable_rows():
+                tail_content = durable_content(row)
                 if isinstance(content, str):
-                    durable_text = "" if durable_content is None else str(durable_content)
+                    durable_text = "" if tail_content is None else str(tail_content)
                     if durable_text and content.endswith("\n\n" + durable_text):
                         restored = copy.deepcopy(msg)
-                        restored["content"] = durable_content
+                        restored["content"] = tail_content
                         return restored
-                    if durable_content is None and incoming_tool_calls:
+                    if tail_content is None and incoming_tool_calls:
                         restored = copy.deepcopy(msg)
                         restored["content"] = None
                         return restored
@@ -3855,18 +3897,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     isinstance(content, list)
                     and content
                     and normalize_content_value(content[1:])
-                    == normalize_content_value(durable_content)
+                    == normalize_content_value(tail_content)
                 ):
                     restored = copy.deepcopy(msg)
-                    restored["content"] = durable_content
+                    restored["content"] = tail_content
                     return restored
         if isinstance(content, str):
             prefix = self._known_generated_summary_scaffold_prefix(content)
             separator = "\n\n"
-            if not prefix or not content.startswith(prefix + separator):
+            if not prefix:
+                return msg
+            if has_exact_durable_content(content):
+                return msg
+            if content == prefix:
+                if not self._stable_tool_calls_identity(msg.get("tool_calls")):
+                    return msg
+                for row in matching_durable_rows():
+                    tail_content = durable_content(row)
+                    if tail_content is None or tail_content == "":
+                        restored = copy.deepcopy(msg)
+                        restored["content"] = tail_content
+                        return restored
+                return msg
+            if not content.startswith(prefix + separator):
+                return msg
+            tail_content = content[len(prefix + separator) :]
+            if not has_durable_tail(tail_content):
                 return msg
             restored = copy.deepcopy(msg)
-            restored["content"] = content[len(prefix + separator) :]
+            restored["content"] = tail_content
             return restored
         if not isinstance(content, list) or not content:
             return msg
@@ -3877,17 +3936,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         prefix = self._known_generated_summary_scaffold_prefix(text)
         if not prefix:
             return msg
-        restored = copy.deepcopy(msg)
-        restored_content = restored["content"]
+        if has_exact_durable_content(content):
+            return msg
         if text == prefix:
-            if len(restored_content) == 1:
+            if len(content) == 1:
                 return msg
-            restored["content"] = restored_content[1:]
+            tail_content = content[1:]
+            if not has_durable_tail(tail_content):
+                return msg
+            restored = copy.deepcopy(msg)
+            restored["content"] = tail_content
             return restored
         separator = "\n\n"
         if not text.startswith(prefix + separator):
             return msg
-        restored_content[0]["text"] = text[len(prefix + separator) :]
+        tail_content = copy.deepcopy(content)
+        tail_content[0]["text"] = text[len(prefix + separator) :]
+        if not has_durable_tail(tail_content):
+            return msg
+        restored = copy.deepcopy(msg)
+        restored["content"] = tail_content
         return restored
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
