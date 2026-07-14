@@ -1494,11 +1494,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             or self._is_preserved_todo_context_message(message)
         )
 
-    def _sole_durable_user_prompt_message(self) -> Optional[Dict[str, Any]]:
-        """Return the session's sole stored user occurrence, if exactly one exists."""
+    def _durable_user_prompt_messages(self, *, stop_after: int = 2) -> List[Dict[str, Any]]:
+        """Return up to ``stop_after`` stored prompt-bearing user occurrences."""
         if not self._session_id:
-            return None
-        sole_user: Optional[Dict[str, Any]] = None
+            return []
+        durable_users: List[Dict[str, Any]] = []
         after_store_id = 0
         try:
             while True:
@@ -1515,15 +1515,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     content = normalize_content_value(row.get("content")) or ""
                     if not content.strip() or self._matches_ignore_message_patterns(row, stored_row=True):
                         continue
-                    if sole_user is not None:
-                        return None
-                    sole_user = row
+                    durable_users.append(row)
+                    if len(durable_users) >= stop_after:
+                        return durable_users
                 if len(rows) < 1000:
                     break
         except Exception:
-            logger.debug("LCM sole durable user lookup failed", exc_info=True)
-            return None
-        return sole_user
+            logger.debug("LCM durable user lookup failed", exc_info=True)
+            return []
+        return durable_users
 
     def _is_real_user_prompt_message(
         self,
@@ -1589,9 +1589,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if scaffold_candidates
             else {}
         )
+        durable_user_prompts = self._durable_user_prompt_messages()
         sole_durable_user = (
-            self._sole_durable_user_prompt_message()
-            if scaffold_candidates and id(messages[1]) not in durable_store_ids_by_message_id
+            durable_user_prompts[0]
+            if (
+                len(durable_user_prompts) == 1
+                and scaffold_candidates
+                and id(messages[1]) not in durable_store_ids_by_message_id
+            )
             else None
         )
         if not self._is_real_user_prompt_message(
@@ -1607,6 +1612,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             for message in messages[2:]
         ):
+            return 1
+        if len(durable_user_prompts) > 1:
             return 1
         return 2
 
@@ -3682,14 +3689,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
-        if "[Expand for details:" not in content:
-            return False
-        return bool(
-            re.search(
-                r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
-                content,
-            )
-        )
+        return self._looks_like_active_summary_blob(content)
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):
@@ -5139,7 +5139,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 if any(
                     (msg_content := (msg.get("content") or "")) == content
-                    or msg_content.startswith(f"{content}\n\n---\n\n")
+                    or (
+                        isinstance(msg_content, str)
+                        and msg_content.startswith(f"{content}\n\n---\n\n")
+                    )
                     for msg in (candidate[1:] if system_msg is not None else candidate)
                 ):
                     return candidate

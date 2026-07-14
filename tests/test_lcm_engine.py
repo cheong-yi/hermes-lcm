@@ -11720,6 +11720,31 @@ class TestSingleUserPromptAnchor:
         assert stale_user not in result
         assert later_user in result
 
+    def test_durable_later_user_disqualifies_stale_short_snapshot_anchor(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "durable-later-user-anchor.db"))
+        engine = LCMEngine(config=config)
+        engine.on_session_start("durable-later-user-anchor", platform="cli", context_length=200_000)
+        system = {"role": "system", "content": "system"}
+        stale_user = {"role": "user", "content": "stale initial request"}
+        durable_history = [
+            system,
+            stale_user,
+            {"role": "assistant", "content": "old response"},
+            {"role": "user", "content": "later durable request"},
+            {"role": "assistant", "content": "later response"},
+        ]
+
+        try:
+            engine._ingest_messages(durable_history)
+
+            assert engine._leading_anchor_count([
+                system,
+                stale_user,
+                {"role": "assistant", "content": "stale active response"},
+            ]) == 1
+        finally:
+            engine.shutdown()
+
     @pytest.mark.parametrize(
         "pseudo_content",
         [
@@ -20966,6 +20991,34 @@ class TestAssemblyGuardrails:
         assert result[:2] == [system, retained_user]
         assert joined.count("[Expand for details:") == 1
 
+    def test_forced_overflow_summary_dedupe_accepts_structured_candidate_content(self, tmp_path):
+        instance = LCMEngine(config=LCMConfig(
+            database_path=str(tmp_path / "lcm_guardrail_structured_summary_dedupe.db"),
+        ))
+        instance._session_id = "guardrail-session"
+        summary_blob = (
+            "[Recent Summary (d0, node 999)]\n"
+            "unavailable summary\n"
+            "[Expand for details: unavailable]"
+        )
+        structured_user = {
+            "role": "user",
+            "content": [{"type": "text", "text": "structured current request"}],
+        }
+
+        try:
+            result = instance._assemble_overflow_recovery_context(
+                {"role": "system", "content": "system"},
+                [
+                    {"role": "assistant", "content": summary_blob},
+                    structured_user,
+                ],
+            )
+        finally:
+            instance.shutdown()
+
+        assert structured_user in result
+
     def test_forced_overflow_recovery_flags_irreducible_single_tail_overflow(self, tmp_path, monkeypatch):
         import importlib
 
@@ -21197,6 +21250,44 @@ class TestAssemblyToolPairGuardrail:
         assert [message.get("role") for message in result] == ["system", "user", "assistant"]
         assert "earlier work" in str(result[-1].get("content"))
         assert "fresh assistant tail" in str(result[-1].get("content"))
+
+    def test_merged_summary_does_not_make_real_assistant_tail_scaffold(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_real_assistant_summary_merge.db")
+        node = SummaryNode(
+            session_id="tool-pair-test",
+            depth=0,
+            summary="earlier work",
+            token_count=3,
+            source_token_count=50,
+            source_ids=[],
+            source_type="messages",
+            created_at=time.time(),
+            expand_hint="earlier work",
+        )
+        instance._dag.add_node(node)
+        real_assistant = {
+            "role": "assistant",
+            "content": "fresh assistant tail",
+            "tool_calls": [{"id": "call_real", "function": {"name": "terminal", "arguments": "{}"}}],
+        }
+
+        try:
+            result = instance._assemble_context(
+                {"role": "system", "content": "system"},
+                [
+                    {"role": "user", "content": "sole retained prompt"},
+                    real_assistant,
+                    {"role": "tool", "tool_call_id": "call_real", "content": "real result"},
+                ],
+                preserve_leading_user=True,
+            )
+        finally:
+            instance.shutdown()
+
+        merged_assistant = next(message for message in result if message.get("tool_calls"))
+        assert "earlier work" in str(merged_assistant.get("content"))
+        assert "fresh assistant tail" in str(merged_assistant.get("content"))
+        assert not instance._is_replayed_context_scaffold_message(merged_assistant)
 
     def test_assemble_inserts_stub_for_missing_tool_result(self, tmp_path):
         """When an assistant tool_call has no matching tool result in the
