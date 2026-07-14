@@ -1486,18 +1486,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return []
         return messages[leading_anchor_count:fresh_tail_start]
 
-    def _is_real_user_prompt_message(self, message: Dict[str, Any]) -> bool:
-        """Return whether a user record is real prompt-bearing conversation."""
+    def _is_scaffold_shaped_user_message(self, message: Dict[str, Any]) -> bool:
+        """Return whether a user message has the shape of generated context."""
+        return (
+            self._is_context_summary_content(message.get("content"))
+            or self._is_replayed_context_scaffold_message(message)
+            or self._is_preserved_todo_context_message(message)
+        )
+
+    def _sole_durable_user_prompt_message(self) -> Optional[Dict[str, Any]]:
+        """Return the session's sole stored user occurrence, if exactly one exists."""
+        if not self._session_id:
+            return None
+        sole_user: Optional[Dict[str, Any]] = None
+        after_store_id = 0
+        try:
+            while True:
+                rows = self._store.load_session_page(
+                    self._session_id,
+                    after_store_id=after_store_id,
+                    limit=1000,
+                    roles=["user"],
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    after_store_id = max(after_store_id, int(row.get("store_id") or 0))
+                    content = normalize_content_value(row.get("content")) or ""
+                    if not content.strip() or self._matches_ignore_message_patterns(row, stored_row=True):
+                        continue
+                    if sole_user is not None:
+                        return None
+                    sole_user = row
+                if len(rows) < 1000:
+                    break
+        except Exception:
+            logger.debug("LCM sole durable user lookup failed", exc_info=True)
+            return None
+        return sole_user
+
+    def _is_real_user_prompt_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        durable_store_id: Optional[int] = None,
+        sole_durable_user: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return whether a user record is real prompt-bearing conversation.
+
+        Generated scaffold wrappers are content-collision-prone, so their text
+        is never the authority. They count as real only when this exact active
+        occurrence maps to durable storage, or when it matches the session's
+        sole durable user occurrence (which remains valid behind the compaction
+        frontier and across engine restart).
+        """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
         content = normalize_content_value(message.get("content")) or ""
         if not content.strip():
-            return False
-        if (
-            self._is_context_summary_content(message.get("content"))
-            or self._is_replayed_context_scaffold_message(message)
-            or self._is_preserved_todo_context_message(message)
-        ):
             return False
         pattern_text = text_content_for_pattern_matching(message.get("content")) or ""
         if (
@@ -1507,7 +1553,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             or self._is_ignored_active_replay_placeholder(message, pattern_text)
         ):
             return False
-        return True
+        if not self._is_scaffold_shaped_user_message(message):
+            return True
+        if durable_store_id is not None:
+            return True
+        if sole_durable_user is not None:
+            return self._message_replay_identity(message) == self._message_replay_identity(
+                sole_durable_user,
+                stored_row=True,
+            )
+        return False
 
     def _leading_anchor_count(self, messages: List[Dict[str, Any]]) -> int:
         """Return the number of non-compactable leading messages.
@@ -1519,9 +1574,39 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not messages or not isinstance(messages[0], dict) or messages[0].get("role") != "system":
             return 0
-        if len(messages) < 2 or not self._is_real_user_prompt_message(messages[1]):
+        if len(messages) < 2:
             return 1
-        if any(self._is_real_user_prompt_message(message) for message in messages[2:]):
+
+        scaffold_candidates = [
+            message
+            for message in messages[1:]
+            if isinstance(message, dict)
+            and message.get("role") == "user"
+            and self._is_scaffold_shaped_user_message(message)
+        ]
+        durable_store_ids_by_message_id = (
+            self._get_store_id_map_for_messages(messages[1:])
+            if scaffold_candidates
+            else {}
+        )
+        sole_durable_user = (
+            self._sole_durable_user_prompt_message()
+            if scaffold_candidates and id(messages[1]) not in durable_store_ids_by_message_id
+            else None
+        )
+        if not self._is_real_user_prompt_message(
+            messages[1],
+            durable_store_id=durable_store_ids_by_message_id.get(id(messages[1])),
+            sole_durable_user=sole_durable_user,
+        ):
+            return 1
+        if any(
+            self._is_real_user_prompt_message(
+                message,
+                durable_store_id=durable_store_ids_by_message_id.get(id(message)),
+            )
+            for message in messages[2:]
+        ):
             return 1
         return 2
 
@@ -4596,6 +4681,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return normalized + note
 
     @staticmethod
+    def _prepend_generated_context_to_message(
+        message: Dict[str, Any],
+        generated_context: str,
+    ) -> Dict[str, Any]:
+        """Fold generated context into a same-role tail message without losing metadata."""
+        merged = message.copy()
+        content = message.get("content")
+        if isinstance(content, list):
+            merged["content"] = [
+                {"type": "text", "text": generated_context},
+                *content,
+            ]
+        else:
+            normalized = normalize_content_value(content) or ""
+            merged["content"] = (
+                f"{generated_context}\n\n---\n\n{normalized}"
+                if normalized
+                else generated_context
+            )
+        return merged
+
+    @staticmethod
     def _is_preserved_todo_context_message(message: Dict[str, Any]) -> bool:
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
@@ -4709,7 +4816,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and system_msg is not None
             and system_msg.get("role") == "system"
             and tail_messages
-            and self._is_real_user_prompt_message(tail_messages[0])
+            and tail_messages[0].get("role") == "user"
+            and (normalize_content_value(tail_messages[0].get("content")) or "").strip()
         ):
             retained_user_msg = tail_messages[0].copy()
             tail_messages = tail_messages[1:]
@@ -4772,7 +4880,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
         next_role = tail_selected[0].get("role") if tail_selected else None
-        if not result or result[-1].get("role") == "system":
+        if retained_user_msg is not None:
+            summary_role = "assistant"
+        elif not result or result[-1].get("role") == "system":
             # The summary becomes the first provider-visible message: either no
             # leading anchor exists (gateway-style assembly) or the system
             # prompt is the only anchor, which Anthropic extracts into a
@@ -4781,9 +4891,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # compaction.
             summary_role = "user"
         else:
-            # Keep an assistant-leading fresh tail attached to its tool results.
-            # An assistant summary immediately before that tail creates adjacent
-            # provider-facing assistant turns, which some templates reject.
             summary_role = "user" if "assistant" in {last_role, next_role} else "assistant"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
@@ -4824,7 +4931,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                if (
+                    retained_user_msg is not None
+                    and tail_selected
+                    and tail_selected[0].get("role") == summary_role
+                ):
+                    tail_selected = [
+                        self._prepend_generated_context_to_message(tail_selected[0], combined),
+                        *tail_selected[1:],
+                    ]
+                else:
+                    result.append({"role": summary_role, "content": combined})
 
         # Fresh tail
         result.extend(tail_selected)
@@ -4857,6 +4974,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed_result.append(trimmed)
             result = self._sanitize_active_context_messages(trimmed_result)
 
+        self._remember_assembled_active_context(result)
         return result
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:

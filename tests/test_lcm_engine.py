@@ -11502,10 +11502,10 @@ class TestEngineCompress:
 
 class TestSingleUserPromptAnchor:
     @staticmethod
-    def _tool_chain(count=8, content_size=160):
+    def _tool_chain(count=8, content_size=160, call_prefix="call_anchor"):
         messages = []
         for index in range(count):
-            call_id = f"call_anchor_{index}"
+            call_id = f"{call_prefix}_{index}"
             messages.extend([
                 {
                     "role": "assistant",
@@ -11557,9 +11557,9 @@ class TestSingleUserPromptAnchor:
         assert "stable system prompt" in result[0]["content"]
         assert result[1] == user_prompt
         summary = next(msg for msg in result if "Earlier tool work" in str(msg.get("content")))
-        assert summary["role"] == "user"
+        assert summary["role"] == "assistant"
 
-    def test_normal_compaction_does_not_emit_adjacent_assistant_messages(
+    def test_normal_compaction_emits_valid_role_sequence_and_contiguous_tool_pairs(
         self,
         tmp_path,
         monkeypatch,
@@ -11583,11 +11583,15 @@ class TestSingleUserPromptAnchor:
         finally:
             engine.shutdown()
 
-        roles = [message.get("role") for message in result]
-        assert all(
-            previous != current or current != "assistant"
-            for previous, current in zip(roles, roles[1:])
-        )
+        assert [message.get("role") for message in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert "Earlier tool work" in str(result[2].get("content"))
         for index, message in enumerate(result):
             call_ids = [call.get("id") for call in message.get("tool_calls", [])]
             for offset, call_id in enumerate(call_ids, start=1):
@@ -11691,6 +11695,74 @@ class TestSingleUserPromptAnchor:
         ]
 
         assert engine._leading_anchor_count(messages) == 1
+
+    @pytest.mark.parametrize(
+        "literal_prompt",
+        [
+            "CONTEXT SUMMARY\nLiteral user-authored summary words",
+            "[Recent Summary (d0, node 1)]\nLiteral user-authored text\n[Expand for details: literal request]",
+            "[Current user objective preserved from compacted history]\nLiteral user-authored objective",
+            "[Your active task list was preserved across context compression]\n- literal user-authored todo",
+        ],
+    )
+    def test_literal_scaffold_collision_remains_sole_raw_prompt_across_restart(
+        self,
+        tmp_path,
+        monkeypatch,
+        literal_prompt,
+    ):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "literal-scaffold-collision.db"),
+        )
+        user_prompt = {"role": "user", "content": literal_prompt}
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "literal-scaffold-collision",
+            platform="cli",
+            conversation_id="literal-scaffold-collision-conversation",
+            context_length=200_000,
+        )
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", self._mock_summary)
+
+        active_context = before_restart.compress([
+            {"role": "system", "content": "stable system prompt"},
+            user_prompt,
+            *self._tool_chain(),
+        ])
+        assert active_context[1] == user_prompt
+        assert [
+            row["content"]
+            for row in before_restart._store.get_session_messages("literal-scaffold-collision")
+        ].count(literal_prompt) == 1
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        try:
+            after_restart.on_session_start(
+                "literal-scaffold-collision",
+                platform="cli",
+                conversation_id="literal-scaffold-collision-conversation",
+                context_length=200_000,
+            )
+            reassembled = after_restart.compress([
+                *active_context,
+                *self._tool_chain(count=2, call_prefix="call_restart"),
+            ])
+
+            assert reassembled[1] == user_prompt
+            assert [
+                row["content"]
+                for row in after_restart._store.get_session_messages("literal-scaffold-collision")
+            ].count(literal_prompt) == 1
+            assert after_restart._last_ingest_reconciliation["reason"] == (
+                "replayed durable assembled active context"
+            )
+        finally:
+            after_restart.shutdown()
 
     def test_ignored_pseudo_user_is_not_a_permanent_anchor(self, tmp_path, monkeypatch):
         from hermes_lcm import message_patterns as message_patterns_mod
