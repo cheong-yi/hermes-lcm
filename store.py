@@ -1405,8 +1405,23 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        with self._writer_coordinator.write_region(self._write_lock):
-            self._conn.commit()
+        self._writer_coordinator.flush(
+            self._conn,
+            local_lock=self._write_lock,
+        )
+
+    def write_transaction(self):
+        """Return the store connection's canonical coordinated transaction.
+
+        Cross-table maintenance owns SQL at the command layer, but it must not
+        reach private locks or bypass the one-writer admission boundary.
+        """
+
+        return self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+            begin_immediate=True,
+        )
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.

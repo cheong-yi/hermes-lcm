@@ -1244,7 +1244,6 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     apply is destructive, so do the coordinated deletes on one connection to
     avoid half-cleaned state if a later table delete fails.
     """
-    conn = engine._store.connection
     # Protect the actively-bound session id, not current_session_id. While a
     # cron tick has rebound the engine, _session_id is the row the engine is
     # actively writing to via lifecycle hooks; deleting it during cleanup
@@ -1262,32 +1261,31 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
 
     placeholders = ",".join("?" for _ in session_ids)
     params = tuple(sorted(session_ids))
-    lifecycle_rows = conn.execute(
-        """
-        SELECT conversation_id, current_session_id, last_finalized_session_id
-        FROM lcm_lifecycle_state
-        """
-    ).fetchall()
-    lifecycle_delete_conversation_ids: list[str] = []
-    lifecycle_skipped = 0
-    for conversation_id, current_session_id, last_finalized_session_id in lifecycle_rows:
-        refs = {
-            str(value)
-            for value in (current_session_id, last_finalized_session_id)
-            if value
-        }
-        if not refs or not (refs & session_ids):
-            continue
-        if refs & protected_session_ids:
+    with engine._store.write_transaction() as conn:
+        lifecycle_rows = conn.execute(
+            """
+            SELECT conversation_id, current_session_id, last_finalized_session_id
+            FROM lcm_lifecycle_state
+            """
+        ).fetchall()
+        lifecycle_delete_conversation_ids: list[str] = []
+        lifecycle_skipped = 0
+        for conversation_id, current_session_id, last_finalized_session_id in lifecycle_rows:
+            refs = {
+                str(value)
+                for value in (current_session_id, last_finalized_session_id)
+                if value
+            }
+            if not refs or not (refs & session_ids):
+                continue
+            if refs & protected_session_ids:
+                lifecycle_skipped += 1
+                continue
+            if refs <= session_ids:
+                lifecycle_delete_conversation_ids.append(str(conversation_id))
+                continue
             lifecycle_skipped += 1
-            continue
-        if refs <= session_ids:
-            lifecycle_delete_conversation_ids.append(str(conversation_id))
-            continue
-        lifecycle_skipped += 1
 
-    try:
-        conn.execute("BEGIN IMMEDIATE")
         msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
         node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
         lifecycle_deleted = 0
@@ -1297,10 +1295,6 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
                 (conversation_id,),
             )
             lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
 
     return {
         "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,

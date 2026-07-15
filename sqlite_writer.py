@@ -230,6 +230,28 @@ class WriterCoordinator:
                     if self._transaction_depth == 0:
                         self._transaction_connection = None
 
+    def flush(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        local_lock: ContextManager[object] | None = None,
+    ) -> None:
+        """Commit an already-open transaction without leaking failed state.
+
+        Backup preparation needs to flush helper connections whose transaction
+        was opened before admission.  ``transaction()`` intentionally joins
+        such a transaction without owning its commit, so this separate managed
+        flush commits it and rolls it back if commit itself fails.
+        """
+
+        with self.write_region(local_lock):
+            try:
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
     def close_owner(
         self,
         owner_token: int,

@@ -668,6 +668,39 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
     ]
 
 
+def test_apply_import_uses_store_coordinated_write_transaction(
+    tmp_path: Path,
+    monkeypatch,
+):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    original_write_transaction = importer.MessageStore.write_transaction
+    admitted_paths: list[Path] = []
+
+    def tracked_write_transaction(store):
+        admitted_paths.append(Path(store.db_path))
+        return original_write_transaction(store)
+
+    monkeypatch.setattr(
+        importer.MessageStore,
+        "write_transaction",
+        tracked_write_transaction,
+    )
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="coordinated-import",
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert admitted_paths == [target_db]
+
+
 def test_apply_backs_up_uri_reserved_target_db_path(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"

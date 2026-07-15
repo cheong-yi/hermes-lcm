@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.command import _delete_clean_candidates_atomically
 from hermes_lcm.dag import SummaryNode, build_nodes_fts_spec
 from hermes_lcm.db_bootstrap import (
     _write_transaction,
@@ -153,6 +154,53 @@ def test_bootstrap_fallback_rolls_back_commit_failure():
     conn.commit()
     assert conn.execute("SELECT id FROM parents").fetchall() == [(7,)]
     conn.close()
+
+
+@pytest.mark.parametrize("helper_name", ["store", "dag", "lifecycle"])
+def test_helper_flush_rolls_back_commit_failure_before_next_writer(
+    tmp_path: Path,
+    helper_name: str,
+):
+    db_path = tmp_path / f"{helper_name}-flush-failure.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    helper = {
+        "store": engine._store,
+        "dag": engine._dag,
+        "lifecycle": engine._lifecycle,
+    }[helper_name]
+    connection = helper.connection
+    assert connection is not None
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.executescript(
+        """
+        CREATE TABLE flush_parents(id INTEGER PRIMARY KEY);
+        CREATE TABLE flush_children(
+            parent_id INTEGER,
+            FOREIGN KEY(parent_id) REFERENCES flush_parents(id)
+                DEFERRABLE INITIALLY DEFERRED
+        );
+        """
+    )
+    connection.execute("BEGIN")
+    connection.execute("INSERT INTO flush_children(parent_id) VALUES (23)")
+
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            helper.commit()
+
+        assert connection.in_transaction is False
+        second = sqlite3.connect(db_path)
+        try:
+            with engine._store.writer_coordinator.transaction(
+                second,
+                begin_immediate=True,
+            ):
+                second.execute("INSERT INTO flush_parents(id) VALUES (23)")
+            assert second.execute("SELECT id FROM flush_parents").fetchall() == [(23,)]
+        finally:
+            second.close()
+    finally:
+        engine.shutdown()
 
 
 def test_interrupted_ticket_is_skipped_and_later_writer_progresses(
@@ -346,6 +394,47 @@ def test_clear_debt_serializes_its_read_check_write_with_new_debt(tmp_path: Path
     assert state.debt_size_estimate == 9
     clearer.close()
     recorder.close()
+
+
+def test_atomic_cleanup_delete_competes_for_the_shared_writer_permit(tmp_path: Path):
+    db_path = tmp_path / "coordinated-cleanup.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    engine._session_id = "live-session"
+    engine._store.append(
+        "stale-session",
+        {"role": "user", "content": "delete me"},
+        token_estimate=2,
+    )
+    coordinator = engine._store.writer_coordinator
+    completed = threading.Event()
+    results: list[dict[str, int]] = []
+
+    def delete_stale_session() -> None:
+        results.append(_delete_clean_candidates_atomically(engine, {"stale-session"}))
+        completed.set()
+
+    try:
+        acquisitions_before = coordinator.metrics_snapshot()["acquisitions"]
+        with coordinator.permit():
+            delete_thread = threading.Thread(target=delete_stale_session, daemon=True)
+            delete_thread.start()
+            assert not completed.wait(timeout=0.15)
+
+        delete_thread.join(timeout=5)
+        assert not delete_thread.is_alive()
+        assert completed.is_set()
+        assert results == [
+            {
+                "messages_deleted": 1,
+                "nodes_deleted": 0,
+                "lifecycle_deleted": 0,
+                "lifecycle_skipped": 0,
+            }
+        ]
+        assert engine._store.get_range("stale-session") == []
+        assert coordinator.metrics_snapshot()["acquisitions"] == acquisitions_before + 2
+    finally:
+        engine.shutdown()
 
 
 def test_eleven_engine_clones_share_one_writer_and_preserve_exact_rows(tmp_path: Path):

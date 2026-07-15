@@ -734,8 +734,10 @@ class SummaryDAG:
 
     def commit(self) -> None:
         """Commit pending writes under path and connection admission."""
-        with self._writer_coordinator.write_region(self._db_lock):
-            self._conn.commit()
+        self._writer_coordinator.flush(
+            self._conn,
+            local_lock=self._db_lock,
+        )
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)

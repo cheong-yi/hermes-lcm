@@ -1183,39 +1183,35 @@ def _process_import_candidates(
         ingest_protection_config=protection_config,
         hermes_home=str(target_path.parent),
     )
-    conn = store._conn
-    _ensure_import_table(conn)
-    imported_message_map = _imported_message_map_from_conn(conn, import_id)
     summary_stats = SummaryImportStats(scanned=len(summary_candidates))
-    if include_summaries:
-        _ensure_summary_nodes_schema(conn)
-        _ensure_summary_import_table(conn)
-
     imported = 0
     try:
-        for candidate in to_import:
-            store_id = _insert_import_candidate(
-                conn,
-                import_id=import_id,
-                candidate=candidate,
-                protection_config=protection_config,
-                target_path=target_path,
-            )
-            imported_message_map[candidate.source_message_id] = store_id
-            imported += 1
-        if include_summaries:
-            summary_stats = _process_summary_candidates(
-                conn=conn,
-                import_id=import_id,
-                candidates=summary_candidates,
-                imported_messages=imported_message_map,
-                imported_summaries=_imported_summary_map_from_conn(conn, import_id),
-                dry_run=False,
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        with store.write_transaction() as conn:
+            _ensure_import_table(conn)
+            imported_message_map = _imported_message_map_from_conn(conn, import_id)
+            if include_summaries:
+                _ensure_summary_nodes_schema(conn)
+                _ensure_summary_import_table(conn)
+
+            for candidate in to_import:
+                store_id = _insert_import_candidate(
+                    conn,
+                    import_id=import_id,
+                    candidate=candidate,
+                    protection_config=protection_config,
+                    target_path=target_path,
+                )
+                imported_message_map[candidate.source_message_id] = store_id
+                imported += 1
+            if include_summaries:
+                summary_stats = _process_summary_candidates(
+                    conn=conn,
+                    import_id=import_id,
+                    candidates=summary_candidates,
+                    imported_messages=imported_message_map,
+                    imported_summaries=_imported_summary_map_from_conn(conn, import_id),
+                    dry_run=False,
+                )
     finally:
         store.close()
 

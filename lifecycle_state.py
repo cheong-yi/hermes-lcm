@@ -894,5 +894,7 @@ class LifecycleStateStore:
 
     def commit(self) -> None:
         """Commit pending writes under path and connection admission."""
-        with self._writer_coordinator.write_region(self._lock):
-            self._conn.commit()
+        self._writer_coordinator.flush(
+            self._conn,
+            local_lock=self._lock,
+        )
