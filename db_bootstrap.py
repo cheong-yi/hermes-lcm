@@ -106,13 +106,12 @@ def _write_transaction(
                 conn.execute("BEGIN IMMEDIATE" if begin_immediate else "BEGIN")
             try:
                 yield
+                if started and conn.in_transaction:
+                    conn.commit()
             except BaseException:
                 if started and conn.in_transaction:
                     conn.rollback()
                 raise
-            else:
-                if started and conn.in_transaction:
-                    conn.commit()
         return
     with resolved.transaction(
         conn,

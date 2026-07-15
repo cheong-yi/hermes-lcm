@@ -649,6 +649,7 @@ class LifecycleStateStore:
         )
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -656,22 +657,17 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        with self._writer_coordinator.transaction(
-            self._conn,
-            local_lock=self._lock,
-            begin_immediate=True,
-        ):
-            self._conn.execute(
-                """
-                UPDATE lcm_lifecycle_state
-                SET debt_kind = NULL,
-                    debt_size_estimate = 0,
-                    debt_updated_at = ?,
-                    updated_at = ?
-                WHERE conversation_id = ?
-                """,
-                (now, now, conversation_id),
-            )
+        self._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = ?,
+                updated_at = ?
+            WHERE conversation_id = ?
+            """,
+            (now, now, conversation_id),
+        )
         return self.get_by_conversation(conversation_id)
 
     @_synchronized

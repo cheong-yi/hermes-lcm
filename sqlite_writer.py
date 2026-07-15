@@ -68,6 +68,7 @@ class WriterCoordinator:
         self._condition = threading.Condition(threading.RLock())
         self._next_ticket = 0
         self._serving_ticket = 0
+        self._abandoned_tickets: set[int] = set()
         self._owner_thread_id: int | None = None
         self._owner_depth = 0
         self._owner_started_ns = 0
@@ -83,7 +84,11 @@ class WriterCoordinator:
         self._hold_samples_ns: deque[int] = deque(maxlen=_SAMPLE_LIMIT)
         self._owner_tokens: set[int] = set()
         self._next_owner_token = 1
-        self._checkpoint_count = 0
+        self._checkpoint_attempt_count = 0
+        self._checkpoint_success_count = 0
+        self._checkpoint_busy_count = 0
+        self._checkpoint_failure_count = 0
+        self._checkpoint_last_result = "not_attempted"
 
     def bind_owner(self) -> int:
         """Register one storage helper and return its idempotent close token."""
@@ -105,8 +110,14 @@ class WriterCoordinator:
             self._next_ticket += 1
             wait_started_ns = time.perf_counter_ns()
             queued = ticket != self._serving_ticket or self._owner_thread_id is not None
-            while ticket != self._serving_ticket or self._owner_thread_id is not None:
-                self._condition.wait()
+            try:
+                while ticket != self._serving_ticket or self._owner_thread_id is not None:
+                    self._condition.wait()
+            except BaseException:
+                self._abandoned_tickets.add(ticket)
+                self._skip_abandoned_tickets_locked()
+                self._condition.notify_all()
+                raise
 
             wait_ns = time.perf_counter_ns() - wait_started_ns
             self._owner_thread_id = thread_id
@@ -124,6 +135,14 @@ class WriterCoordinator:
             )
             return True
 
+    def _skip_abandoned_tickets_locked(self) -> None:
+        while (
+            self._owner_thread_id is None
+            and self._serving_ticket in self._abandoned_tickets
+        ):
+            self._abandoned_tickets.remove(self._serving_ticket)
+            self._serving_ticket += 1
+
     def _release(self, outermost: bool) -> None:
         with self._condition:
             if not outermost:
@@ -139,6 +158,7 @@ class WriterCoordinator:
             self._owner_depth = 0
             self._owner_started_ns = 0
             self._serving_ticket += 1
+            self._skip_abandoned_tickets_locked()
             self._condition.notify_all()
 
     @contextmanager
@@ -198,13 +218,12 @@ class WriterCoordinator:
                     )
                 try:
                     yield connection
+                    if started_transaction and connection.in_transaction:
+                        connection.commit()
                 except BaseException:
                     if started_transaction and connection.in_transaction:
                         connection.rollback()
                     raise
-                else:
-                    if started_transaction and connection.in_transaction:
-                        connection.commit()
             finally:
                 with self._condition:
                     self._transaction_depth -= 1
@@ -229,11 +248,21 @@ class WriterCoordinator:
                     self._owner_tokens.remove(owner_token)
                     final_owner = not self._owner_tokens
                     if final_owner and connection is not None:
-                        self._checkpoint_count += 1
+                        self._checkpoint_attempt_count += 1
                         try:
-                            connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                        except sqlite3.Error:
-                            pass
+                            row = connection.execute(
+                                "PRAGMA wal_checkpoint(PASSIVE)"
+                            ).fetchone()
+                            busy = bool(row and int(row[0] or 0))
+                            if busy:
+                                self._checkpoint_busy_count += 1
+                                self._checkpoint_last_result = "busy"
+                            else:
+                                self._checkpoint_success_count += 1
+                                self._checkpoint_last_result = "ok"
+                        except sqlite3.Error as exc:
+                            self._checkpoint_failure_count += 1
+                            self._checkpoint_last_result = f"error: {exc}"
                 if connection is not None:
                     connection.close()
 
@@ -248,7 +277,11 @@ class WriterCoordinator:
                 "active_writers": self._active_writers,
                 "max_active_writers": self._max_active_writers,
                 "owner_count": len(self._owner_tokens),
-                "checkpoint_count": self._checkpoint_count,
+                "checkpoint_attempt_count": self._checkpoint_attempt_count,
+                "checkpoint_success_count": self._checkpoint_success_count,
+                "checkpoint_busy_count": self._checkpoint_busy_count,
+                "checkpoint_failure_count": self._checkpoint_failure_count,
+                "checkpoint_last_result": self._checkpoint_last_result,
                 "wait_seconds_total": self._wait_ns_total / 1_000_000_000.0,
                 "wait_seconds_p50": _percentile(self._wait_samples_ns, 50),
                 "wait_seconds_p95": _percentile(self._wait_samples_ns, 95),
