@@ -410,6 +410,7 @@ class CompactionMixin:
 
         noop_reason = "no eligible raw backlog outside fresh tail"
         dependent_reply_message_ids: set[int] = set()
+        previously_consumed_dependent_reply_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
@@ -482,6 +483,7 @@ class CompactionMixin:
                         continue
                     if generated_dependent_reply:
                         dependent_reply_message_ids.add(id(working_msg))
+                        previously_consumed_dependent_reply_ids.add(id(working_msg))
                         if role in {"assistant", "tool"}:
                             drop_dependent_reply = True
                     if drop_dependent_reply and role in {"assistant", "tool"}:
@@ -606,24 +608,39 @@ class CompactionMixin:
                         break
                     validation_chunk.append(following)
                     retained_dependent_messages.append(following)
+                validation_chunk = [
+                    message
+                    for message in validation_chunk
+                    if id(message) not in previously_consumed_dependent_reply_ids
+                ]
                 lineage_chunk = [
                     message
                     for message in lookup_chunk
                     if id(message) not in dependent_reply_message_ids
                 ]
                 validation_id_map = self._get_publication_store_id_map(validation_chunk)
-                source_ids = sorted(
+                validation_message_ids = [id(message) for message in validation_chunk]
+                if (
+                    len(set(validation_message_ids)) != len(validation_message_ids)
+                    or len(validation_id_map) != len(validation_chunk)
+                    or len(set(validation_id_map.values())) != len(validation_chunk)
+                    or any(
+                        id(message) not in validation_id_map
+                        for message in validation_chunk
+                    )
+                ):
+                    raise PublicationCaptureError(
+                        "selected leaf chunk source mapping is missing or ambiguous",
+                        frontier_store_id=self._last_compacted_store_id,
+                    )
+                source_ids = list(
                     dict.fromkeys(
-                        validation_id_map[id(message)]
-                        for message in lineage_chunk
-                        if id(message) in validation_id_map
+                        validation_id_map[id(message)] for message in lineage_chunk
                     )
                 )
-                consumed_ids = sorted(
+                consumed_ids = list(
                     dict.fromkeys(
-                        validation_id_map[id(message)]
-                        for message in validation_chunk
-                        if id(message) in validation_id_map
+                        validation_id_map[id(message)] for message in validation_chunk
                     )
                 )
                 if not consumed_ids:

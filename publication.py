@@ -136,6 +136,7 @@ def _coverage_key(
     session_id: str,
     expected_frontier_store_id: int,
     new_frontier_store_id: int,
+    source_store_ids: tuple[int, ...],
     source_identities: tuple[SourceIdentity, ...],
 ) -> str:
     payload = [
@@ -143,6 +144,7 @@ def _coverage_key(
         session_id,
         int(expected_frontier_store_id),
         int(new_frontier_store_id),
+        list(source_store_ids),
         [[identity.store_id, identity.fingerprint] for identity in source_identities],
     ]
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
@@ -336,6 +338,7 @@ class AtomicPublicationStore:
                 session_id=session_id,
                 expected_frontier_store_id=expected,
                 new_frontier_store_id=new_frontier,
+                source_store_ids=source_ids,
                 source_identities=identities,
             ),
         )

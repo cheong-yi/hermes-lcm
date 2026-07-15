@@ -683,16 +683,37 @@ class MessageStore:
         *,
         after_store_id: int = 0,
         limit: int = 1000,
+        through_store_id: int | None = None,
     ) -> List[Dict[str, Any]]:
-        """Read carried rows across session rollover for publication lineage."""
+        """Read one bounded page of carried publication-lineage rows."""
 
+        bounded_limit = max(1, int(limit))
+        upper_bound = (
+            int(through_store_id)
+            if through_store_id is not None
+            else self.get_conversation_max_store_id(conversation_id)
+        )
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                WHERE conversation_id = ? AND store_id > ?
+                WHERE conversation_id = ? AND store_id > ? AND store_id <= ?
                 ORDER BY store_id LIMIT ?""",
-            (conversation_id, int(after_store_id or 0), int(limit)),
+            (
+                conversation_id,
+                int(after_store_id or 0),
+                upper_bound,
+                bounded_limit,
+            ),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def get_conversation_max_store_id(self, conversation_id: str) -> int:
+        """Return a read-only upper bound for a paginated lineage scan."""
+
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(store_id), 0) FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
 
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""

@@ -4193,10 +4193,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if len(mapped) == len(messages) or not self._conversation_id:
             return mapped
 
-        candidates = self._store.get_conversation_messages_after(
-            self._conversation_id,
-            after_store_id=self._last_compacted_store_id,
+        unmatched_messages = [
+            message for message in messages if id(message) not in mapped
+        ]
+        # The scan is paginated beyond SQLite's historical 1000-row page, but
+        # remains bounded in direct proportion to the publication request. If
+        # the bounded snapshot cannot be exhausted, fail closed rather than
+        # guessing that an early duplicate is the intended carried row.
+        max_scan_rows = min(16_384, max(64, len(unmatched_messages) * 4))
+        snapshot_max_store_id = self._store.get_conversation_max_store_id(
+            self._conversation_id
         )
+        candidates: list[Dict[str, Any]] = []
+        next_after = self._last_compacted_store_id
+        page_size = min(512, max_scan_rows)
+        while next_after < snapshot_max_store_id and len(candidates) < max_scan_rows:
+            page = self._store.get_conversation_messages_after(
+                self._conversation_id,
+                after_store_id=next_after,
+                through_store_id=snapshot_max_store_id,
+                limit=min(page_size, max_scan_rows - len(candidates)),
+            )
+            if not page:
+                break
+            candidates.extend(page)
+            next_after = int(page[-1]["store_id"])
+        if next_after < snapshot_max_store_id:
+            return mapped
+
         used = set(mapped.values())
         candidates_by_identity: defaultdict[tuple[str, str, str, str], deque[int]] = (
             defaultdict(deque)
@@ -4207,7 +4231,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 candidates_by_identity[
                     self._message_replay_identity(candidate, stored_row=True)
                 ].append(store_id)
-        for message in messages:
+        unmatched_counts: defaultdict[tuple[str, str, str, str], int] = defaultdict(int)
+        for message in unmatched_messages:
+            unmatched_counts[self._message_replay_identity(message)] += 1
+        for identity, count in unmatched_counts.items():
+            if len(candidates_by_identity.get(identity, ())) != count:
+                # Missing and surplus candidates are both unsafe: the latter
+                # is ambiguous when identical carried rows exist.
+                candidates_by_identity.pop(identity, None)
+
+        for message in unmatched_messages:
             if id(message) in mapped:
                 continue
             identity = self._message_replay_identity(message)

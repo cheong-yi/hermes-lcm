@@ -10,6 +10,7 @@ retry, or leaves every durable and active-context surface unchanged.
 from __future__ import annotations
 
 import copy
+import math
 import sqlite3
 import threading
 import time
@@ -21,7 +22,11 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG
-from hermes_lcm.db_bootstrap import SCHEMA_VERSION, run_versioned_migrations
+from hermes_lcm.db_bootstrap import (
+    SCHEMA_VERSION,
+    SchemaVersionTooNewError,
+    run_versioned_migrations,
+)
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.publication import (
@@ -123,12 +128,12 @@ def _fts_count(path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM nodes_fts_docsize").fetchone()[0])
 
 
-def _frontier(path: Path) -> int:
+def _frontier(path: Path, conversation_id: str = CONVERSATION_ID) -> int:
     with sqlite3.connect(path) as conn:
         row = conn.execute(
             "SELECT current_frontier_store_id FROM lcm_lifecycle_state "
             "WHERE conversation_id = ?",
-            (CONVERSATION_ID,),
+            (conversation_id,),
         ).fetchone()
         return int(row[0])
 
@@ -300,6 +305,41 @@ def test_response_lost_retry_returns_same_node_without_duplicate(
     assert retry.node_id == first.node_id
     assert _node_count(atomic.db_path) == 1
     assert _frontier(atomic.db_path) == intent.new_frontier_store_id
+
+
+def test_coverage_key_includes_ordered_source_lineage_subset(
+    atomic: AtomicFixture,
+):
+    first_source, second_source = atomic.source_ids[:2]
+    first = atomic.publisher.capture_leaf_intent(
+        conversation_id=CONVERSATION_ID,
+        session_id=SESSION_ID,
+        expected_frontier_store_id=0,
+        new_frontier_store_id=max(atomic.source_ids),
+        source_store_ids=[first_source],
+        validation_store_ids=atomic.source_ids,
+    ).with_summary(
+        summary="first lineage",
+        token_count=2,
+        source_token_count=2,
+    )
+    second = atomic.publisher.capture_leaf_intent(
+        conversation_id=CONVERSATION_ID,
+        session_id=SESSION_ID,
+        expected_frontier_store_id=0,
+        new_frontier_store_id=max(atomic.source_ids),
+        source_store_ids=[second_source],
+        validation_store_ids=atomic.source_ids,
+    ).with_summary(
+        summary="second lineage",
+        token_count=2,
+        source_token_count=2,
+    )
+
+    assert first.coverage_key != second.coverage_key
+    assert atomic.publisher.publish_leaf(first).status == "published"
+    assert atomic.publisher.publish_leaf(second).status == "stale"
+    assert _node_count(atomic.db_path) == 1
 
 
 def test_two_clone_barrier_same_range_race_has_one_canonical_node(
@@ -512,6 +552,163 @@ def test_success_preserves_canary_fresh_tail_and_tool_pair_invariants(
         engine.shutdown()
 
 
+def test_cross_session_rollover_maps_more_than_one_thousand_lineage_rows(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "rollover-1005.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=False,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-1005"
+    new_session_id = "session:new-1005"
+    source_messages = [
+        {"role": "user", "content": f"old-lineage-{index:04d}"}
+        for index in range(1005)
+    ]
+    fresh_canary = {"role": "assistant", "content": "fresh-tail-canary-1005"}
+    source_ids = engine._store.append_batch(
+        "session:old-1005",
+        [*source_messages, fresh_canary],
+        conversation_id=conversation_id,
+    )
+    active = [
+        {"role": "system", "content": "system-canary-1005"},
+        *source_messages,
+        fresh_canary,
+    ]
+    original_active = copy.deepcopy(active)
+    engine.on_session_start(
+        new_session_id,
+        conversation_id=conversation_id,
+        platform="cli",
+        context_length=100_000,
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def summarize(chunk, focus_topic=None):
+        assert len(chunk) == len(source_messages)
+        text = "all rollover lineage retained\n[Expand for details: old-lineage]"
+        return list(chunk), count_messages_tokens(chunk), text, 1, 1
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    try:
+        compressed = engine.compress(active, force=True)
+        nodes = engine._dag.get_session_nodes(new_session_id)
+
+        assert active == original_active
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == source_ids[:-1]
+        assert len(nodes[0].source_ids) == 1005
+        assert _frontier(db_path, conversation_id) == source_ids[-2]
+        assert str(compressed[0]["content"]).startswith("system-canary-1005")
+        assert compressed[-1] == fresh_canary
+    finally:
+        engine.shutdown()
+
+
+def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "rollover-missing.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-missing"
+    mapped = {"role": "user", "content": "mapped-old-row"}
+    missing = {"role": "assistant", "content": "missing-old-row"}
+    fresh = {"role": "user", "content": "fresh-canary-missing"}
+    engine._store.append_batch(
+        "session:old-missing",
+        [mapped, fresh],
+        conversation_id=conversation_id,
+    )
+    active = [{"role": "system", "content": "system-canary"}, mapped, missing, fresh]
+    original_active = copy.deepcopy(active)
+    engine.on_session_start(
+        "session:new-missing",
+        conversation_id=conversation_id,
+        platform="cli",
+        context_length=10_000,
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def forbidden_summary(*_args, **_kwargs):
+        raise AssertionError("partial source mapping must fail before summarization")
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", forbidden_summary)
+    try:
+        compressed = engine.compress(active, force=True)
+
+        assert active == original_active
+        assert compressed == original_active
+        assert _node_count(db_path) == 0
+        assert _frontier(db_path, conversation_id) == 0
+    finally:
+        engine.shutdown()
+
+
+def test_ambiguous_rollover_mapping_fails_safe_without_publication(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "rollover-ambiguous.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-ambiguous"
+    duplicate = {"role": "user", "content": "identical-old-row"}
+    fresh = {"role": "assistant", "content": "fresh-canary-ambiguous"}
+    engine._store.append_batch(
+        "session:old-ambiguous",
+        [duplicate, dict(duplicate), fresh],
+        conversation_id=conversation_id,
+    )
+    active = [{"role": "system", "content": "system-canary"}, duplicate, fresh]
+    original_active = copy.deepcopy(active)
+    engine.on_session_start(
+        "session:new-ambiguous",
+        conversation_id=conversation_id,
+        platform="cli",
+        context_length=10_000,
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def forbidden_summary(*_args, **_kwargs):
+        raise AssertionError("ambiguous source mapping must fail before summarization")
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", forbidden_summary)
+    try:
+        compressed = engine.compress(active, force=True)
+
+        assert active == original_active
+        assert compressed == original_active
+        assert _node_count(db_path) == 0
+        assert _frontier(db_path, conversation_id) == 0
+    finally:
+        engine.shutdown()
+
+
 def test_cas_loser_reloads_canonical_context_without_gc_or_input_mutation(
     tmp_path: Path,
     monkeypatch,
@@ -584,33 +781,70 @@ def test_cas_loser_reloads_canonical_context_without_gc_or_input_mutation(
         engine.shutdown()
 
 
-def test_eleven_clone_bounded_publication_stress(tmp_path: Path):
+def test_eleven_engine_clone_bounded_publication_stress(tmp_path: Path):
     fixture = AtomicFixture(tmp_path / "eleven.db")
     intent = fixture.intent()
-    publishers = [
-        AtomicPublicationStore(
-            fixture.db_path,
-            writer_coordinator=fixture.coordinator,
+    engines = [
+        LCMEngine(
+            config=LCMConfig(database_path=str(fixture.db_path)),
         )
         for _ in range(11)
     ]
     barrier = threading.Barrier(11)
 
-    def publish(publisher: AtomicPublicationStore) -> PublicationResult:
+    def publish(engine: LCMEngine) -> tuple[PublicationResult, float]:
         barrier.wait()
-        return publisher.publish_leaf(intent)
+        started = time.perf_counter()
+        result = engine._publication.publish_leaf(intent)
+        return result, time.perf_counter() - started
 
     started = time.perf_counter()
     try:
         with ThreadPoolExecutor(max_workers=11) as pool:
-            results = list(pool.map(publish, publishers))
+            outcomes = list(pool.map(publish, engines))
     finally:
         elapsed = time.perf_counter() - started
-        for publisher in publishers:
-            publisher.close()
+        for engine in engines:
+            engine.shutdown()
         fixture.close()
 
+    results = [result for result, _latency in outcomes]
+    latencies = sorted(latency for _result, latency in outcomes)
+    p95 = latencies[math.ceil(len(latencies) * 0.95) - 1]
+    p99 = latencies[math.ceil(len(latencies) * 0.99) - 1]
     assert [result.status for result in results].count("published") == 1
     assert [result.status for result in results].count("already_published") == 10
     assert len({result.node_id for result in results}) == 1
+    assert p95 <= p99 < 10.0
     assert elapsed < 10.0
+
+
+def test_atomic_publication_refuses_too_new_schema_before_configuration(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "publication-future.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION + 1),),
+        )
+        conn.commit()
+
+    publisher = AtomicPublicationStore(db_path)
+    try:
+        with pytest.raises(SchemaVersionTooNewError):
+            _ = publisher.connection
+    finally:
+        publisher.close()
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert tables == {"metadata"}
+    assert journal_mode == "delete"

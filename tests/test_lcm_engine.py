@@ -19862,7 +19862,7 @@ class TestSessionRollover:
         failing_messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "epsilon " * 80},
-            {"role": "assistant", "content": "zeta " * 80},
+            {"role": "assistant", "content": "zeta"},
             {"role": "user", "content": "eta " * 80},
             {"role": "assistant", "content": "theta " * 80},
             {"role": "user", "content": "iota " * 80},
