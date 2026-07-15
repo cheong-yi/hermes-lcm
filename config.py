@@ -46,6 +46,23 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _parse_bool_env_with_source(
+    key: str,
+    default: bool,
+    *,
+    default_source: str = "default",
+) -> tuple[bool, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, f"env:{key}", None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, f"env:{key}", None
+    return default, default_source, f"invalid env {key}={raw!r} ignored"
+
+
 def _parse_str_env(key: str, default):
     return os.environ.get(key, default)
 
@@ -302,6 +319,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
+    _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
 )
 
 _PARSER_BY_TYPE = {
@@ -321,6 +342,10 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
+    "async_background_compaction_enabled",
+    "async_background_compaction_worker_enabled",
+    "async_background_compaction_max_batches",
+    "async_background_compaction_retry_backoff_seconds",
 })
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
@@ -591,6 +616,35 @@ class LCMConfig:
             default_source=summary_timeout_source,
         )
         _record("summary_timeout_ms", source, warning)
+        for field_name, env_key, parser in (
+            (
+                "async_background_compaction_enabled",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED",
+                _parse_bool_env_with_source,
+            ),
+            (
+                "async_background_compaction_worker_enabled",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED",
+                _parse_bool_env_with_source,
+            ),
+            (
+                "async_background_compaction_max_batches",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES",
+                _parse_int_env_with_source,
+            ),
+            (
+                "async_background_compaction_retry_backoff_seconds",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS",
+                _parse_float_env_with_source,
+            ),
+        ):
+            value, source, warning = parser(
+                env_key,
+                getattr(c, field_name),
+                default_source=config_sources.get(field_name, "default"),
+            )
+            setattr(c, field_name, value)
+            _record(field_name, source, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:

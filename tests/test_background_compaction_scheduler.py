@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 import sqlite3
+import os
+from pathlib import Path
 
 import pytest
 
@@ -204,3 +206,161 @@ def test_preparing_claim_has_durable_bounded_lease_and_closed_state(tmp_path):
     finally:
         engine._store.connection.rollback()
         engine.shutdown()
+
+
+def test_shutdown_cancels_inflight_preparation_before_storage_close(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_summary(**_kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "late summary", 1
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", slow_summary)
+    db_path = tmp_path / "shutdown.db"
+    engine = _engine(db_path, 0)
+    messages = _messages("shutdown")
+    engine.ingest(messages)
+    assert started.wait(1.0)
+    scheduler = engine._background_compaction_scheduler
+
+    started_shutdown = time.perf_counter()
+    engine.shutdown()
+    shutdown_elapsed = time.perf_counter() - started_shutdown
+    release.set()
+
+    assert shutdown_elapsed <= 0.50
+    assert scheduler.wait_idle(timeout=3.0) is True
+    assert scheduler.metrics_snapshot()["failed"] == 0
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT state FROM lcm_prepared_compactions").fetchone()[0] == "pending"
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+def _open_fds_for(path: Path) -> list[str]:
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.exists():
+        return []
+    matches: list[str] = []
+    for entry in fd_root.iterdir():
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if str(path) in target:
+            matches.append(target)
+    return matches
+
+
+def test_profile_rebind_cancels_inflight_preparation_and_releases_old_fds(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_summary(**_kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "late profile summary", 1
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", slow_summary)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    config = LCMConfig(
+        database_path="",
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    engine.on_session_start(
+        "profile-a-session",
+        conversation_id="profile-a-conversation",
+        platform="test",
+        context_length=1_000,
+    )
+    messages = _messages("profile-a")
+    engine.ingest(messages)
+    assert started.wait(1.0)
+    old_scheduler = engine._background_compaction_scheduler
+    old_db = home_a / "lcm.db"
+
+    started_rebind = time.perf_counter()
+    engine.on_session_start(
+        "profile-b-session",
+        conversation_id="profile-b-conversation",
+        platform="test",
+        context_length=1_000,
+        hermes_home=str(home_b),
+    )
+    rebind_elapsed = time.perf_counter() - started_rebind
+
+    assert rebind_elapsed <= 0.50
+    assert Path(engine._store.db_path) == home_b / "lcm.db"
+    assert _open_fds_for(old_db) == []
+
+    # A cancelled background callback must not leak across threads and poison
+    # new foreground summary work on the rebound profile.
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **_kwargs: ("new profile foreground summary", 1),
+    )
+    _chunk, _tokens, foreground_summary, _level, _attempts = (
+        engine._summarize_leaf_chunk_with_rescue(
+            [{"role": "user", "content": "new profile foreground work"}]
+        )
+    )
+    assert foreground_summary == "new profile foreground summary"
+
+    release.set()
+    assert old_scheduler.wait_idle(timeout=3.0) is True
+    assert old_scheduler.metrics_snapshot()["failed"] == 0
+    with sqlite3.connect(old_db) as conn:
+        assert conn.execute("SELECT state FROM lcm_prepared_compactions").fetchone()[0] == "pending"
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    engine.shutdown()
+
+
+def test_configured_db_rebind_releases_cancelled_claim_for_retry(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_summary(**_kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "late configured-db summary", 1
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", slow_summary)
+    db_path = tmp_path / "configured.db"
+    engine = _engine(db_path, 0)
+    messages = _messages("configured")
+    engine.ingest(messages)
+    assert started.wait(1.0)
+    scheduler = engine._background_compaction_scheduler
+
+    engine.on_session_start(
+        "new-profile-session",
+        conversation_id="new-profile-conversation",
+        platform="test",
+        context_length=1_000,
+        hermes_home=str(tmp_path / "new-profile"),
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT state FROM lcm_prepared_compactions").fetchone()[0] == "pending"
+
+    release.set()
+    assert scheduler.wait_idle(timeout=3.0) is True
+    assert scheduler.metrics_snapshot()["failed"] == 0
+
+    engine._config.async_background_compaction_worker_enabled = False
+    engine.on_session_start(
+        "scheduler-session-0",
+        conversation_id="scheduler-conversation-0",
+        platform="test",
+        context_length=1_000,
+    )
+    retried = engine.prepare_background_compaction_once(messages)
+    assert retried.state == "ready"
+    assert retried.attempt_count == 2
+    engine.shutdown()

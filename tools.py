@@ -2730,6 +2730,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             async_status.get("preparing_batches")
             or async_status.get("failed_batches")
             or async_status.get("last_error")
+            or async_status.get("stale_ready_policy_batches")
+            or async_status.get("stale_ready_route_batches")
+            or async_status.get("expired_retry_batches")
+            or async_status.get("orphan_pending_summaries")
         )
         checks.append({
             "check": "async_compaction_health",

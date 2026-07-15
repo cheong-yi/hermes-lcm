@@ -167,6 +167,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_compaction_storage_lock = threading.RLock()
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
@@ -446,17 +447,19 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        self._cancel_background_compaction()
         # Close the lazy publisher first so a helper with an initialized
         # connection remains as the final owner and can perform the shared
         # graceful checkpoint even when no publication ever opened its DB.
-        for attr in ("_publication", "_prepared_compactions", "_store", "_dag", "_lifecycle"):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        with self._background_compaction_storage_lock:
+            for attr in ("_publication", "_prepared_compactions", "_store", "_dag", "_lifecycle"):
+                helper = getattr(self, attr, None)
+                close = getattr(helper, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
@@ -519,6 +522,9 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
+            self._cancel_background_compaction()
+            with self._background_compaction_storage_lock:
+                self._prepared_compactions.release_owned_preparations()
             self._hermes_home = hermes_home
             store = getattr(self, "_store", None)
             if store is not None:
@@ -1289,10 +1295,16 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             token_budget = min(token_budget, 12000)
 
             capture_callback = getattr(
-                self,
-                "_leaf_publication_capture_callback",
+                self._thread_context,
+                "leaf_publication_capture_callback",
                 None,
             )
+            if capture_callback is None:
+                capture_callback = getattr(
+                    self,
+                    "_leaf_publication_capture_callback",
+                    None,
+                )
             if callable(capture_callback):
                 capture_callback(attempt_chunk)
 

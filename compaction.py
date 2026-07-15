@@ -723,14 +723,17 @@ class CompactionMixin:
                 if self._config.extraction_enabled:
                     self._run_pre_compaction_extraction(summary_input_chunk)
 
-                self._leaf_publication_capture_callback = capture_publication_intent
+                self._thread_context.leaf_publication_capture_callback = capture_publication_intent
                 try:
                     compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
                         summary_input_chunk,
                         focus_topic=focus_topic,
                     )
                 finally:
-                    self._leaf_publication_capture_callback = None
+                    try:
+                        del self._thread_context.leaf_publication_capture_callback
+                    except AttributeError:
+                        pass
             source_lookup_chunk = publication_capture["source_lookup_chunk"]
             selected_raw_len = len(source_lookup_chunk)
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
