@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 
 
 def _synchronized(method):
@@ -30,7 +31,11 @@ def _synchronized(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._lock,
+            begin_immediate=True,
+        ):
             return method(self, *args, **kwargs)
     return wrapper
 
@@ -54,7 +59,12 @@ class LifecycleState:
 
 
 class LifecycleStateStore:
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        writer_coordinator: WriterCoordinator | None = None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
@@ -63,7 +73,13 @@ class LifecycleStateStore:
         # Serialize read-modify-write flows so concurrent binds/frontier
         # advances cannot interleave and regress the checkpoint.
         self._lock = threading.RLock()
+        self._writer_coordinator = writer_coordinator or get_writer_coordinator(self.db_path)
+        self._writer_owner_token = self._writer_coordinator.bind_owner()
         self._init_db()
+
+    @property
+    def writer_coordinator(self) -> WriterCoordinator:
+        return self._writer_coordinator
 
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
@@ -73,20 +89,30 @@ class LifecycleStateStore:
             isolation_level=None,
         )
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        configure_connection(
+            self._conn,
+            coordinator=self._writer_coordinator,
+            local_lock=self._lock,
+        )
         self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._conn.commit()
+        run_versioned_migrations(
+            self._conn,
+            coordinator=self._writer_coordinator,
+            local_lock=self._lock,
+        )
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        owner_token = getattr(self, "_writer_owner_token", None)
+        if owner_token is None:
+            return
+        self._writer_coordinator.close_owner(
+            owner_token,
+            conn,
+            local_lock=self._lock,
+        )
+        self._writer_owner_token = None
+        self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
@@ -255,7 +281,6 @@ class LifecycleStateStore:
                 now,
             ),
         )
-        self._conn.commit()
         state = self.get_by_conversation(conversation_id)
         assert state is not None
         return state
@@ -303,7 +328,6 @@ class LifecycleStateStore:
                 state.conversation_id,
             ),
         )
-        self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
 
     @_synchronized
@@ -365,7 +389,6 @@ class LifecycleStateStore:
                 now,
             ),
         )
-        self._conn.commit()
         updated = self.get_by_conversation(conversation_id)
         assert updated is not None
         return updated
@@ -624,7 +647,6 @@ class LifecycleStateStore:
             """,
             (kind, max(0, int(size_estimate or 0)), now, now, conversation_id),
         )
-        self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
@@ -634,18 +656,22 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET debt_kind = NULL,
-                debt_size_estimate = 0,
-                debt_updated_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (now, now, conversation_id),
-        )
-        self._conn.commit()
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._lock,
+            begin_immediate=True,
+        ):
+            self._conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET debt_kind = NULL,
+                    debt_size_estimate = 0,
+                    debt_updated_at = ?,
+                    updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (now, now, conversation_id),
+            )
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -665,7 +691,6 @@ class LifecycleStateStore:
             """,
             (now, now, conversation_id),
         )
-        self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -688,7 +713,6 @@ class LifecycleStateStore:
             """,
             (now, now, now, conversation_id),
         )
-        self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -720,94 +744,84 @@ class LifecycleStateStore:
         assert conn is not None
         protected = {str(s) for s in (protected_session_ids or ()) if s}
 
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            sessions_with_data: set[str] = set()
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-
-            def _session_has_data(session_id: str) -> bool:
-                if not session_id:
-                    return False
-                if "messages" in tables and conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                if "summary_nodes" in tables and conn.execute(
-                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                return False
-
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
-            now = time.time()
-            max_age_seconds = (
-                float(max_age_hours) * 3600.0
-                if max_age_hours is not None
-                else None
-            )
-            deleted = 0
-
-            rows = conn.execute(
-                "SELECT * FROM lcm_lifecycle_state"
+        sessions_with_data: set[str] = set()
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
-            for row in rows:
-                cur = str(row["current_session_id"] or "")
-                fin = str(row["last_finalized_session_id"] or "")
+        }
 
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
+        def _session_has_data(session_id: str) -> bool:
+            if not session_id:
+                return False
+            if "messages" in tables and conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                return True
+            if "summary_nodes" in tables and conn.execute(
+                "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                return True
+            return False
 
-                refs = {r for r in (cur, fin) if r}
-                if refs & protected:
-                    continue
+        if "messages" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM messages"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
+        if "summary_nodes" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM summary_nodes"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
 
-                if max_age_seconds is not None:
-                    row_age = (
-                        row["current_bound_at"]
-                        or row["last_finalized_at"]
-                        or row["updated_at"]
-                    )
-                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
-                        continue
+        now = time.time()
+        max_age_seconds = (
+            float(max_age_hours) * 3600.0
+            if max_age_hours is not None
+            else None
+        )
+        deleted = 0
 
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
-                if _session_has_data(cur) or _session_has_data(fin):
-                    continue
+        rows = conn.execute(
+            "SELECT * FROM lcm_lifecycle_state"
+        ).fetchall()
+        for row in rows:
+            cur = str(row["current_session_id"] or "")
+            fin = str(row["last_finalized_session_id"] or "")
 
-                conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
+            if ((cur and cur in sessions_with_data)
+                    or (fin and fin in sessions_with_data)):
+                continue
+
+            refs = {r for r in (cur, fin) if r}
+            if refs & protected:
+                continue
+
+            if max_age_seconds is not None:
+                row_age = (
+                    row["current_bound_at"]
+                    or row["last_finalized_at"]
+                    or row["updated_at"]
                 )
-                deleted += 1
+                if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                    continue
 
-            if deleted:
-                conn.commit()
-            else:
-                conn.rollback()
-            return deleted
-        except Exception:
-            conn.rollback()
-            raise
+            # Recheck against the tables right before deletion. The decorator's
+            # BEGIN IMMEDIATE blocks concurrent writers while this transaction
+            # is open and keeps the safety check honest.
+            if _session_has_data(cur) or _session_has_data(fin):
+                continue
+
+            conn.execute(
+                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (row["conversation_id"],),
+            )
+            deleted += 1
+
+        return deleted
 
     def delete_safe_rows_for_sessions(
         self,
@@ -821,28 +835,31 @@ class LifecycleStateStore:
         protected = {str(s) for s in (protected_session_ids or ()) if s}
         deleted = 0
         skipped = 0
-        rows = self._conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
-        for row in rows:
-            refs = {
-                str(value)
-                for value in (row["current_session_id"], row["last_finalized_session_id"])
-                if value
-            }
-            if not refs or not (refs & candidates):
-                continue
-            if refs & protected:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._lock,
+            begin_immediate=True,
+        ):
+            rows = self._conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
+            for row in rows:
+                refs = {
+                    str(value)
+                    for value in (row["current_session_id"], row["last_finalized_session_id"])
+                    if value
+                }
+                if not refs or not (refs & candidates):
+                    continue
+                if refs & protected:
+                    skipped += 1
+                    continue
+                if refs <= candidates:
+                    self._conn.execute(
+                        "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                        (row["conversation_id"],),
+                    )
+                    deleted += 1
+                    continue
                 skipped += 1
-                continue
-            if refs <= candidates:
-                self._conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
-                )
-                deleted += 1
-                continue
-            skipped += 1
-        if deleted:
-            self._conn.commit()
         return deleted, skipped
 
     def advance_frontier(
@@ -853,10 +870,14 @@ class LifecycleStateStore:
     ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        with self._lock:
-            state = self.get_by_conversation(conversation_id)
-            if state is None or state.current_session_id != session_id:
-                return state
+        state = self.get_by_conversation(conversation_id)
+        if state is None or state.current_session_id != session_id:
+            return state
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._lock,
+            begin_immediate=True,
+        ):
             now = time.time()
             conn = self._conn
             assert conn is not None
@@ -864,7 +885,7 @@ class LifecycleStateStore:
             # writer bumped the frontier between the read above and this write.
             # A Python-side max() over the stale read could otherwise regress
             # the checkpoint and force the same range to be compacted twice.
-            cursor = conn.execute(
+            conn.execute(
                 """
                 UPDATE lcm_lifecycle_state
                 SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
@@ -873,7 +894,9 @@ class LifecycleStateStore:
                 """,
                 (int(frontier_store_id or 0), now, conversation_id, session_id),
             )
-            if cursor.rowcount == 0:
-                return self.get_by_conversation(conversation_id)
-            conn.commit()
-            return self.get_by_conversation(conversation_id)
+        return self.get_by_conversation(conversation_id)
+
+    def commit(self) -> None:
+        """Commit pending writes under path and connection admission."""
+        with self._writer_coordinator.write_region(self._lock):
+            self._conn.commit()

@@ -23,10 +23,10 @@ def flush_engine_connections(engine) -> None:
     contract stays in one place.
     """
     engine._store.commit()
-    engine._dag._conn.commit()
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
-        lifecycle_conn.commit()
+    engine._dag.commit()
+    lifecycle = getattr(engine, "_lifecycle", None)
+    if lifecycle is not None and lifecycle.connection is not None:
+        lifecycle.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:

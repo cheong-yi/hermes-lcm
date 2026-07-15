@@ -13,7 +13,10 @@ import re
 import shutil
 import sqlite3
 import time
+from contextlib import contextmanager, nullcontext
 from typing import Iterable, Sequence
+
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +61,73 @@ class ExternalContentFtsSpec:
         self.trigger_sqls = tuple(trigger_sqls)
 
 
-def configure_connection(conn: sqlite3.Connection) -> None:
+def _connection_coordinator(
+    conn: sqlite3.Connection,
+    coordinator: WriterCoordinator | None = None,
+) -> WriterCoordinator | None:
+    if coordinator is not None:
+        return coordinator
+    path = _database_path_for_connection(conn)
+    if not path:
+        return None
+    return get_writer_coordinator(path)
+
+
+@contextmanager
+def _write_region(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+):
+    resolved = _connection_coordinator(conn, coordinator)
+    if resolved is None:
+        with (local_lock if local_lock is not None else nullcontext()):
+            yield
+        return
+    with resolved.write_region(local_lock):
+        yield
+
+
+@contextmanager
+def _write_transaction(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+    begin_immediate: bool = False,
+):
+    resolved = _connection_coordinator(conn, coordinator)
+    if resolved is None:
+        lock_context = local_lock if local_lock is not None else nullcontext()
+        with lock_context:
+            started = not conn.in_transaction
+            if started:
+                conn.execute("BEGIN IMMEDIATE" if begin_immediate else "BEGIN")
+            try:
+                yield
+            except BaseException:
+                if started and conn.in_transaction:
+                    conn.rollback()
+                raise
+            else:
+                if started and conn.in_transaction:
+                    conn.commit()
+        return
+    with resolved.transaction(
+        conn,
+        local_lock=local_lock,
+        begin_immediate=begin_immediate,
+    ):
+        yield
+
+
+def configure_connection(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+) -> None:
     """Configure SQLite connection for WAL durability and hygiene.
 
     In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
@@ -90,12 +159,17 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
     """
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    with _write_region(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+    ):
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA wal_autocheckpoint=500")
+        conn.execute("PRAGMA journal_size_limit=67108864")
+        conn.execute("PRAGMA mmap_size=268435456")
 
 
 def add_column_if_missing(
@@ -118,11 +192,12 @@ def add_column_if_missing(
     """
     if column in existing_columns:
         return
-    try:
-        conn.execute(alter_sql)
-    except sqlite3.OperationalError as exc:
-        if "duplicate column name" not in str(exc).lower():
-            raise
+    with _write_transaction(conn, begin_immediate=True):
+        try:
+            conn.execute(alter_sql)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def ensure_metadata_table(conn: sqlite3.Connection) -> None:
@@ -465,16 +540,17 @@ def _load_integrity_checked_at(
 def _record_integrity_checked(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
 ) -> None:
-    ensure_metadata_table(conn)
     current = time.time() if now is None else now
-    conn.execute(
-        """
-        INSERT INTO metadata(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_integrity_marker_key(spec), str(current)),
-    )
+    with _write_transaction(conn, begin_immediate=True):
+        ensure_metadata_table(conn)
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_integrity_marker_key(spec), str(current)),
+        )
 
 
 def _should_run_integrity_check(
@@ -531,28 +607,29 @@ def check_external_content_fts_integrity(
 
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
     savepoint_sql = quote_sql_identifier(savepoint)
-    try:
-        conn.execute(f"SAVEPOINT {savepoint_sql}")
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
-        )
-    except sqlite3.DatabaseError as exc:
+    with _write_region(conn):
+        try:
+            conn.execute(f"SAVEPOINT {savepoint_sql}")
+            conn.execute(
+                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
+            )
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute(f"ROLLBACK TO {savepoint_sql}")
+                conn.execute(f"RELEASE {savepoint_sql}")
+            except sqlite3.DatabaseError:
+                pass
+            detail = str(exc)
+            lowered = detail.lower()
+            if "readonly" in lowered or "read-only" in lowered:
+                return {"status": "unchecked", "detail": detail}
+            return {"status": "fail", "detail": detail}
+
         try:
             conn.execute(f"ROLLBACK TO {savepoint_sql}")
             conn.execute(f"RELEASE {savepoint_sql}")
-        except sqlite3.DatabaseError:
-            pass
-        detail = str(exc)
-        lowered = detail.lower()
-        if "readonly" in lowered or "read-only" in lowered:
-            return {"status": "unchecked", "detail": detail}
-        return {"status": "fail", "detail": detail}
-
-    try:
-        conn.execute(f"ROLLBACK TO {savepoint_sql}")
-        conn.execute(f"RELEASE {savepoint_sql}")
-    except sqlite3.DatabaseError as exc:
-        return {"status": "fail", "detail": str(exc)}
+        except sqlite3.DatabaseError as exc:
+            return {"status": "fail", "detail": str(exc)}
 
     return {"status": "pass", "detail": "ok"}
 
@@ -621,10 +698,12 @@ def repair_external_content_fts(
     *,
     now: float | None = None,
     throttle: bool = False,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
 ) -> dict[str, bool]:
-    rebuilt = False
-    degraded = False
-    if _fts_needs_rebuild(conn, spec, now=now, throttle=throttle):
+    needs_rebuild = _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
+    low_disk = False
+    if needs_rebuild:
         db_path = conn.execute("PRAGMA database_list").fetchone()
         if db_path:
             db_file = db_path[2]
@@ -634,70 +713,106 @@ def repair_external_content_fts(
                     spec.table_name,
                     _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
-                _drop_fts_artifacts(conn, spec)
-                conn.commit()
-                return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
-        _drop_fts_table(conn, spec.table_name)
-        conn.execute(
-            f"""
-            CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
-                {quote_sql_identifier(spec.indexed_column)},
-                content={quote_sql_identifier(spec.content_table)},
-                content_rowid={quote_sql_identifier(spec.content_rowid)}
-            )
-            """
-        )
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
-        )
-        rebuilt = True
-
+                low_disk = True
     triggers_were_missing = _fts_missing_triggers(conn, spec)
-    for trigger_sql in spec.trigger_sqls:
-        conn.execute(trigger_sql)
-    if rebuilt:
-        # A freshly rebuilt index is known-consistent; record the marker so the
-        # next startup can skip the deep integrity-check within the interval.
-        _record_integrity_checked(conn, spec, now=now)
-    conn.commit()
-    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+    rebuilt = False
+    degraded = False
+    with _write_transaction(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+        begin_immediate=True,
+    ):
+        if needs_rebuild and low_disk:
+            _drop_fts_artifacts(conn, spec)
+            degraded = True
+        elif needs_rebuild:
+            _drop_fts_table(conn, spec.table_name)
+            conn.execute(
+                f"""
+                CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
+                    {quote_sql_identifier(spec.indexed_column)},
+                    content={quote_sql_identifier(spec.content_table)},
+                    content_rowid={quote_sql_identifier(spec.content_rowid)}
+                )
+                """
+            )
+            conn.execute(
+                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
+            )
+            rebuilt = True
+
+        if not degraded:
+            for trigger_sql in spec.trigger_sqls:
+                conn.execute(trigger_sql)
+        if rebuilt:
+            # A freshly rebuilt index is known-consistent; record the marker so
+            # the next startup can skip the deep check within the interval.
+            _record_integrity_checked(conn, spec, now=now)
+    return {
+        "rebuilt": rebuilt,
+        "degraded": degraded,
+        "triggers_recreated": triggers_were_missing and not degraded,
+    }
 
 
 def ensure_external_content_fts(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
 ) -> None:
     # Startup path: throttle the deep integrity-check. Explicit repair callers
     # use ``repair_external_content_fts(..., throttle=False)`` for a forced check.
-    repair_external_content_fts(conn, spec, now=now, throttle=True)
+    repair_external_content_fts(
+        conn,
+        spec,
+        now=now,
+        throttle=True,
+        coordinator=coordinator,
+        local_lock=local_lock,
+    )
 
 
-def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+def run_versioned_migrations(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+) -> None:
     refuse_schema_version_too_new(conn)
+    with _write_transaction(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+        begin_immediate=True,
+    ):
+        ensure_metadata_table(conn)
+        ensure_migration_state_table(conn)
 
-    ensure_metadata_table(conn)
-    ensure_migration_state_table(conn)
+        refuse_schema_version_too_new(conn)
+        current_version = get_schema_version(conn)
+        if current_version < 2:
+            mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
+            current_version = 2
 
-    refuse_schema_version_too_new(conn)
-    current_version = get_schema_version(conn)
-    if current_version < 2:
-        mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
-        current_version = 2
+        if current_version < 3:
+            ensure_lifecycle_state_table(conn)
+            mark_migration_step_complete(conn, "v3_lifecycle_state")
+            current_version = 3
+        else:
+            ensure_lifecycle_state_table(conn)
 
-    if current_version < 3:
-        ensure_lifecycle_state_table(conn)
-        mark_migration_step_complete(conn, "v3_lifecycle_state")
-        current_version = 3
-    else:
-        ensure_lifecycle_state_table(conn)
+        ensure_lifecycle_state_columns(conn)
+        if current_version < 4:
+            mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
+            current_version = 4
 
-    ensure_lifecycle_state_columns(conn)
-    if current_version < 4:
-        mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
-        current_version = 4
+        ensure_message_origin_columns(conn)
+        if current_version < 5:
+            mark_migration_step_complete(conn, "v5_message_conversation_id")
+            current_version = 5
 
-    ensure_message_origin_columns(conn)
-    if current_version < 5:
-        mark_migration_step_complete(conn, "v5_message_conversation_id")
-        current_version = 5
-
-    set_schema_version(conn, current_version)
+        set_schema_version(conn, current_version)

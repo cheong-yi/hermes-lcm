@@ -117,6 +117,7 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
+from .sqlite_writer import get_writer_coordinator
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -413,13 +414,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        writer_coordinator = get_writer_coordinator(db_path)
         self._store = MessageStore(
             db_path,
             ingest_protection_config=self._config,
             hermes_home=hermes_home,
+            writer_coordinator=writer_coordinator,
         )
-        self._dag = SummaryDAG(db_path)
-        self._lifecycle = LifecycleStateStore(db_path)
+        self._dag = SummaryDAG(db_path, writer_coordinator=writer_coordinator)
+        self._lifecycle = LifecycleStateStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
