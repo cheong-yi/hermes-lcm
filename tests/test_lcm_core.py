@@ -23,7 +23,11 @@ from hermes_lcm.escalation import (
     _deterministic_truncate,
 )
 from hermes_lcm.lifecycle_state import LifecycleStateStore
-from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
+from hermes_lcm.db_bootstrap import (
+    SCHEMA_VERSION,
+    ExternalContentFtsSpec,
+    ensure_external_content_fts,
+)
 from hermes_lcm.search_query import sanitize_fts5_query
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
@@ -1690,7 +1694,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -1739,7 +1743,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -2707,7 +2711,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "5"
+        assert version == str(SCHEMA_VERSION)
 
         tables = {
             row[0]
@@ -3287,7 +3291,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -3339,7 +3343,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"

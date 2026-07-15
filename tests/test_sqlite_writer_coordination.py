@@ -530,7 +530,8 @@ def test_eleven_engine_clones_share_one_writer_and_preserve_exact_rows(tmp_path:
         assert all(engine._store.writer_coordinator is coordinator for engine in engines)
         assert all(engine._dag.writer_coordinator is coordinator for engine in engines)
         assert all(engine._lifecycle.writer_coordinator is coordinator for engine in engines)
-        assert coordinator.metrics_snapshot()["owner_count"] == 33
+        assert all(engine._publication.writer_coordinator is coordinator for engine in engines)
+        assert coordinator.metrics_snapshot()["owner_count"] == engine_count * 4
 
         barrier = threading.Barrier(len(engines))
 

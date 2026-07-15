@@ -677,6 +677,23 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_conversation_messages_after(
+        self,
+        conversation_id: str,
+        *,
+        after_store_id: int = 0,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Read carried rows across session rollover for publication lineage."""
+
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                WHERE conversation_id = ? AND store_id > ?
+                ORDER BY store_id LIMIT ?""",
+            (conversation_id, int(after_store_id or 0), int(limit)),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:

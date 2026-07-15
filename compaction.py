@@ -19,8 +19,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
+from .publication import PublicationCaptureError
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
@@ -345,6 +345,13 @@ class CompactionMixin:
                 force=force,
             )
 
+        # Older hosts and a number of direct API callers set only _session_id
+        # before calling compress(). Atomic publication needs the durable
+        # conversation binding before ingest so new message rows and lifecycle
+        # validation agree on the same identity.
+        if self._session_id and not self._conversation_id:
+            self._bind_lifecycle_state(self._session_id)
+
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
             observed_tokens=observed_prompt_tokens,
@@ -373,6 +380,7 @@ class CompactionMixin:
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
+        canonical_reload_frontier: int | None = None
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         critical_budget_pressure = self._critical_budget_pressure_reached(
@@ -563,6 +571,121 @@ class CompactionMixin:
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
+            publication_capture: dict[str, Any] = {}
+
+            def capture_publication_intent(attempt_chunk: List[Dict[str, Any]]) -> None:
+                attempted_ids = {id(message) for message in attempt_chunk}
+                attempted_positions = [
+                    idx
+                    for idx, message in enumerate(selected_raw_chunk)
+                    if id(message) in attempted_ids
+                ]
+                last_attempted_pos = (
+                    max(attempted_positions)
+                    if attempted_positions
+                    else len(attempt_chunk) - 1
+                )
+                last_consumed_pos = last_attempted_pos
+                while (
+                    last_consumed_pos + 1 < len(selected_raw_chunk)
+                    and id(selected_raw_chunk[last_consumed_pos + 1])
+                    in dependent_reply_message_ids
+                ):
+                    last_consumed_pos += 1
+                lookup_chunk = selected_raw_chunk[: last_consumed_pos + 1]
+                validation_chunk = list(lookup_chunk)
+                retained_dependent_messages: list[Dict[str, Any]] = []
+                # A dependent assistant/tool reply can still sit in the fresh
+                # tail immediately after the selected range. It stays active
+                # until normal tail aging removes it, but the frontier must
+                # consume and validate its durable row now so it can never be
+                # summarized independently on a later pass.
+                following_start = leading_anchor_count + len(selected_raw_chunk)
+                for following in working_messages[following_start:]:
+                    if id(following) not in dependent_reply_message_ids:
+                        break
+                    validation_chunk.append(following)
+                    retained_dependent_messages.append(following)
+                lineage_chunk = [
+                    message
+                    for message in lookup_chunk
+                    if id(message) not in dependent_reply_message_ids
+                ]
+                validation_id_map = self._get_publication_store_id_map(validation_chunk)
+                source_ids = sorted(
+                    dict.fromkeys(
+                        validation_id_map[id(message)]
+                        for message in lineage_chunk
+                        if id(message) in validation_id_map
+                    )
+                )
+                consumed_ids = sorted(
+                    dict.fromkeys(
+                        validation_id_map[id(message)]
+                        for message in validation_chunk
+                        if id(message) in validation_id_map
+                    )
+                )
+                if not consumed_ids:
+                    raise PublicationCaptureError(
+                        "selected leaf chunk has no durable source identity",
+                        frontier_store_id=self._last_compacted_store_id,
+                    )
+                publication_expected_frontier = self._last_compacted_store_id
+                lifecycle_state = self._lifecycle.get_by_conversation(
+                    self._conversation_id
+                )
+                if (
+                    lifecycle_state is not None
+                    and lifecycle_state.current_session_id == self._session_id
+                ):
+                    # Rotate intentionally advances only the durable bootstrap
+                    # frontier while leaving the in-process source mapper at
+                    # the old active-context boundary. Publication must CAS
+                    # against durable truth without severing that old lineage.
+                    publication_expected_frontier = max(
+                        publication_expected_frontier,
+                        int(lifecycle_state.current_frontier_store_id or 0),
+                    )
+                new_publication_frontier = max(consumed_ids)
+                if new_publication_frontier <= publication_expected_frontier:
+                    raise PublicationCaptureError(
+                        "selected leaf chunk is already behind the durable frontier",
+                        frontier_store_id=publication_expected_frontier,
+                    )
+                publication_capture.clear()
+                publication_capture.update(
+                    {
+                        "intent": self._publication.capture_leaf_intent(
+                            conversation_id=self._conversation_id,
+                            session_id=self._session_id,
+                            expected_frontier_store_id=publication_expected_frontier,
+                            new_frontier_store_id=new_publication_frontier,
+                            source_store_ids=source_ids,
+                            validation_store_ids=consumed_ids,
+                        ),
+                        "source_lookup_chunk": lookup_chunk,
+                        "source_store_ids": source_ids,
+                        "consumed_store_ids": consumed_ids,
+                        "retained_dependent_messages": retained_dependent_messages,
+                    }
+                )
+
+            try:
+                # Capture before extraction/summary work. The rescue loop calls
+                # the same callback before each smaller LLM attempt.
+                capture_publication_intent(summary_input_chunk or selected_raw_chunk)
+            except PublicationCaptureError as exc:
+                expected_before_capture = self._last_compacted_store_id
+                self._last_compacted_store_id = max(
+                    self._last_compacted_store_id,
+                    exc.frontier_store_id,
+                )
+                if exc.frontier_store_id > expected_before_capture:
+                    canonical_reload_frontier = exc.frontier_store_id
+                noop_reason = str(exc)
+                break
+
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -579,53 +702,54 @@ class CompactionMixin:
                 if self._config.extraction_enabled:
                     self._run_pre_compaction_extraction(summary_input_chunk)
 
-                compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
-                    summary_input_chunk,
-                    focus_topic=focus_topic,
-                )
-            compacted_summary_ids = {id(message) for message in compacted_chunk}
-            compacted_positions = [
-                idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
-            ]
-            last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
-            last_consumed_raw_pos = last_compacted_raw_pos
-            while (
-                last_consumed_raw_pos + 1 < len(selected_raw_chunk)
-                and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
-            ):
-                last_consumed_raw_pos += 1
-            source_lookup_chunk = selected_raw_chunk[: last_consumed_raw_pos + 1]
+                self._leaf_publication_capture_callback = capture_publication_intent
+                try:
+                    compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
+                        summary_input_chunk,
+                        focus_topic=focus_topic,
+                    )
+                finally:
+                    self._leaf_publication_capture_callback = None
+            source_lookup_chunk = publication_capture["source_lookup_chunk"]
             selected_raw_len = len(source_lookup_chunk)
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
             source_tokens = count_messages_tokens(source_lookup_chunk)
-
-            source_lineage_chunk = [
-                message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
-            ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
-            source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
-            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
+            source_store_ids = publication_capture["source_store_ids"]
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
-
-            node = SummaryNode(
-                session_id=self._session_id,
-                depth=0,
+            prepared_intent = publication_capture["intent"].with_summary(
                 summary=summary_text,
                 token_count=summary_tokens,
                 source_token_count=source_tokens,
-                source_ids=source_store_ids,
-                source_type="messages",
                 created_at=time.time(),
                 earliest_at=earliest_at,
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
+            publication_result = self._publication.publish_leaf(prepared_intent)
+            self._last_compacted_store_id = max(
+                self._last_compacted_store_id,
+                publication_result.frontier_store_id,
+            )
+            if not publication_result.canonical:
+                if (
+                    publication_result.status == "stale"
+                    and publication_result.frontier_store_id
+                    > prepared_intent.expected_frontier_store_id
+                ):
+                    canonical_reload_frontier = publication_result.frontier_store_id
+                noop_reason = publication_result.reason or publication_result.status
+                break
+            self._carry_generated_ignored_dependent_replies(
+                publication_capture["retained_dependent_messages"]
+            )
+            try:
+                self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
+            except Exception:
+                logger.warning(
+                    "LCM best-effort transcript GC failed after atomic publication",
+                    exc_info=True,
+                )
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
@@ -656,6 +780,33 @@ class CompactionMixin:
                         break
 
         if not leaf_compacted_this_turn:
+            if canonical_reload_frontier is not None:
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                durable_tail = [
+                    self._store.to_openai_msg(row)
+                    for row in self._store.get_range(
+                        self._session_id,
+                        start_id=canonical_reload_frontier + 1,
+                        conversation_id=self._conversation_id,
+                    )
+                    if str(row.get("role") or "") != "system"
+                ]
+                canonical = self._assemble_context(
+                    working_messages[0] if leading_anchor_count else None,
+                    durable_tail,
+                    assembly_cap_override=recovery_assembly_cap,
+                )
+                self._ingest_cursor = len(canonical)
+                self._ingest_cursor_needs_reconcile = False
+                self._last_compression_status = "canonical_reload"
+                self._last_compression_noop_reason = noop_reason
+                self._write_generated_ignored_placeholder_hash_counts(
+                    self._generated_placeholder_digest_budget_for_active_replay(canonical)
+                )
+                self._write_generated_ignored_placeholder_hash_ordinals(
+                    self._generated_placeholder_digest_ordinals_for_active_replay(canonical)
+                )
+                return canonical
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,

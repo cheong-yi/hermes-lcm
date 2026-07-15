@@ -149,6 +149,7 @@ class SummaryNode:
     earliest_at: float | None = None
     latest_at: float | None = None
     expand_hint: str = ""  # "Expand for details about: ..."
+    coverage_key: str | None = None
     search_rank: float | None = None
     search_directness: float = 0.0
 
@@ -210,7 +211,8 @@ class SummaryDAG:
                 created_at REAL NOT NULL,
                 earliest_at REAL,
                 latest_at REAL,
-                expand_hint TEXT DEFAULT ''
+                expand_hint TEXT DEFAULT '',
+                coverage_key TEXT
             )""")
             self._conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
@@ -729,7 +731,8 @@ class SummaryDAG:
             earliest_at=row[9],
             latest_at=row[10],
             expand_hint=row[11] or "",
-            search_rank=row[12] if len(row) > 12 else None,
+            coverage_key=row[12] if len(row) > 12 else None,
+            search_rank=row[13] if len(row) > 13 else None,
         )
 
     def commit(self) -> None:

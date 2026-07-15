@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -118,6 +119,7 @@ from .sqlite_util import (
     _temporary_sqlite_busy_timeout,
 )
 from .sqlite_writer import get_writer_coordinator
+from .publication import AtomicPublicationStore
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -426,10 +428,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             db_path,
             writer_coordinator=writer_coordinator,
         )
+        self._publication = AtomicPublicationStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
+        # Close the lazy publisher first so a helper with an initialized
+        # connection remains as the final owner and can perform the shared
+        # graceful checkpoint even when no publication ever opened its DB.
+        for attr in ("_publication", "_store", "_dag", "_lifecycle"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -1265,6 +1274,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             serialized = self._serialize_messages(attempt_chunk)
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
+
+            capture_callback = getattr(
+                self,
+                "_leaf_publication_capture_callback",
+                None,
+            )
+            if callable(capture_callback):
+                capture_callback(attempt_chunk)
 
             try:
                 summary_text, level = summarize_with_escalation(
@@ -4158,6 +4175,54 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
         return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
 
+    def _get_publication_store_id_map(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[int, int]:
+        """Resolve current rows plus bounded same-conversation rollover rows.
+
+        The normal mapper intentionally scans only the current session. During
+        a compression rollover, however, fresh raw tail messages can remain in
+        the old session while their active context and DAG nodes move to the
+        new one. Publication still needs exact durable row identity for those
+        carried messages, so unmatched objects get one ordered, read-only scan
+        of the same conversation after the current frontier.
+        """
+
+        mapped = self._get_store_id_map_for_messages(messages)
+        if len(mapped) == len(messages) or not self._conversation_id:
+            return mapped
+
+        candidates = self._store.get_conversation_messages_after(
+            self._conversation_id,
+            after_store_id=self._last_compacted_store_id,
+        )
+        used = set(mapped.values())
+        candidates_by_identity: defaultdict[tuple[str, str, str, str], deque[int]] = (
+            defaultdict(deque)
+        )
+        for candidate in candidates:
+            store_id = int(candidate["store_id"])
+            if store_id not in used:
+                candidates_by_identity[
+                    self._message_replay_identity(candidate, stored_row=True)
+                ].append(store_id)
+        for message in messages:
+            if id(message) in mapped:
+                continue
+            identity = self._message_replay_identity(message)
+            matching_ids = candidates_by_identity.get(identity)
+            if matching_ids:
+                mapped[id(message)] = matching_ids.popleft()
+        return mapped
+
+    def _get_publication_store_ids_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[int]:
+        mapped = self._get_publication_store_id_map(messages)
+        return [mapped[id(message)] for message in messages if id(message) in mapped]
+
     # -- Internal: summarization -------------------------------------------
 
     def _run_pre_compaction_extraction(self, messages: List[Dict[str, Any]]) -> None:
@@ -5285,6 +5350,4 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
+        self._close_storage()

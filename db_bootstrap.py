@@ -30,7 +30,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -340,6 +340,32 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
+
+
+def ensure_summary_publication_columns(conn: sqlite3.Connection) -> None:
+    """Install the nullable v6 coverage key without invalidating legacy nodes."""
+
+    table_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone()
+    if not table_row:
+        return
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
+    }
+    if "coverage_key" not in columns:
+        try:
+            conn.execute("ALTER TABLE summary_nodes ADD COLUMN coverage_key TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_nodes_coverage_key_unique
+        ON summary_nodes(coverage_key)
+        WHERE coverage_key IS NOT NULL
+        """
     )
 
 
@@ -813,5 +839,12 @@ def run_versioned_migrations(
         if current_version < 5:
             mark_migration_step_complete(conn, "v5_message_conversation_id")
             current_version = 5
+
+        # Run this unconditionally because MessageStore can advance metadata to
+        # v6 before SummaryDAG creates summary_nodes on a brand-new database.
+        ensure_summary_publication_columns(conn)
+        if current_version < 6:
+            mark_migration_step_complete(conn, "v6_atomic_publication")
+            current_version = 6
 
         set_schema_version(conn, current_version)
