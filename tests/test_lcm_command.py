@@ -221,6 +221,10 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
         "lcm:\n"
         "  context_threshold: 0.61\n"
         "  fresh_tail_count: 999\n"
+        "  async_background_compaction_enabled: true\n"
+        "  async_background_compaction_worker_enabled: true\n"
+        "  async_background_compaction_max_batches: 2\n"
+        "  async_background_compaction_retry_backoff_seconds: 45\n"
         "compression:\n"
         "  threshold: 0.92\n"
         "auxiliary:\n"
@@ -248,12 +252,17 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config"]["summary_spend_max_calls"] == 0
     assert payload["config"]["summary_spend_window_seconds"] == 123.5
     assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
+    assert payload["config"]["async_background_compaction_enabled"] is True
+    assert payload["config"]["async_background_compaction_worker_enabled"] is True
+    assert payload["config"]["async_background_compaction_max_batches"] == 2
+    assert payload["config"]["async_background_compaction_retry_backoff_seconds"] == 45.0
     assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
     assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
     assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
     assert payload["config_sources"]["summary_spend_max_calls"] == "env:LCM_SUMMARY_SPEND_MAX_CALLS"
     assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
     assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
+    assert payload["config_sources"]["async_background_compaction_enabled"] == "config_yaml:lcm.async_background_compaction_enabled"
     assert engine._summary_spend_guard.max_calls == 0
     assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
 

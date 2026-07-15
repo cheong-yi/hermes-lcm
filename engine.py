@@ -120,6 +120,11 @@ from .sqlite_util import (
 )
 from .sqlite_writer import get_writer_coordinator
 from .publication import AtomicPublicationStore
+from .prepared_compaction import (
+    BackgroundCompactionMixin,
+    PreparedCompactionStore,
+    get_background_compaction_scheduler,
+)
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -140,7 +145,7 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -345,6 +350,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        self._async_compaction_publish_failure_hook = ""
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -428,17 +434,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             db_path,
             writer_coordinator=writer_coordinator,
         )
+        self._prepared_compactions = PreparedCompactionStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
         self._publication = AtomicPublicationStore(
             db_path,
             writer_coordinator=writer_coordinator,
         )
+        self._background_compaction_scheduler = get_background_compaction_scheduler(db_path)
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         # Close the lazy publisher first so a helper with an initialized
         # connection remains as the final owner and can perform the shared
         # graceful checkpoint even when no publication ever opened its DB.
-        for attr in ("_publication", "_store", "_dag", "_lifecycle"):
+        for attr in ("_publication", "_prepared_compactions", "_store", "_dag", "_lifecycle"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -1211,6 +1222,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._ingest_messages(messages)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                if self._config.async_background_compaction_worker_enabled:
+                    self.schedule_background_compaction(messages)
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
@@ -3233,6 +3246,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
         status["ingest_protection"] = sensitive_pattern_status(self._config)
+        status["async_compaction"] = self.get_async_compaction_status()
         try:
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive

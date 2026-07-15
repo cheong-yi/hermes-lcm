@@ -1,9 +1,7 @@
 """RED spike tests for opt-in async/background compaction.
 
-These tests intentionally describe the desired public/private contract before
-implementation exists. They stay xfailed on the design branch so the normal
-suite remains green, but strict xfail means each scenario becomes a real gate as
-soon as the feature starts landing.
+These tests describe the public/private contract for async preparation and
+atomic promotion.
 """
 
 from __future__ import annotations
@@ -14,11 +12,6 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="async/background compaction with atomic publish is design-only; implementation not landed",
-)
 
 
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):

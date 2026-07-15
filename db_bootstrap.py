@@ -30,13 +30,15 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
     "metadata",
     "summary_nodes",
+    "lcm_prepared_compactions",
+    "lcm_prepared_summary_nodes",
     "lcm_lifecycle_state",
     "lcm_migration_state",
     "messages_fts",
@@ -365,6 +367,104 @@ def ensure_summary_publication_columns(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_nodes_coverage_key_unique
         ON summary_nodes(coverage_key)
         WHERE coverage_key IS NOT NULL
+        """
+    )
+
+
+def ensure_prepared_compaction_tables(conn: sqlite3.Connection) -> None:
+    """Install v7 non-canonical background preparation storage.
+
+    Prepared rows deliberately live outside ``summary_nodes`` and its FTS
+    triggers.  The CHECK constraint is the durable closed-state guard; callers
+    additionally validate legal transitions before issuing updates.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_prepared_compactions (
+            batch_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('pending', 'preparing', 'ready', 'promoted',
+                          'rejected', 'failed', 'superseded')
+            ),
+            frontier_start_store_id INTEGER NOT NULL,
+            frontier_end_store_id INTEGER NOT NULL,
+            fresh_tail_count INTEGER NOT NULL,
+            leaf_chunk_tokens INTEGER NOT NULL,
+            policy_fingerprint TEXT NOT NULL,
+            summary_route_fingerprint TEXT NOT NULL,
+            coverage_key TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            validation_source_ids TEXT NOT NULL,
+            source_identity_hashes TEXT NOT NULL,
+            ordered_lineage TEXT NOT NULL,
+            expected_leaf_count INTEGER NOT NULL DEFAULT 1,
+            prepared_leaf_count INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            owner_id TEXT,
+            attempt_token TEXT,
+            lease_expires_at REAL,
+            heartbeat_at REAL,
+            next_retry_at REAL,
+            last_error TEXT,
+            rejected_reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            promoted_at REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_prepared_summary_nodes (
+            pending_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL UNIQUE
+                REFERENCES lcm_prepared_compactions(batch_id) ON DELETE CASCADE,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            depth INTEGER NOT NULL DEFAULT 0 CHECK (depth = 0),
+            summary TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            source_token_count INTEGER NOT NULL,
+            source_ids TEXT NOT NULL,
+            previous_pending_ids TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            earliest_at REAL,
+            latest_at REAL,
+            expand_hint TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_conversation_state
+        ON lcm_prepared_compactions(conversation_id, state, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_session_state
+        ON lcm_prepared_compactions(session_id, state, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_retry
+        ON lcm_prepared_compactions(next_retry_at, state)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_lease
+        ON lcm_prepared_compactions(lease_expires_at, state)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_node_batch
+        ON lcm_prepared_summary_nodes(batch_id)
         """
     )
 
@@ -846,5 +946,10 @@ def run_versioned_migrations(
         if current_version < 6:
             mark_migration_step_complete(conn, "v6_atomic_publication")
             current_version = 6
+
+        ensure_prepared_compaction_tables(conn)
+        if current_version < 7:
+            mark_migration_step_complete(conn, "v7_prepared_compactions")
+            current_version = 7
 
         set_schema_version(conn, current_version)

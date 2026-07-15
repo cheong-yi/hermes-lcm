@@ -377,6 +377,10 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        promoted_context = self._try_promote_ready_background(working_messages)
+        if promoted_context is not None:
+            self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+            return promoted_context
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
@@ -743,7 +747,10 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            publication_result = self._publication.publish_leaf(prepared_intent)
+            publication_result = self._publication.publish_leaf(
+                prepared_intent,
+                after_publish=self._prepared_compactions.supersede_for_foreground_in_transaction,
+            )
             self._last_compacted_store_id = max(
                 self._last_compacted_store_id,
                 publication_result.frontier_store_id,

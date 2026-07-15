@@ -118,6 +118,7 @@ class PublicationResult:
 
 
 AfterInsertHook = Callable[[sqlite3.Connection, PublicationIntent, int], None]
+BeforeInsertHook = Callable[[sqlite3.Connection, PublicationIntent], None]
 
 
 def _row_fingerprint(row: Iterable[object]) -> str:
@@ -357,7 +358,14 @@ class AtomicPublicationStore:
             reason=reason,
         )
 
-    def publish_leaf(self, intent: PublicationIntent) -> PublicationResult:
+    def publish_leaf(
+        self,
+        intent: PublicationIntent,
+        *,
+        before_insert: BeforeInsertHook | None = None,
+        after_publish: AfterInsertHook | None = None,
+        failure_hook: str = "",
+    ) -> PublicationResult:
         """Validate and publish one canonical D0 node in one transaction."""
 
         if not intent.summary:
@@ -419,6 +427,8 @@ class AtomicPublicationStore:
                         reason="source rows changed after capture",
                     )
                 else:
+                    if before_insert is not None:
+                        before_insert(conn, intent)
                     cursor = conn.execute(
                         """
                         INSERT INTO summary_nodes(
@@ -442,6 +452,8 @@ class AtomicPublicationStore:
                         ),
                     )
                     node_id = int(cursor.lastrowid)
+                    if failure_hook == "after_canonical_insert":
+                        raise RuntimeError("injected async promotion failure")
                     if self._after_insert is not None:
                         self._after_insert(conn, intent, node_id)
                     updated = conn.execute(
@@ -467,6 +479,8 @@ class AtomicPublicationStore:
                         # writers, but never commit a node if the CAS contract is
                         # broken by an external writer/trigger.
                         raise RuntimeError("publication frontier CAS lost after insert")
+                    if after_publish is not None:
+                        after_publish(conn, intent, node_id)
                     result = PublicationResult(
                         status="published",
                         node_id=node_id,

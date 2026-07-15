@@ -218,8 +218,7 @@ def test_schema_v6_adds_nullable_coverage_key_and_unique_partial_index(
     )
     conn.close()
 
-    assert SCHEMA_VERSION == 6
-    assert version == 6
+    assert version == SCHEMA_VERSION
     assert "coverage_key" in columns
     assert legacy_key is None
     assert indexes["idx_summary_nodes_coverage_key_unique"][2] == 1
@@ -287,7 +286,7 @@ def test_v4_v5_to_v6_migration_is_concurrent_and_idempotent(
         ).fetchone()[0]
         columns = {row[1] for row in conn.execute("PRAGMA table_info(summary_nodes)")}
     assert errors == []
-    assert version == "6"
+    assert version == str(SCHEMA_VERSION)
     assert index_count == 1
     assert "coverage_key" in columns
 

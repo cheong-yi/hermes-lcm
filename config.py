@@ -146,7 +146,13 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {
+    "context_threshold",
+    "async_background_compaction_enabled",
+    "async_background_compaction_worker_enabled",
+    "async_background_compaction_max_batches",
+    "async_background_compaction_retry_backoff_seconds",
+}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -450,6 +456,14 @@ class LCMConfig:
     summary_timeout_ms: int = 60_000
     expansion_timeout_ms: int = 120_000
 
+    # -- Opt-in background leaf preparation ---
+    # Both flags default off.  The first exposes manual one-shot preparation;
+    # the second permits the process-wide scheduler to enqueue it after ingest.
+    async_background_compaction_enabled: bool = False
+    async_background_compaction_worker_enabled: bool = False
+    async_background_compaction_max_batches: int = 2
+    async_background_compaction_retry_backoff_seconds: float = 300.0
+
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
@@ -493,7 +507,44 @@ class LCMConfig:
             if warning:
                 config_source_warnings.append(warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        yaml_config = _load_hermes_config_yaml()
+        yaml_lcm = yaml_config.get("lcm") if isinstance(yaml_config, dict) else None
+        if isinstance(yaml_lcm, dict):
+            for field_name, field_type in (
+                ("async_background_compaction_enabled", bool),
+                ("async_background_compaction_worker_enabled", bool),
+                ("async_background_compaction_max_batches", int),
+                ("async_background_compaction_retry_backoff_seconds", float),
+            ):
+                if field_name not in yaml_lcm:
+                    continue
+                raw_value = yaml_lcm[field_name]
+                try:
+                    if field_type is bool:
+                        if isinstance(raw_value, bool):
+                            parsed_value = raw_value
+                        elif isinstance(raw_value, str):
+                            normalized = raw_value.strip().lower()
+                            if normalized in {"1", "true", "yes", "on"}:
+                                parsed_value = True
+                            elif normalized in {"0", "false", "no", "off"}:
+                                parsed_value = False
+                            else:
+                                raise ValueError("invalid boolean")
+                        elif raw_value in {0, 1}:
+                            parsed_value = bool(raw_value)
+                        else:
+                            raise ValueError("invalid boolean")
+                    else:
+                        parsed_value = field_type(raw_value)
+                    setattr(c, field_name, parsed_value)
+                    config_sources[field_name] = f"config_yaml:lcm.{field_name}"
+                except (TypeError, ValueError):
+                    config_source_warnings.append(
+                        f"invalid config.yaml lcm.{field_name}={raw_value!r} ignored"
+                    )
+
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(yaml_config)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
