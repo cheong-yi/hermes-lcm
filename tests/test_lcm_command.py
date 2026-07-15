@@ -1072,12 +1072,18 @@ def test_lcm_doctor_text_reports_same_count_stale_message_fts(engine):
 
 
 def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkeypatch):
-    def fake_fts_integrity(_conn, spec):
-        if spec.table_name == "messages_fts":
-            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
-        return {"status": "pass", "detail": "ok"}
+    original_inspect = engine._store.inspect_fts
 
-    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", fake_fts_integrity)
+    def fake_inspect(spec):
+        inspection = original_inspect(spec)
+        if spec.table_name == "messages_fts":
+            inspection["integrity"] = {
+                "status": "unchecked",
+                "detail": "attempt to write a readonly database",
+            }
+        return inspection
+
+    monkeypatch.setattr(engine._store, "inspect_fts", fake_inspect)
 
     text_result = handle_lcm_command("doctor", engine)
 
@@ -1091,12 +1097,12 @@ def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkey
 
 
 def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, monkeypatch):
-    def fake_fts_integrity(_conn, spec):
+    def fake_fts_integrity(spec):
         if spec.table_name == "messages_fts":
             return {"status": "unchecked", "detail": "attempt to write a readonly database"}
         return {"status": "pass", "detail": "ok"}
 
-    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+    monkeypatch.setattr(engine._store, "check_fts_integrity", fake_fts_integrity)
 
     doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
     messages_check = next(check for check in doctor["checks"] if check["check"] == "messages_fts_integrity")
@@ -1200,9 +1206,22 @@ def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
     class FakeStore:
         _conn = ro_conn
 
-        @property
-        def connection(self):
-            return self._conn
+        def inspect_fts(self, spec):
+            integrity = check_external_content_fts_integrity(self._conn, spec)
+            return {
+                "structural_needs_repair": False,
+                "integrity": integrity,
+                "content_rows": int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.content_table}"
+                    ).fetchone()[0]
+                ),
+                "fts_rows": int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.table_name}"
+                    ).fetchone()[0]
+                ),
+            }
 
     class FakeEngine:
         _store = FakeStore()

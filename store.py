@@ -20,9 +20,12 @@ from typing import Any, Dict, List, Optional
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    check_external_content_fts_integrity,
     configure_connection,
     ensure_external_content_fts,
+    external_content_fts_needs_repair,
     refuse_schema_version_too_new,
+    repair_external_content_fts,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -1409,6 +1412,58 @@ class MessageStore:
             self._conn,
             local_lock=self._write_lock,
         )
+
+    def check_fts_integrity(
+        self,
+        spec: ExternalContentFtsSpec,
+    ) -> dict[str, str]:
+        """Run an FTS integrity savepoint under canonical store admission."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            return check_external_content_fts_integrity(self._conn, spec)
+
+    def inspect_fts(self, spec: ExternalContentFtsSpec) -> dict[str, Any]:
+        """Return structural, deep-integrity, and row-count FTS status."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            structural_needs_repair = external_content_fts_needs_repair(
+                self._conn,
+                spec,
+            )
+            integrity = check_external_content_fts_integrity(self._conn, spec)
+            content_rows = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM {spec.content_table}"
+                ).fetchone()[0]
+            )
+            try:
+                fts_rows = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.table_name}"
+                    ).fetchone()[0]
+                )
+            except sqlite3.Error:
+                fts_rows = None
+            return {
+                "structural_needs_repair": structural_needs_repair,
+                "integrity": integrity,
+                "content_rows": content_rows,
+                "fts_rows": fts_rows,
+            }
+
+    def repair_fts(
+        self,
+        spec: ExternalContentFtsSpec,
+    ) -> dict[str, bool]:
+        """Repair one FTS index under the store permit, lock, and transaction."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            return repair_external_content_fts(
+                self._conn,
+                spec,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
 
     def write_transaction(self):
         """Return the store connection's canonical coordinated transaction.

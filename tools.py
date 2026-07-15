@@ -24,7 +24,7 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec
-from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
+from .db_bootstrap import inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
     externalized_payload_stats,
@@ -2532,12 +2532,12 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
     # inverted indexes point at the exact table and repair path.
-    for check_name, conn, spec in (
-        ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
-        ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
+    for check_name, spec in (
+        ("messages_fts_integrity", build_message_fts_spec()),
+        ("nodes_fts_integrity", build_nodes_fts_spec()),
     ):
         try:
-            fts_integrity = check_external_content_fts_integrity(conn, spec)
+            fts_integrity = engine._store.check_fts_integrity(spec)
             status = fts_integrity["status"]
             checks.append({
                 "check": check_name,

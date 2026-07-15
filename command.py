@@ -9,10 +9,7 @@ import sqlite3
 from typing import Any
 
 from .db_bootstrap import (
-    check_external_content_fts_integrity,
-    external_content_fts_needs_repair,
     inspect_lcm_schema_health,
-    repair_external_content_fts,
 )
 from .diagnostics import (
     _has_lifecycle_fragmentation,
@@ -515,25 +512,18 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
         "messages_fts": build_message_fts_spec(),
         "nodes_fts": build_nodes_fts_spec(),
     }
-    conn = engine._store.connection
     for label, spec in specs.items():
         try:
-            structural_needs_repair = external_content_fts_needs_repair(conn, spec)
-            integrity_check = check_external_content_fts_integrity(conn, spec)
+            inspection = engine._store.inspect_fts(spec)
+            structural_needs_repair = inspection["structural_needs_repair"]
+            integrity_check = inspection["integrity"]
             integrity_status = str(integrity_check.get("status") or "fail")
             needs_repair = structural_needs_repair or integrity_status == "fail"
-            content_count = int(conn.execute(
-                f"SELECT COUNT(*) FROM {spec.content_table}"
-            ).fetchone()[0])
-            try:
-                fts_count = int(conn.execute(f"SELECT COUNT(*) FROM {spec.table_name}").fetchone()[0])
-            except sqlite3.Error:
-                fts_count = None
             checks[label] = {
                 "ok": not needs_repair,
                 "needs_repair": needs_repair,
-                "content_rows": content_count,
-                "fts_rows": fts_count,
+                "content_rows": inspection["content_rows"],
+                "fts_rows": inspection["fts_rows"],
                 "integrity_status": integrity_status,
                 "integrity_detail": integrity_check.get("detail"),
                 "error": None,
@@ -586,10 +576,9 @@ def _doctor_repair_apply_text(engine) -> str:
             "note: repair apply aborted before any FTS tables were repaired",
         ])
 
-    conn = engine._store.connection
     try:
-        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
-        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+        messages_result = engine._store.repair_fts(build_message_fts_spec())
+        nodes_result = engine._store.repair_fts(build_nodes_fts_spec())
     except sqlite3.Error as exc:
         return "\n".join([
             "LCM doctor repair apply",
@@ -752,8 +741,9 @@ def _doctor_text(engine) -> str:
         return "ok" if status == "pass" else status
 
     try:
-        store_fts_count = int(store_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
-        store_fts_integrity = check_external_content_fts_integrity(store_conn, build_message_fts_spec())
+        store_fts_inspection = engine._store.inspect_fts(build_message_fts_spec())
+        store_fts_count = store_fts_inspection["fts_rows"]
+        store_fts_integrity = store_fts_inspection["integrity"]
         store_fts = _fts_text_status(store_fts_integrity)
         if store_fts == "fail":
             issues.append("messages_fts")
@@ -766,8 +756,9 @@ def _doctor_text(engine) -> str:
         issues.append("messages_fts")
 
     try:
-        node_fts_count = int(dag_conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0])
-        node_fts_integrity = check_external_content_fts_integrity(dag_conn, build_nodes_fts_spec())
+        node_fts_inspection = engine._store.inspect_fts(build_nodes_fts_spec())
+        node_fts_count = node_fts_inspection["fts_rows"]
+        node_fts_integrity = node_fts_inspection["integrity"]
         node_fts = _fts_text_status(node_fts_integrity)
         if node_fts == "fail":
             issues.append("nodes_fts")

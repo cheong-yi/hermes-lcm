@@ -19,7 +19,11 @@ from pathlib import Path
 import pytest
 
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.command import _delete_clean_candidates_atomically
+from hermes_lcm.command import (
+    _delete_clean_candidates_atomically,
+    _doctor_repair_apply_text,
+    _scan_fts_repair,
+)
 from hermes_lcm.dag import SummaryNode, build_nodes_fts_spec
 from hermes_lcm.db_bootstrap import (
     _write_transaction,
@@ -435,6 +439,74 @@ def test_atomic_cleanup_delete_competes_for_the_shared_writer_permit(tmp_path: P
         assert coordinator.metrics_snapshot()["acquisitions"] == acquisitions_before + 2
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["integrity", "repair"])
+def test_store_fts_writer_waits_for_the_store_local_lock(
+    tmp_path: Path,
+    operation: str,
+):
+    store = MessageStore(tmp_path / f"fts-{operation}-lock.db")
+    spec = build_message_fts_spec()
+    completed = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_operation() -> None:
+        try:
+            if operation == "integrity":
+                store.check_fts_integrity(spec)
+            else:
+                store.repair_fts(spec)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    try:
+        acquisitions_before = store.writer_coordinator.metrics_snapshot()["acquisitions"]
+        with store._write_lock:
+            worker = threading.Thread(target=run_operation, daemon=True)
+            worker.start()
+            assert not completed.wait(timeout=0.15)
+
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert completed.is_set()
+        assert errors == []
+        assert (
+            store.writer_coordinator.metrics_snapshot()["acquisitions"]
+            == acquisitions_before + 1
+        )
+    finally:
+        store.close()
+
+
+def test_command_fts_paths_do_not_reach_for_the_raw_store_connection(
+    tmp_path: Path,
+    monkeypatch,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "wrapped-command-fts.db")),
+        hermes_home=str(tmp_path / "hermes-home"),
+    )
+
+    def reject_raw_connection(_store):
+        raise AssertionError("command FTS paths must use store-owned wrappers")
+
+    monkeypatch.setattr(
+        MessageStore,
+        "connection",
+        property(reject_raw_connection),
+    )
+    try:
+        scan = _scan_fts_repair(engine)
+        apply_text = _doctor_repair_apply_text(engine)
+    finally:
+        engine.shutdown()
+
+    assert scan["needs_repair"] is False
+    assert all(item["ok"] for item in scan["checks"].values())
+    assert "status: ok" in apply_text
 
 
 def test_eleven_engine_clones_share_one_writer_and_preserve_exact_rows(tmp_path: Path):
