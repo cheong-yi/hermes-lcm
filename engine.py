@@ -230,6 +230,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             "action": "none",
             "reason": "not run",
         }
+        self._last_ingest_reconciliation_warning_pending = False
 
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
@@ -329,6 +330,14 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._current_active_replay_store_associations_by_message_id: dict[
             int, tuple[Dict[str, Any], tuple[str, str, str, str], int]
         ] = {}
+        # Exact process-local replay identity for the most recent snapshot that
+        # completed ingest. Hermes can call on_session_end() with that original
+        # pre-compaction list after compress() has shortened the active cursor;
+        # retaining the full ordered identity makes that lifecycle flush
+        # idempotent without guessing from a partial content prefix.
+        self._last_fully_ingested_snapshot_session_id = ""
+        self._last_fully_ingested_snapshot_conversation_id = ""
+        self._last_fully_ingested_snapshot_signature: tuple[int, str] = (0, "")
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -2078,6 +2087,58 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self._session_id
         self._lcm_current_start_allows_bypass_lineage = False
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
+        same_id_compression_continuation = bool(
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id == session_id
+            and previous_session_id == session_id
+            and not self._session_ignored
+            and not self._session_stateless
+            and (
+                not requested_conversation_id
+                or not self._conversation_id
+                or requested_conversation_id == self._conversation_id
+            )
+        )
+        if same_id_compression_continuation:
+            preserved_cursor = self._ingest_cursor
+            preserved_frontier = self._last_compacted_store_id
+            preserved_conversation_id = self._conversation_id
+            self._clear_thread_context_stateless()
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=(
+                    requested_conversation_id
+                    or preserved_conversation_id
+                    or None
+                ),
+            )
+            if preserved_frontier > 0:
+                state = self._lifecycle.advance_frontier(
+                    self._conversation_id,
+                    session_id,
+                    preserved_frontier,
+                )
+                if state is not None:
+                    self._last_compacted_store_id = max(
+                        preserved_frontier,
+                        int(state.current_frontier_store_id or 0),
+                    )
+            self._ingest_cursor = preserved_cursor
+            self._ingest_cursor_needs_reconcile = False
+            self._clear_pending_reset_boundary()
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._log_session_filter_diagnostics()
+            logger.debug(
+                "LCM same-id compression continuation preserved session=%s "
+                "cursor=%d frontier=%d",
+                session_id,
+                preserved_cursor,
+                self._last_compacted_store_id,
+            )
+            return
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
         pre_reset_preserve_ambiguous_no_frame_old_session = False
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
@@ -2964,7 +3025,17 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    if self._matches_last_fully_ingested_snapshot(
+                        session_id,
+                        messages,
+                    ):
+                        logger.debug(
+                            "LCM session-end ingest already durable: session=%s messages=%d",
+                            session_id,
+                            len(messages),
+                        )
+                    else:
+                        self._ingest_messages(messages)
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -3627,6 +3698,43 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         )
         return active_replay_messages
 
+    def _remember_fully_ingested_snapshot(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        self._last_fully_ingested_snapshot_session_id = self._session_id
+        self._last_fully_ingested_snapshot_conversation_id = self._conversation_id
+        self._last_fully_ingested_snapshot_signature = (
+            self._fully_ingested_snapshot_signature(messages)
+        )
+
+    def _fully_ingested_snapshot_signature(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        for message in messages:
+            digest.update(self._lcm_bypass_message_fingerprint(message).encode("ascii"))
+        return len(messages), digest.hexdigest()
+
+    def _matches_last_fully_ingested_snapshot(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        if (
+            not session_id
+            or session_id != self._session_id
+            or session_id != self._last_fully_ingested_snapshot_session_id
+            or self._conversation_id
+            != self._last_fully_ingested_snapshot_conversation_id
+        ):
+            return False
+        return (
+            self._fully_ingested_snapshot_signature(messages)
+            == self._last_fully_ingested_snapshot_signature
+        )
+
     def _cached_active_replay_messages(
         self,
         original_messages: List[Dict[str, Any]],
@@ -3962,6 +4070,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._remember_fully_ingested_snapshot(messages)
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(
@@ -4197,6 +4306,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._remember_fully_ingested_snapshot(messages)
             return self._remember_active_replay_messages(
                 messages,
                 active_replay_messages,
@@ -4230,10 +4340,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
-        if (
-            self._last_ingest_reconciliation.get("reason")
-            == "persisted ambiguous delta"
-        ):
+        if self._last_ingest_reconciliation_warning_pending:
             try:
                 durable_rows = self._store.get_session_count(self._session_id)
             except Exception:
@@ -4251,6 +4358,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 max(inserted_store_ids) if inserted_store_ids else "none",
                 durable_rows,
             )
+            self._last_ingest_reconciliation_warning_pending = False
         for (absolute_idx, _message), store_id in zip(
             messages_to_store_with_index,
             inserted_store_ids,
@@ -4263,6 +4371,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+        self._remember_fully_ingested_snapshot(messages)
         # Most ``protected_messages`` changes are storage-only: inline media,
         # tool results, and data/base64 substrings must stay provider-usable in
         # active replay. Whole-message ``raw_payload`` externalization is the

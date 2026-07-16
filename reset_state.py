@@ -38,6 +38,7 @@ class ResetStateMixin:
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
         self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
+        self._last_ingest_reconciliation_warning_pending = False
 
     def _reset_session_scoped_runtime_state(self) -> None:
         """Reset all session-scoped runtime state.
@@ -58,3 +59,6 @@ class ResetStateMixin:
         self._last_active_replay_messages = []
         self._last_active_replay_store_ids = []
         self._current_active_replay_store_associations_by_message_id = {}
+        self._last_fully_ingested_snapshot_session_id = ""
+        self._last_fully_ingested_snapshot_conversation_id = ""
+        self._last_fully_ingested_snapshot_signature = (0, "")

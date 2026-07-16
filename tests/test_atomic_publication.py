@@ -139,6 +139,171 @@ def _frontier(path: Path, conversation_id: str = CONVERSATION_ID) -> int:
         return int(row[0])
 
 
+def _compress_once(
+    engine: LCMEngine,
+    messages: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict]:
+    def summarize(chunk, focus_topic=None):
+        return (
+            list(chunk),
+            count_messages_tokens(chunk),
+            "lifecycle boundary summary\n[Expand for details: lifecycle-boundary]",
+            1,
+            1,
+        )
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    return engine.compress(messages, force=True)
+
+
+def _lifecycle_boundary_messages() -> list[dict]:
+    return [
+        {"role": "system", "content": "stable system prompt"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "fresh request"},
+    ]
+
+
+def _lifecycle_boundary_engine(tmp_path: Path, name: str) -> LCMEngine:
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / f"{name}.db"),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=False,
+            incremental_max_depth=0,
+        ),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:same-id-boundary",
+        conversation_id="conversation:same-id-boundary",
+        platform="discord",
+        context_length=10_000,
+    )
+    return engine
+
+
+def test_session_end_exactly_matching_last_ingested_snapshot_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = _lifecycle_boundary_engine(tmp_path, "same-id-end-idempotent")
+    messages = _lifecycle_boundary_messages()
+    try:
+        compressed = _compress_once(engine, messages, monkeypatch)
+        assert len(compressed) < len(messages)
+        durable_count = engine._store.get_session_count("session:same-id-boundary")
+
+        engine.on_session_end("session:same-id-boundary", messages)
+
+        assert engine._store.get_session_count("session:same-id-boundary") == durable_count
+    finally:
+        engine.shutdown()
+
+
+def test_same_id_compression_boundary_preserves_published_state_and_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = _lifecycle_boundary_engine(tmp_path, "same-id-start-preserves")
+    messages = _lifecycle_boundary_messages()
+    try:
+        compressed = _compress_once(engine, messages, monkeypatch)
+        durable_count = engine._store.get_session_count("session:same-id-boundary")
+        node_ids = [
+            node.node_id
+            for node in engine._dag.get_session_nodes("session:same-id-boundary")
+        ]
+        frontier = engine._last_compacted_store_id
+        assert node_ids
+        assert frontier > 0
+        assert engine._ingest_cursor == len(compressed)
+
+        # Reproduce the legacy host ordering too: a redundant session-end
+        # callback can finalize the lifecycle row immediately before the
+        # same-id compression boundary reopens the logical continuation.
+        engine.on_session_end("session:same-id-boundary", messages)
+
+        engine.on_session_start(
+            "session:same-id-boundary",
+            boundary_reason="compression",
+            old_session_id="session:same-id-boundary",
+            conversation_id="conversation:same-id-boundary",
+            platform="discord",
+            context_length=10_000,
+        )
+
+        assert engine._ingest_cursor == len(compressed)
+        assert engine._last_compacted_store_id == frontier
+        assert [
+            node.node_id
+            for node in engine._dag.get_session_nodes("session:same-id-boundary")
+        ] == node_ids
+
+        new_message = {"role": "assistant", "content": "fresh answer after boundary"}
+        engine.ingest([*compressed, new_message])
+        assert engine._store.get_session_count("session:same-id-boundary") == durable_count + 1
+    finally:
+        engine.shutdown()
+
+
+def test_session_end_persists_only_genuine_new_tail(
+    tmp_path: Path,
+):
+    engine = _lifecycle_boundary_engine(tmp_path, "same-id-end-tail")
+    messages = _lifecycle_boundary_messages()
+    try:
+        engine.ingest(messages)
+        durable_count = engine._store.get_session_count("session:same-id-boundary")
+        new_message = {"role": "assistant", "content": "late final answer"}
+
+        engine.on_session_end(
+            "session:same-id-boundary",
+            [*messages, new_message],
+        )
+
+        rows = engine._store.get_session_messages("session:same-id-boundary")
+        assert len(rows) == durable_count + 1
+        assert rows[-1]["content"] == "late final answer"
+    finally:
+        engine.shutdown()
+
+
+def test_ambiguous_reconciliation_warning_applies_only_to_its_insert(
+    tmp_path: Path,
+    caplog,
+):
+    db_path = tmp_path / "reconciliation-warning-scope.db"
+    config = LCMConfig(database_path=str(db_path))
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    first.on_session_start(
+        "session:warning-scope",
+        conversation_id="conversation:warning-scope",
+        platform="discord",
+    )
+    first.ingest([{"role": "user", "content": "durable history"}])
+    first.shutdown()
+
+    restarted = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    restarted.on_session_start(
+        "session:warning-scope",
+        conversation_id="conversation:warning-scope",
+        platform="discord",
+    )
+    first_delta = {"role": "user", "content": "ambiguous new branch"}
+    second_delta = {"role": "assistant", "content": "unambiguously appended reply"}
+    try:
+        restarted.ingest([first_delta])
+        restarted.ingest([first_delta, second_delta])
+
+        assert caplog.text.count("LCM persisted ambiguous ingest delta") == 1
+    finally:
+        restarted.shutdown()
+
+
 def test_publication_values_are_immutable_and_capture_is_bounded(atomic: AtomicFixture):
     intent = atomic.intent()
     result = PublicationResult(
