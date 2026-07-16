@@ -746,9 +746,6 @@ class ReconcileMixin:
             "session_count": session_count,
             "stored_tail_count": stored_tail_count,
         }
-        self._last_ingest_reconciliation_warning_pending = (
-            reason == "persisted ambiguous delta"
-        )
         if effective_incoming is not None:
             self._last_ingest_reconciliation["effective_incoming"] = effective_incoming
 

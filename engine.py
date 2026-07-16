@@ -230,8 +230,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             "action": "none",
             "reason": "not run",
         }
-        self._last_ingest_reconciliation_warning_pending = False
-
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
         self.base_url = ""
@@ -3971,6 +3969,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             )
             return self._redact_active_replay_messages(messages)
 
+        ambiguous_reconciliation_warning_pending = False
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
@@ -4029,6 +4028,10 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            ambiguous_reconciliation_warning_pending = (
+                self._last_ingest_reconciliation.get("reason")
+                == "persisted ambiguous delta"
+            )
         cursor = min(max(self._ingest_cursor, 0), n)
         active_replay_store_ids: list[Optional[int]] = [None] * n
         if cursor > 0:
@@ -4340,7 +4343,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
-        if self._last_ingest_reconciliation_warning_pending:
+        if ambiguous_reconciliation_warning_pending:
             try:
                 durable_rows = self._store.get_session_count(self._session_id)
             except Exception:
@@ -4358,7 +4361,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 max(inserted_store_ids) if inserted_store_ids else "none",
                 durable_rows,
             )
-            self._last_ingest_reconciliation_warning_pending = False
         for (absolute_idx, _message), store_id in zip(
             messages_to_store_with_index,
             inserted_store_ids,

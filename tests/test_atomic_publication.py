@@ -304,6 +304,73 @@ def test_ambiguous_reconciliation_warning_applies_only_to_its_insert(
         restarted.shutdown()
 
 
+def test_ambiguous_reconciliation_without_insert_does_not_label_later_append(
+    tmp_path: Path,
+    caplog,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "reconciliation-warning-no-write.db"
+    config = LCMConfig(database_path=str(db_path))
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    first.on_session_start(
+        "session:warning-no-write",
+        conversation_id="conversation:warning-no-write",
+        platform="discord",
+    )
+    first.ingest([{"role": "user", "content": "durable history"}])
+    first.shutdown()
+
+    restarted = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    restarted.on_session_start(
+        "session:warning-no-write",
+        conversation_id="conversation:warning-no-write",
+        platform="discord",
+    )
+    dropped = {"role": "user", "content": "DROP_THIS_RESTART_BATCH"}
+    real_append = {"role": "assistant", "content": "later real append"}
+    restarted._compiled_ignore_message_patterns = [object()]
+    monkeypatch.setattr(
+        restarted,
+        "_matches_ignore_message_patterns",
+        lambda message, *, stored_row=False: (
+            not stored_row
+            and message.get("content") == "DROP_THIS_RESTART_BATCH"
+        ),
+    )
+
+    def ambiguous_reconciliation(messages):
+        restarted._record_ingest_reconciliation(
+            action="persisted batch",
+            reason="persisted ambiguous delta",
+            cursor=0,
+            incoming=len(messages),
+            session_count=1,
+            stored_tail_count=1,
+        )
+        return 0
+
+    monkeypatch.setattr(
+        restarted,
+        "_reconcile_ingest_cursor_from_store",
+        ambiguous_reconciliation,
+    )
+    try:
+        restarted.ingest([dropped])
+        assert (
+            restarted._store.get_session_count("session:warning-no-write")
+            == 1
+        )
+        caplog.clear()
+
+        restarted.ingest([dropped, real_append])
+
+        assert "LCM persisted ambiguous ingest delta" not in caplog.text
+        rows = restarted._store.get_session_messages("session:warning-no-write")
+        assert rows[-1]["content"] == "later real append"
+    finally:
+        restarted.shutdown()
+
+
 def test_publication_values_are_immutable_and_capture_is_bounded(atomic: AtomicFixture):
     intent = atomic.intent()
     result = PublicationResult(
