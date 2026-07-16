@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import math
 import sqlite3
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -616,6 +617,7 @@ def test_cross_session_rollover_maps_more_than_one_thousand_lineage_rows(
 def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
     tmp_path: Path,
     monkeypatch,
+    caplog,
 ):
     db_path = tmp_path / "rollover-missing.db"
     engine = LCMEngine(
@@ -657,6 +659,233 @@ def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
         assert compressed == original_active
         assert _node_count(db_path) == 0
         assert _frontier(db_path, conversation_id) == 0
+        assert "LCM publication mapping incomplete" in caplog.text
+        assert "validation=2 mapped=1 missing=1" in caplog.text
+        assert "frontier=0" in caplog.text
+    finally:
+        engine.shutdown()
+
+
+def test_fresh_restart_ingest_keeps_exact_lineage_for_missing_persisted_output(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    """Rows inserted by this pass remain publishable without content guessing.
+
+    A host ``<persisted-output>`` marker can become unrecoverable after its
+    temporary backing file disappears.  Restart reconciliation must remain
+    conservative, but if the current compression pass inserts that snapshot it
+    has exact row identity and must not immediately lose it to replay-identity
+    normalization.
+    """
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    db_path = tmp_path / "fresh-ingest-lineage.db"
+    results = tmp_path / "hermes-results"
+    results.mkdir()
+    full_output = "FULL_CANARY:" + ("x" * 100)
+    output_path = results / "call_raw.txt"
+    output_path.write_text(full_output, encoding="utf-8")
+    marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(full_output):,} characters, 0.1 KB).\n"
+        f"Full output saved to: {output_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{full_output[:30]}\n...\n"
+        "</persisted-output>"
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old request A"},
+        {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+                {
+                    "id": "call_raw",
+                    "type": "function",
+                    "function": {"name": "dump", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_raw", "content": marker},
+        {"role": "assistant", "content": "old answer B"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+    original_messages = copy.deepcopy(messages)
+    config = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        dynamic_leaf_chunk_enabled=False,
+        incremental_max_depth=0,
+    )
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    first.on_session_start(
+        "session:persisted-output",
+        conversation_id="conversation:persisted-output",
+        platform="cli",
+        context_length=10_000,
+    )
+    first.ingest(messages)
+    old_rows = first._store.get_session_messages("session:persisted-output")
+    old_count = len(old_rows)
+    old_max_store_id = max(int(row["store_id"]) for row in old_rows)
+    first.shutdown()
+    output_path.unlink()
+
+    restarted = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    restarted.on_session_start(
+        "session:persisted-output",
+        conversation_id="conversation:persisted-output",
+        platform="cli",
+        context_length=10_000,
+    )
+    summary_calls: list[list[dict]] = []
+
+    def summarize(chunk, focus_topic=None):
+        summary_calls.append(list(chunk))
+        return (
+            list(chunk),
+            count_messages_tokens(chunk),
+            "persisted output retained\n[Expand for details: persisted-output]",
+            1,
+            1,
+        )
+
+    monkeypatch.setattr(
+        restarted,
+        "_summarize_leaf_chunk_with_rescue",
+        summarize,
+    )
+    try:
+        compressed = restarted.compress(messages, force=True)
+        nodes = restarted._dag.get_session_nodes("session:persisted-output")
+
+        assert messages == original_messages
+        assert summary_calls
+        assert len(nodes) == 1
+        assert nodes[0].source_ids
+        assert min(nodes[0].source_ids) > old_max_store_id
+        assert _frontier(db_path, "conversation:persisted-output") > old_max_store_id
+        assert (
+            restarted._store.get_session_count("session:persisted-output")
+            == old_count + len(messages)
+        )
+        assert compressed[-1] == messages[-1]
+        assert len(compressed) < len(messages)
+        assert "LCM persisted ambiguous ingest delta" in caplog.text
+        assert "incoming=6 cursor_before=0 inserted=6" in caplog.text
+    finally:
+        restarted.shutdown()
+
+
+def test_exact_runtime_lineage_never_falls_back_past_out_of_order_store_id(
+    tmp_path: Path,
+):
+    """Known provenance fails closed instead of rebinding to a later duplicate."""
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "exact-order.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:exact-order",
+        conversation_id="conversation:exact-order",
+        platform="cli",
+        context_length=10_000,
+    )
+    first = {"role": "user", "content": "duplicate"}
+    second = {"role": "user", "content": "duplicate"}
+    ids = engine._store.append_batch(
+        "session:exact-order",
+        [first, second, {"role": "user", "content": "duplicate"}],
+        conversation_id="conversation:exact-order",
+    )
+    active = [dict(first), dict(second)]
+    engine._remember_active_replay_messages(
+        active,
+        active,
+        [ids[1], ids[0]],
+    )
+    try:
+        mapped = engine._get_publication_store_id_map(active)
+
+        assert mapped.get(id(active[0])) == ids[1]
+        assert id(active[1]) not in mapped
+        assert ids[2] not in mapped.values()
+    finally:
+        engine.shutdown()
+
+
+def test_exact_runtime_lineage_rejects_mutated_associated_message(
+    tmp_path: Path,
+):
+    """Object identity alone cannot bind changed active content to an old row."""
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "exact-mutation.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:exact-mutation",
+        conversation_id="conversation:exact-mutation",
+        platform="cli",
+        context_length=10_000,
+    )
+    active = {"role": "user", "content": "before"}
+    before_id = engine._store.append(
+        "session:exact-mutation",
+        active,
+        conversation_id="conversation:exact-mutation",
+    )
+    engine._remember_active_replay_messages([active], [active], [before_id])
+    active["content"] = "after"
+    after_id = engine._store.append(
+        "session:exact-mutation",
+        active,
+        conversation_id="conversation:exact-mutation",
+    )
+    try:
+        mapped = engine._get_publication_store_id_map([active])
+
+        assert mapped == {}
+        assert after_id not in mapped.values()
+    finally:
+        engine.shutdown()
+
+
+def test_exact_runtime_lineage_survives_cached_copy_and_clears_on_reset(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "exact-cache.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:exact-cache",
+        conversation_id="conversation:exact-cache",
+        platform="cli",
+        context_length=10_000,
+    )
+    source = [{"role": "user", "content": "cached"}]
+    store_id = engine._store.append(
+        "session:exact-cache",
+        source[0],
+        conversation_id="conversation:exact-cache",
+    )
+    engine._remember_active_replay_messages(source, source, [store_id])
+    try:
+        copied = engine._cached_active_replay_messages(source)
+        assert copied is not None
+        assert engine._get_publication_store_id_map(copied) == {
+            id(copied[0]): store_id
+        }
+
+        engine._reset_session_scoped_runtime_state()
+        assert engine._current_active_replay_store_associations_by_message_id == {}
     finally:
         engine.shutdown()
 

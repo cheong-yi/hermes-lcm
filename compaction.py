@@ -633,6 +633,27 @@ class CompactionMixin:
                         for message in validation_chunk
                     )
                 ):
+                    mapped_count = sum(
+                        1 for message in validation_chunk if id(message) in validation_id_map
+                    )
+                    missing_count = len(validation_chunk) - mapped_count
+                    try:
+                        durable_rows = self._store.get_session_count(self._session_id)
+                    except Exception:
+                        durable_rows = -1
+                    logger.warning(
+                        "LCM publication mapping incomplete: session=%s "
+                        "conversation=%s validation=%d mapped=%d missing=%d "
+                        "unique_store_ids=%d frontier=%d durable_rows=%d",
+                        self._session_id,
+                        self._conversation_id,
+                        len(validation_chunk),
+                        mapped_count,
+                        missing_count,
+                        len(set(validation_id_map.values())),
+                        self._last_compacted_store_id,
+                        durable_rows,
+                    )
                     raise PublicationCaptureError(
                         "selected leaf chunk source mapping is missing or ambiguous",
                         frontier_store_id=self._last_compacted_store_id,

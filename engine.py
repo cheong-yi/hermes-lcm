@@ -314,6 +314,21 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        # Exact durable provenance aligned with the cached active replay.  The
+        # values come only from MessageStore insert return values; they are not
+        # inferred from message content.  This lets the current runtime publish
+        # rows whose replay identity is intentionally transformed (notably
+        # Hermes persisted-output markers) without weakening restart/rollover
+        # ambiguity checks.
+        self._last_active_replay_store_ids: list[Optional[int]] = []
+        # Strong-reference associations prevent Python object-id reuse from
+        # rebinding a new message to an old durable row. Each association also
+        # records the raw active payload identity so in-place dict mutation
+        # invalidates the provenance instead of silently publishing the wrong
+        # source.
+        self._current_active_replay_store_associations_by_message_id: dict[
+            int, tuple[Dict[str, Any], tuple[str, str, str, str], int]
+        ] = {}
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -3583,6 +3598,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self,
         original_messages: List[Dict[str, Any]],
         active_replay_messages: List[Dict[str, Any]],
+        store_ids: Optional[List[Optional[int]]] = None,
     ) -> List[Dict[str, Any]]:
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
@@ -3590,6 +3606,19 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
+        aligned_store_ids = list(store_ids or [])
+        if len(aligned_store_ids) != len(active_replay_messages):
+            aligned_store_ids = [None] * len(active_replay_messages)
+        self._last_active_replay_store_ids = aligned_store_ids
+        self._current_active_replay_store_associations_by_message_id = {
+            id(message): (
+                message,
+                self._raw_externalized_placeholder_replay_identity(message),
+                int(store_id),
+            )
+            for message, store_id in zip(active_replay_messages, aligned_store_ids)
+            if store_id is not None
+        }
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
         )
@@ -3606,7 +3635,18 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                copied = self._copy_active_replay_messages_preserving_generated_ids(cached)
+                cached_store_ids = getattr(self, "_last_active_replay_store_ids", [])
+                self._current_active_replay_store_associations_by_message_id = {
+                    id(message): (
+                        message,
+                        self._raw_externalized_placeholder_replay_identity(message),
+                        int(store_id),
+                    )
+                    for message, store_id in zip(copied, cached_store_ids)
+                    if store_id is not None
+                }
+                return copied
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -3882,6 +3922,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        active_replay_store_ids: list[Optional[int]] = [None] * n
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -3895,6 +3936,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     self._message_replay_identity(message) for message in messages[:cursor]
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
+                    cached_store_ids = getattr(
+                        self, "_last_active_replay_store_ids", []
+                    )
+                    if len(cached_store_ids) >= cursor:
+                        active_replay_store_ids[:cursor] = cached_store_ids[:cursor]
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
                             cached_active_replay_messages[:cursor]
@@ -3918,7 +3964,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
-            return self._remember_active_replay_messages(messages, replay_messages)
+            return self._remember_active_replay_messages(
+                messages,
+                replay_messages,
+                active_replay_store_ids,
+            )
 
         active_replay_messages = replay_messages
         compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
@@ -4147,7 +4197,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._remember_active_replay_messages(
+                messages,
+                active_replay_messages,
+                active_replay_store_ids,
+            )
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -4169,13 +4223,39 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 active_replay_messages[absolute_idx] = active_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        inserted_store_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
+        if (
+            self._last_ingest_reconciliation.get("reason")
+            == "persisted ambiguous delta"
+        ):
+            try:
+                durable_rows = self._store.get_session_count(self._session_id)
+            except Exception:
+                durable_rows = -1
+            logger.warning(
+                "LCM persisted ambiguous ingest delta: session=%s conversation=%s "
+                "incoming=%d cursor_before=%d inserted=%d store_id_min=%s "
+                "store_id_max=%s durable_rows=%d",
+                self._session_id,
+                self._conversation_id,
+                n,
+                cursor,
+                len(inserted_store_ids),
+                min(inserted_store_ids) if inserted_store_ids else "none",
+                max(inserted_store_ids) if inserted_store_ids else "none",
+                durable_rows,
+            )
+        for (absolute_idx, _message), store_id in zip(
+            messages_to_store_with_index,
+            inserted_store_ids,
+        ):
+            active_replay_store_ids[absolute_idx] = int(store_id)
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4188,7 +4268,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         # active replay. Whole-message ``raw_payload`` externalization is the
         # exception: it intentionally returns a compact active stub so the host
         # does not replay huge opaque text while SQLite stores only the stub.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        return self._remember_active_replay_messages(
+            messages,
+            active_replay_messages,
+            active_replay_store_ids,
+        )
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
@@ -4219,8 +4303,16 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         if len(mapped) == len(messages) or not self._conversation_id:
             return mapped
 
+        exact_runtime_associations = getattr(
+            self,
+            "_current_active_replay_store_associations_by_message_id",
+            {},
+        )
         unmatched_messages = [
-            message for message in messages if id(message) not in mapped
+            message
+            for message in messages
+            if id(message) not in mapped
+            and id(message) not in exact_runtime_associations
         ]
         # The scan is paginated beyond SQLite's historical 1000-row page, but
         # remains bounded in direct proportion to the publication request. If

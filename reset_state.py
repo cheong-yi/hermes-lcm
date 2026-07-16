@@ -54,3 +54,7 @@ class ResetStateMixin:
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
+        self._last_active_replay_source_identities = []
+        self._last_active_replay_messages = []
+        self._last_active_replay_store_ids = []
+        self._current_active_replay_store_associations_by_message_id = {}
