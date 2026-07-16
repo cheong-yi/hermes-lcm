@@ -4396,6 +4396,65 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
         return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
 
+    @staticmethod
+    def _publication_identity_without_preserved_todo_suffix(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        """Ignore only Hermes' exact trailing task-list continuity block.
+
+        Hermes can append this synthetic block to an already-ingested message
+        while preserving task state across host compression. Publication still
+        needs to bind the unchanged durable prefix to its original row, but all
+        other role/content/tool identity remains exact.
+        """
+
+        role, content, third, fourth = identity
+        marker = f"\n\n{_PRESERVED_TODO_CONTEXT_PREFIX}"
+        marker_index = content.rfind(marker)
+        if marker_index < 0:
+            return identity
+        task_block = content[marker_index + 2 :]
+        task_block_prefix = f"{_PRESERVED_TODO_CONTEXT_PREFIX}\n"
+        if not task_block.startswith(task_block_prefix):
+            return identity
+        task_records = task_block[len(task_block_prefix) :]
+        if not task_records or "\r" in task_records:
+            return identity
+        record_headers = list(
+            re.finditer(
+                r"(?m)^- \[(>| )\] ([^\r\n]+?)\. ",
+                task_records,
+            )
+        )
+        if not record_headers or record_headers[0].start() != 0:
+            return identity
+        for index, header in enumerate(record_headers):
+            marker_state, item_id = header.groups()
+            if not item_id or item_id != item_id.strip():
+                return identity
+            record_end = (
+                record_headers[index + 1].start()
+                if index + 1 < len(record_headers)
+                else len(task_records)
+            )
+            record_body = task_records[header.end() : record_end]
+            if index + 1 < len(record_headers):
+                if not record_body.endswith("\n"):
+                    return identity
+                record_body = record_body[:-1]
+            expected_status = (
+                "in_progress"
+                if marker_state == ">"
+                else "pending"
+            )
+            status_suffix = f" ({expected_status})"
+            if not record_body.endswith(status_suffix):
+                return identity
+            item_content = record_body[: -len(status_suffix)]
+            if not item_content or item_content != item_content.strip():
+                return identity
+        return role, content[:marker_index], third, fourth
+
     def _get_publication_store_id_map(
         self,
         messages: List[Dict[str, Any]],
@@ -4419,6 +4478,77 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             "_current_active_replay_store_associations_by_message_id",
             {},
         )
+        exact_suffix_candidates: dict[int, int] = {}
+        exact_suffix_store_ids: set[int] = set()
+        for message in messages:
+            if id(message) in mapped:
+                continue
+            exact_association = exact_runtime_associations.get(id(message))
+            if exact_association is None:
+                continue
+            associated_message, associated_identity, exact_store_id = exact_association
+            current_raw_identity = self._raw_externalized_placeholder_replay_identity(message)
+            stripped_raw_identity = self._publication_identity_without_preserved_todo_suffix(
+                current_raw_identity
+            )
+            if (
+                associated_message is not message
+                or stripped_raw_identity == current_raw_identity
+                or stripped_raw_identity != associated_identity
+            ):
+                continue
+            exact_store_id = int(exact_store_id)
+            if (
+                exact_store_id <= self._last_compacted_store_id
+                or exact_store_id in mapped.values()
+                or exact_store_id in exact_suffix_store_ids
+            ):
+                continue
+            durable_row = self._store.get(exact_store_id)
+            if (
+                durable_row is None
+                or str(durable_row.get("conversation_id") or "") != self._conversation_id
+            ):
+                continue
+            stripped_replay_identity = self._publication_identity_without_preserved_todo_suffix(
+                self._message_replay_identity(message)
+            )
+            if self._message_replay_identity(
+                durable_row,
+                stored_row=True,
+            ) != stripped_replay_identity:
+                continue
+            exact_suffix_candidates[id(message)] = exact_store_id
+            exact_suffix_store_ids.add(exact_store_id)
+
+        # Proven suffix associations still obey the same monotonic source-row
+        # order as all other publication mapping. Respect both already-mapped
+        # neighbors and earlier accepted exact suffix associations.
+        next_mapped_store_id: list[int | None] = [None] * len(messages)
+        next_store_id: int | None = None
+        for index in range(len(messages) - 1, -1, -1):
+            next_mapped_store_id[index] = next_store_id
+            existing_store_id = mapped.get(id(messages[index]))
+            if existing_store_id is not None:
+                next_store_id = int(existing_store_id)
+        previous_store_id = self._last_compacted_store_id
+        for index, message in enumerate(messages):
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                previous_store_id = int(existing_store_id)
+                continue
+            exact_store_id = exact_suffix_candidates.get(id(message))
+            if exact_store_id is None or exact_store_id <= previous_store_id:
+                continue
+            following_store_id = next_mapped_store_id[index]
+            if following_store_id is not None and exact_store_id >= following_store_id:
+                continue
+            mapped[id(message)] = exact_store_id
+            previous_store_id = exact_store_id
+
+        if len(mapped) == len(messages):
+            return mapped
+
         unmatched_messages = [
             message
             for message in messages
@@ -4451,6 +4581,13 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             return mapped
 
         used = set(mapped.values())
+        candidate_identities_by_store_id = {
+            int(candidate["store_id"]): self._message_replay_identity(
+                candidate,
+                stored_row=True,
+            )
+            for candidate in candidates
+        }
         candidates_by_identity: defaultdict[tuple[str, str, str, str], deque[int]] = (
             defaultdict(deque)
         )
@@ -4458,7 +4595,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             store_id = int(candidate["store_id"])
             if store_id not in used:
                 candidates_by_identity[
-                    self._message_replay_identity(candidate, stored_row=True)
+                    candidate_identities_by_store_id[store_id]
                 ].append(store_id)
         unmatched_counts: defaultdict[tuple[str, str, str, str], int] = defaultdict(int)
         for message in unmatched_messages:
@@ -4476,6 +4613,99 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             matching_ids = candidates_by_identity.get(identity)
             if matching_ids:
                 mapped[id(message)] = matching_ids.popleft()
+
+        used = set(mapped.values())
+        compatibility_candidates: defaultdict[
+            tuple[str, str, str, str],
+            deque[int],
+        ] = defaultdict(deque)
+        for candidate in candidates:
+            store_id = int(candidate["store_id"])
+            if store_id in used:
+                continue
+            compatibility_candidates[
+                candidate_identities_by_store_id[store_id]
+            ].append(store_id)
+        compatibility_counts: defaultdict[
+            tuple[str, str, str, str],
+            int,
+        ] = defaultdict(int)
+        compatibility_messages: list[
+            tuple[Dict[str, Any], tuple[str, str, str, str]]
+        ] = []
+        for message in messages:
+            if (
+                id(message) in mapped
+                or id(message) in exact_runtime_associations
+            ):
+                continue
+            identity = self._message_replay_identity(message)
+            stripped_identity = self._publication_identity_without_preserved_todo_suffix(
+                identity
+            )
+            if stripped_identity == identity:
+                continue
+            compatibility_messages.append((message, stripped_identity))
+            compatibility_counts[stripped_identity] += 1
+        for identity, count in compatibility_counts.items():
+            if len(compatibility_candidates.get(identity, ())) != count:
+                # Without exact runtime provenance, duplicate durable prefixes
+                # are ambiguous and must remain unmapped.
+                compatibility_candidates.pop(identity, None)
+        compatibility_mapped_message_ids: set[int] = set()
+        for message, stripped_identity in compatibility_messages:
+            matching_ids = compatibility_candidates.get(stripped_identity)
+            if matching_ids:
+                mapped[id(message)] = matching_ids.popleft()
+                compatibility_mapped_message_ids.add(id(message))
+
+        ordered_mappings: list[tuple[int, int, bool]] = []
+        for message in messages:
+            message_id = id(message)
+            store_id = mapped.get(message_id)
+            if store_id is None:
+                continue
+            store_id = int(store_id)
+            is_compatibility_mapping = (
+                message_id in compatibility_mapped_message_ids
+            )
+            while (
+                ordered_mappings
+                and store_id <= ordered_mappings[-1][1]
+                and ordered_mappings[-1][2]
+            ):
+                mapped.pop(ordered_mappings[-1][0], None)
+                ordered_mappings.pop()
+            previous_store_id = (
+                ordered_mappings[-1][1]
+                if ordered_mappings
+                else self._last_compacted_store_id
+            )
+            if store_id <= previous_store_id:
+                if is_compatibility_mapping:
+                    mapped.pop(message_id, None)
+                continue
+            ordered_mappings.append(
+                (message_id, store_id, is_compatibility_mapping)
+            )
+
+        final_store_ids = [
+            int(mapped[id(message)])
+            for message in messages
+            if id(message) in mapped
+        ]
+        if any(
+            current_store_id <= previous_store_id
+            for previous_store_id, current_store_id in zip(
+                [self._last_compacted_store_id, *final_store_ids],
+                final_store_ids,
+            )
+        ):
+            # Base mappings are authoritative. If they are unexpectedly
+            # non-monotonic, discard every optional compatibility addition so
+            # this method cannot report a complete reordered lineage.
+            for message_id in compatibility_mapped_message_ids:
+                mapped.pop(message_id, None)
         return mapped
 
     def _get_publication_store_ids_for_messages(

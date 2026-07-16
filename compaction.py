@@ -385,6 +385,7 @@ class CompactionMixin:
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
         canonical_reload_frontier: int | None = None
+        publication_capture_failed = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         critical_budget_pressure = self._critical_budget_pressure_reached(
@@ -416,6 +417,22 @@ class CompactionMixin:
         dependent_reply_message_ids: set[int] = set()
         previously_consumed_dependent_reply_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
+
+        def record_publication_capture_failure(exc: PublicationCaptureError) -> None:
+            nonlocal canonical_reload_frontier
+            nonlocal noop_reason
+            nonlocal publication_capture_failed
+
+            expected_before_capture = self._last_compacted_store_id
+            self._last_compacted_store_id = max(
+                self._last_compacted_store_id,
+                exc.frontier_store_id,
+            )
+            publication_capture_failed = True
+            self._last_boundary_skip_time = time.time()
+            if exc.frontier_store_id > expected_before_capture:
+                canonical_reload_frontier = exc.frontier_store_id
+            noop_reason = str(exc)
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
@@ -718,14 +735,7 @@ class CompactionMixin:
                 # the same callback before each smaller LLM attempt.
                 capture_publication_intent(summary_input_chunk or selected_raw_chunk)
             except PublicationCaptureError as exc:
-                expected_before_capture = self._last_compacted_store_id
-                self._last_compacted_store_id = max(
-                    self._last_compacted_store_id,
-                    exc.frontier_store_id,
-                )
-                if exc.frontier_store_id > expected_before_capture:
-                    canonical_reload_frontier = exc.frontier_store_id
-                noop_reason = str(exc)
+                record_publication_capture_failure(exc)
                 break
 
             if not summary_input_chunk:
@@ -746,10 +756,14 @@ class CompactionMixin:
 
                 self._thread_context.leaf_publication_capture_callback = capture_publication_intent
                 try:
-                    compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
-                        summary_input_chunk,
-                        focus_topic=focus_topic,
-                    )
+                    try:
+                        compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
+                            summary_input_chunk,
+                            focus_topic=focus_topic,
+                        )
+                    except PublicationCaptureError as exc:
+                        record_publication_capture_failure(exc)
+                        break
                 finally:
                     try:
                         del self._thread_context.leaf_publication_capture_callback
@@ -892,7 +906,10 @@ class CompactionMixin:
                     active_context_messages,
                     insert_missing_tool_stubs=False,
                 )
-            if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
+            if (
+                sanitized_messages != working_messages
+                or ingest_cleanup_changed_active_context
+            ) and not publication_capture_failed:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
                 # or reassembled context, keeping the old cursor could make the

@@ -32,6 +32,7 @@ from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.publication import (
     AtomicPublicationStore,
+    PublicationCaptureError,
     PublicationIntent,
     PublicationResult,
 )
@@ -894,6 +895,130 @@ def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
         assert "LCM publication mapping incomplete" in caplog.text
         assert "validation=2 mapped=1 missing=1" in caplog.text
         assert "frontier=0" in caplog.text
+        assert engine._last_compression_status == "noop"
+        assert "selected leaf chunk source mapping" in engine._last_compression_noop_reason
+        assert engine._compression_boundary_cooldown_active() is True
+    finally:
+        engine.shutdown()
+
+
+def test_missing_mapping_stays_noop_when_scaffold_cleanup_changes_context(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Cleanup must not disguise a failed publication capture as progress."""
+
+    db_path = tmp_path / "missing-with-scaffold-cleanup.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:missing-with-scaffold-cleanup"
+    scaffold = {
+        "role": "user",
+        "content": (
+            "[Durable Summary (d2, node 42)]\n"
+            "Derived active context.\n"
+            "[Expand for details: prior-history]"
+        ),
+    }
+    mapped = {"role": "user", "content": "mapped-old-row"}
+    missing = {"role": "assistant", "content": "missing-old-row"}
+    fresh = {"role": "user", "content": "fresh-canary"}
+    engine._store.append_batch(
+        "session:old-with-scaffold",
+        [mapped, fresh],
+        conversation_id=conversation_id,
+    )
+    active = [scaffold, mapped, missing, fresh]
+    engine.on_session_start(
+        "session:new-with-scaffold",
+        conversation_id=conversation_id,
+        platform="discord",
+        context_length=10_000,
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def forbidden_summary(*_args, **_kwargs):
+        raise AssertionError("partial source mapping must fail before summarization")
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", forbidden_summary)
+    try:
+        compressed = engine.compress(active, force=True)
+
+        assert compressed == [mapped, missing, fresh]
+        assert engine._last_compression_status == "noop"
+        assert "selected leaf chunk source mapping" in engine._last_compression_noop_reason
+        assert engine._compression_boundary_cooldown_active() is True
+        assert _node_count(db_path) == 0
+        assert _frontier(db_path, conversation_id) == 0
+    finally:
+        engine.shutdown()
+
+
+def test_rescue_capture_failure_routes_to_noop_and_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A later rescue capture failure must not escape or leave running state."""
+
+    db_path = tmp_path / "rescue-capture-failure.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            incremental_max_depth=0,
+        )
+    )
+    messages = [
+        {"role": "user", "content": "old-source-one"},
+        {"role": "assistant", "content": "old-source-two"},
+        {"role": "user", "content": "fresh-canary"},
+    ]
+    engine.on_session_start(
+        "session:rescue-capture-failure",
+        conversation_id="conversation:rescue-capture-failure",
+        platform="discord",
+        context_length=10_000,
+    )
+    capture_calls = 0
+    original_mapper = engine._get_publication_store_id_map
+
+    def fail_second_capture(chunk):
+        nonlocal capture_calls
+        capture_calls += 1
+        if capture_calls == 2:
+            raise PublicationCaptureError(
+                "rescue publication mapping failed",
+                frontier_store_id=engine._last_compacted_store_id,
+            )
+        return original_mapper(chunk)
+
+    def summarize(chunk, focus_topic=None):
+        engine._thread_context.leaf_publication_capture_callback(chunk)
+        raise AssertionError("failed rescue capture must stop summarization")
+
+    monkeypatch.setattr(engine, "_get_publication_store_id_map", fail_second_capture)
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    try:
+        compressed = engine.compress(messages, force=True)
+
+        assert capture_calls == 2
+        assert compressed == messages
+        assert engine._last_compression_status == "noop"
+        assert engine._last_compression_noop_reason == "rescue publication mapping failed"
+        assert engine._compression_boundary_cooldown_active() is True
+        assert _node_count(db_path) == 0
+        assert _frontier(
+            db_path,
+            "conversation:rescue-capture-failure",
+        ) == 0
     finally:
         engine.shutdown()
 
@@ -1052,6 +1177,88 @@ def test_exact_runtime_lineage_never_falls_back_past_out_of_order_store_id(
         engine.shutdown()
 
 
+def test_suffix_runtime_lineage_preserves_active_store_id_order(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "suffix-exact-order.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:suffix-exact-order",
+        conversation_id="conversation:suffix-exact-order",
+        platform="discord",
+        context_length=10_000,
+    )
+    first = {"role": "user", "content": "duplicate-durable"}
+    second = {"role": "user", "content": "duplicate-durable"}
+    ids = engine._store.append_batch(
+        engine._session_id,
+        [first, second],
+        conversation_id=engine._conversation_id,
+    )
+    active = [dict(first), dict(second)]
+    engine._remember_active_replay_messages(
+        active,
+        active,
+        [ids[1], ids[0]],
+    )
+    suffix = (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify ordered provenance (in_progress)"
+    )
+    active[0]["content"] += suffix
+    active[1]["content"] += suffix
+    try:
+        mapped = engine._get_publication_store_id_map(active)
+
+        assert mapped.get(id(active[0])) == ids[1]
+        assert id(active[1]) not in mapped
+    finally:
+        engine.shutdown()
+
+
+def test_suffix_exact_runtime_lineage_does_not_require_bounded_scan_exhaustion(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "suffix-exact-bounded.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:suffix-exact-bounded",
+        conversation_id="conversation:suffix-exact-bounded",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable = {"role": "user", "content": "proven-durable-prefix"}
+    store_id = engine._store.append(
+        engine._session_id,
+        durable,
+        conversation_id=engine._conversation_id,
+    )
+    active = dict(durable)
+    engine._remember_active_replay_messages([active], [active], [store_id])
+    engine._store.append_batch(
+        engine._session_id,
+        [
+            {"role": "assistant", "content": f"later-row-{index}"}
+            for index in range(80)
+        ],
+        conversation_id=engine._conversation_id,
+    )
+    active["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify bounded exact lineage (in_progress)"
+    )
+    try:
+        assert engine._get_publication_store_id_map([active]) == {
+            id(active): store_id
+        }
+    finally:
+        engine.shutdown()
+
+
 def test_exact_runtime_lineage_rejects_mutated_associated_message(
     tmp_path: Path,
 ):
@@ -1085,6 +1292,290 @@ def test_exact_runtime_lineage_rejects_mutated_associated_message(
 
         assert mapped == {}
         assert after_id not in mapped.values()
+    finally:
+        engine.shutdown()
+
+
+def test_publication_lineage_accepts_only_trailing_hermes_task_list_suffix(
+    tmp_path: Path,
+):
+    """Hermes may append its synthetic task-list block after LCM ingestion."""
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "todo-suffix.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:todo-suffix",
+        conversation_id="conversation:todo-suffix",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable = {
+        "role": "user",
+        "content": "[Async delegation result]\nWorker completed the bounded task.",
+    }
+    store_id = engine._store.append(
+        "session:todo-suffix",
+        durable,
+        conversation_id="conversation:todo-suffix",
+    )
+    active = dict(durable)
+    engine._remember_active_replay_messages([active], [active], [store_id])
+    active["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify the worker result across\n"
+        "multiple generated lines (in_progress)\n"
+        "- [ ] report-final. Report the verification outcome (pending)"
+    )
+    try:
+        assert engine._get_publication_store_id_map([active]) == {
+            id(active): store_id
+        }
+
+        changed = dict(active)
+        changed["content"] = str(changed["content"]).replace(
+            "Worker completed",
+            "Worker did not complete",
+            1,
+        )
+        assert engine._get_publication_store_id_map([changed]) == {}
+    finally:
+        engine.shutdown()
+
+
+def test_compaction_publishes_original_row_after_hermes_task_list_suffix(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "todo-suffix-publication.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            incremental_max_depth=0,
+        ),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:todo-suffix-publication",
+        conversation_id="conversation:todo-suffix-publication",
+        platform="discord",
+        context_length=10_000,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "[Async delegation result]\nWorker completed the bounded task.",
+        },
+        {"role": "assistant", "content": "I will verify the worker output."},
+        {"role": "user", "content": "fresh-canary"},
+    ]
+    source_ids = engine._store.append_batch(
+        engine._session_id,
+        messages,
+        conversation_id=engine._conversation_id,
+    )
+    engine._remember_active_replay_messages(messages, messages, source_ids)
+    engine._ingest_cursor = len(messages)
+    engine._ingest_cursor_needs_reconcile = False
+    messages[0]["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify the worker result (in_progress)"
+    )
+
+    def summarize(chunk, focus_topic=None):
+        text = "worker result retained\n[Expand for details: worker-result]"
+        return list(chunk), count_messages_tokens(chunk), text, 1, 1
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    try:
+        compressed = engine.compress(messages, force=True)
+        nodes = engine._dag.get_session_nodes(engine._session_id)
+
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == source_ids[:2]
+        assert engine._last_compression_status == "compacted"
+        assert compressed[-1] == messages[-1]
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "invalid_suffix",
+    [
+        "\n\n[Your active task list was preserved across context compression]",
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "arbitrary payload"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [x] 1. Verify the worker result (pending)"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [>] 1. Verify the worker result (pending)"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [ ] 1. Verify the worker result (in_progress)"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [ ] 1. Verify the worker result (pending)\n"
+            "trailing text"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [>] . Verify the worker result (in_progress)"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [>] 1.    (in_progress)"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [>] 1. Verify the worker result (in_progress)\n"
+        ),
+        (
+            "\n\n[Your active task list was preserved across context compression]\n"
+            "- [>] 1. Verify the worker result (in_progress)\n"
+            "arbitrary text after a valid task line"
+        ),
+    ],
+)
+def test_publication_lineage_rejects_malformed_hermes_task_list_suffix(
+    tmp_path: Path,
+    invalid_suffix: str,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "invalid-todo-suffix.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:invalid-todo-suffix",
+        conversation_id="conversation:invalid-todo-suffix",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable = {"role": "user", "content": "durable-prefix"}
+    engine._store.append(
+        engine._session_id,
+        durable,
+        conversation_id=engine._conversation_id,
+    )
+    active = dict(durable)
+    active["content"] += invalid_suffix
+    try:
+        assert engine._get_publication_store_id_map([active]) == {}
+    finally:
+        engine.shutdown()
+
+
+def test_publication_lineage_rejects_ambiguous_duplicate_task_list_prefix(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "ambiguous-todo-suffix.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:ambiguous-todo-suffix",
+        conversation_id="conversation:ambiguous-todo-suffix",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable = {"role": "user", "content": "duplicate-durable-prefix"}
+    engine._store.append_batch(
+        engine._session_id,
+        [durable, durable],
+        conversation_id=engine._conversation_id,
+    )
+    active = dict(durable)
+    active["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [ ] 1. Verify the worker result (pending)"
+    )
+    try:
+        assert engine._get_publication_store_id_map([active]) == {}
+    finally:
+        engine.shutdown()
+
+
+def test_publication_suffix_fallback_rejects_reordered_distinct_rows(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "reordered-todo-suffix.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:reordered-todo-suffix",
+        conversation_id="conversation:reordered-todo-suffix",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable_a = {"role": "user", "content": "durable-A"}
+    durable_b = {"role": "assistant", "content": "durable-B"}
+    ids = engine._store.append_batch(
+        engine._session_id,
+        [durable_a, durable_b],
+        conversation_id=engine._conversation_id,
+    )
+    suffix = (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify fallback ordering (in_progress)"
+    )
+    active_b = dict(durable_b)
+    active_a = dict(durable_a)
+    active_b["content"] += suffix
+    active_a["content"] += suffix
+    try:
+        mapped = engine._get_publication_store_id_map([active_b, active_a])
+
+        assert not (
+            mapped.get(id(active_b)) == ids[1]
+            and mapped.get(id(active_a)) == ids[0]
+        )
+        assert len(mapped) < 2
+    finally:
+        engine.shutdown()
+
+
+def test_publication_suffix_fallback_rejects_reorder_before_base_mapping(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "mixed-reordered-todo-suffix.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:mixed-reordered-todo-suffix",
+        conversation_id="conversation:mixed-reordered-todo-suffix",
+        platform="discord",
+        context_length=10_000,
+    )
+    durable_a = {"role": "user", "content": "durable-A"}
+    durable_b = {"role": "assistant", "content": "durable-B"}
+    ids = engine._store.append_batch(
+        engine._session_id,
+        [durable_a, durable_b],
+        conversation_id=engine._conversation_id,
+    )
+    active_b = dict(durable_b)
+    active_b["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify mixed fallback ordering (in_progress)"
+    )
+    active_a = dict(durable_a)
+    try:
+        mapped = engine._get_publication_store_id_map([active_b, active_a])
+
+        assert mapped.get(id(active_a)) == ids[0]
+        assert id(active_b) not in mapped
+        assert len(mapped) < 2
     finally:
         engine.shutdown()
 
