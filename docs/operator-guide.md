@@ -582,6 +582,84 @@ known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
 
 ## Import and backfill
 
+### Historical tool-output sidecars
+
+`scripts/backfill_externalized_tool_outputs.py` pre-creates Hermes-native
+externalized-payload sidecars for large textual tool rows already in an LCM
+database. It opens SQLite read-only and never rewrites messages or summaries.
+The default is a dry run:
+
+```bash
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --manifest ./externalization-backfill.json
+
+# Create only eligible sidecars after reviewing the scrubbed manifest.
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --manifest ./externalization-backfill.json \
+  --apply
+```
+
+Sidecar retention and redaction: before a historical tool result is written to
+the externalized-payload directory the command applies the currently enabled
+`LCM_SENSITIVE_PATTERNS` policy to its content, exactly as live ingest does, so no
+un-redacted secret is copied onto the new retention surface. Every manifest digest,
+ref, and provenance proof is derived from the redacted content that is actually
+stored. Each sidecar mirrors the live externalized-payload shape (kind, role,
+session id, tool-call id, and the redacted content) so recovery through
+`lcm_expand(externalized_ref=...)` keeps working. The manifest records the active
+redaction policy and refuses to resume a journal written under a different policy.
+
+The manifest is a durable ownership journal containing references, digests,
+provenance proofs, target-identity hashes, the redaction policy, counts, sizes, and
+token estimates, not raw payload content, session ids, or tool-call ids; the refs
+carry a `historical-backfill` marker rather than a tool-call stub. Reusing the same
+manifest path preserves every sidecar created by earlier apply runs. An interrupted apply
+can be rerun with the same path to recover its pending journal entries. The
+journal is bound to one database file and one externalized-payload storage root;
+the command refuses reuse or rollback against another target. Manifest files and
+sidecars are opened without following their final symlink and rollback rechecks
+file identity before deletion. A new manifest is published with a no-clobber
+link; an existing journal is updated with an atomic name exchange and restored
+if the displaced inode is not the validated manifest. A regular file or symlink
+that races into the manifest leaf is therefore preserved and the command fails
+closed. Existing-journal updates require atomic name-exchange support from the
+host OS and filesystem. Apply and rollback require the storage directory to be
+owned by the current user and not writable by group or other users. They also
+hold an advisory lock on the opened directory so concurrent invocations of this
+script cannot mutate it together.
+
+The command also refuses database schemas newer than this build before scanning
+rows or writing sidecars. Apply failures are recorded in `counts.failed` and
+`failed_paths` and cause a nonzero exit status. Rollback is dry-run by default
+and accepts only a complete, applied ownership journal for the historical-
+externalization operation; `--apply` deletes a sidecar only when its backfill
+provenance binds it to that journal, its content still matches the recorded
+digest, and no message content, nested `messages.tool_calls` value, or summary
+references it:
+
+```bash
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --rollback ./externalization-backfill.json
+```
+
+Stop the profile that owns the target database and every other process running
+as that account that can write the externalized-payload directory before an
+operator apply or rollback. The directory lock coordinates this script only;
+writers that ignore it are outside the supported integrity boundary. POSIX has
+no unlink-by-open-file-descriptor primitive, so rollback moves an owned sidecar
+to a random quarantine name, checks that inode again immediately before the
+name-based unlink, and fails closed with the quarantine entry retained if a
+replacement is detected. This quiescent, owner-controlled directory is the
+precondition that makes the final unlink safe.
+
+### OpenClaw/lossless-claw history
+
 `scripts/import_lossless_claw.py` is the local, dry-run-by-default operator path
 for moving OpenClaw history into a Hermes-LCM `lcm.db`. It supports two source
 families:

@@ -676,6 +676,12 @@ This is a local archive migration path. It does not make LCM a general memory
 provider, and it does not change the current-session retrieval contract for
 agent tools.
 
+For databases that already contain large historical tool rows,
+`scripts/backfill_externalized_tool_outputs.py` can pre-create native recovery
+sidecars without rewriting SQLite. It is dry-run by default, writes a scrubbed
+digest/count manifest, is idempotent on repeat apply, and supports guarded
+manifest-based rollback. See the [operator guide](docs/operator-guide.md#historical-tool-output-sidecars).
+
 ## Troubleshooting
 
 ### `hermes plugins` shows `lcm (not found)` but LCM tools exist
