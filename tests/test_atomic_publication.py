@@ -847,6 +847,98 @@ def test_cross_session_rollover_maps_more_than_one_thousand_lineage_rows(
         engine.shutdown()
 
 
+def test_sparse_rollover_gap_maps_between_exact_neighbors_in_large_conversation(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    """A small rollover gap must not depend on exhausting unrelated later rows."""
+
+    db_path = tmp_path / "rollover-sparse-gap.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=False,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-sparse-gap"
+    current_session_id = "session:current-sparse-gap"
+    old_session_id = "session:old-sparse-gap"
+    engine.on_session_start(
+        current_session_id,
+        conversation_id=conversation_id,
+        platform="discord",
+        context_length=10_000,
+    )
+    first = {"role": "user", "content": "exact-current-before-gap"}
+    carried = {"role": "assistant", "content": "carried-old-session-gap"}
+    following = {"role": "user", "content": "exact-current-after-gap"}
+    fresh = {"role": "assistant", "content": "fresh-tail-canary-sparse-gap"}
+    first_id = engine._store.append(
+        current_session_id,
+        first,
+        conversation_id=conversation_id,
+    )
+    carried_id = engine._store.append(
+        old_session_id,
+        carried,
+        conversation_id=conversation_id,
+    )
+    following_id = engine._store.append(
+        current_session_id,
+        following,
+        conversation_id=conversation_id,
+    )
+    fresh_id = engine._store.append(
+        current_session_id,
+        fresh,
+        conversation_id=conversation_id,
+    )
+    engine._store.append_batch(
+        old_session_id,
+        [
+            {"role": "assistant", "content": f"unrelated-later-row-{index}"}
+            for index in range(80)
+        ],
+        conversation_id=conversation_id,
+    )
+    active = [
+        {"role": "system", "content": "system-canary-sparse-gap"},
+        first,
+        carried,
+        following,
+        fresh,
+    ]
+    engine._remember_active_replay_messages(
+        active,
+        active,
+        [None, first_id, None, following_id, fresh_id],
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def summarize(chunk, focus_topic=None):
+        assert chunk == active[1:4]
+        text = "sparse gap retained\n[Expand for details: sparse-gap]"
+        return list(chunk), count_messages_tokens(chunk), text, 1, 1
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    try:
+        compressed = engine.compress(active, force=True)
+        nodes = engine._dag.get_session_nodes(current_session_id)
+
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [first_id, carried_id, following_id]
+        assert _frontier(db_path, conversation_id) == following_id
+        assert compressed[-1] == fresh
+        assert "LCM publication mapping incomplete" not in caplog.text
+    finally:
+        engine.shutdown()
+
+
 def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
     tmp_path: Path,
     monkeypatch,

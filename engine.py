@@ -4555,29 +4555,58 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             if id(message) not in mapped
             and id(message) not in exact_runtime_associations
         ]
-        # The scan is paginated beyond SQLite's historical 1000-row page, but
-        # remains bounded in direct proportion to the publication request. If
-        # the bounded snapshot cannot be exhausted, fail closed rather than
-        # guessing that an early duplicate is the intended carried row.
-        max_scan_rows = min(16_384, max(64, len(unmatched_messages) * 4))
-        snapshot_max_store_id = self._store.get_conversation_max_store_id(
+        unmatched_message_ids = {id(message) for message in unmatched_messages}
+        first_unmatched_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if id(message) in unmatched_message_ids
+            ),
+            0,
+        )
+        last_unmatched_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if id(messages[index]) in unmatched_message_ids
+            ),
+            len(messages) - 1,
+        )
+        scan_after_store_id = self._last_compacted_store_id
+        for message in messages[:first_unmatched_index]:
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                scan_after_store_id = int(existing_store_id)
+        scan_through_store_id = self._store.get_conversation_max_store_id(
             self._conversation_id
         )
+        for message in messages[last_unmatched_index + 1 :]:
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                scan_through_store_id = int(existing_store_id)
+                break
+        # The scan is paginated beyond SQLite's historical 1000-row page, but
+        # remains bounded in direct proportion to the publication request.
+        # Exact ordered neighbors narrow sparse rollover gaps so unrelated
+        # later rows cannot make a small provable gap look unbounded. If that
+        # bounded interval still cannot be exhausted, fail closed rather than
+        # guessing that an early duplicate is the intended carried row.
+        max_scan_rows = min(16_384, max(64, len(unmatched_messages) * 4))
         candidates: list[Dict[str, Any]] = []
-        next_after = self._last_compacted_store_id
+        next_after = scan_after_store_id
         page_size = min(512, max_scan_rows)
-        while next_after < snapshot_max_store_id and len(candidates) < max_scan_rows:
+        while next_after < scan_through_store_id and len(candidates) < max_scan_rows:
             page = self._store.get_conversation_messages_after(
                 self._conversation_id,
                 after_store_id=next_after,
-                through_store_id=snapshot_max_store_id,
+                through_store_id=scan_through_store_id,
                 limit=min(page_size, max_scan_rows - len(candidates)),
             )
             if not page:
                 break
             candidates.extend(page)
             next_after = int(page[-1]["store_id"])
-        if next_after < snapshot_max_store_id:
+        if next_after < scan_through_store_id:
             return mapped
 
         used = set(mapped.values())
