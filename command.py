@@ -1277,6 +1277,14 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
                 continue
             lifecycle_skipped += 1
 
+        conn.execute(
+            f"DELETE FROM lcm_prepared_summary_nodes WHERE session_id IN ({placeholders})",
+            params,
+        )
+        conn.execute(
+            f"DELETE FROM lcm_prepared_compactions WHERE session_id IN ({placeholders})",
+            params,
+        )
         msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
         node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
         lifecycle_deleted = 0

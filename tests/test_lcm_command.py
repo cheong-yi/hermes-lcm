@@ -1476,6 +1476,40 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     ))
     engine._lifecycle.bind_session("cron_20260414")
     engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=1)
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_compactions(
+            batch_id, conversation_id, session_id, state,
+            frontier_start_store_id, frontier_end_store_id,
+            fresh_tail_count, leaf_chunk_tokens,
+            policy_fingerprint, summary_route_fingerprint, coverage_key,
+            source_ids, validation_source_ids, source_identity_hashes,
+            ordered_lineage, expected_leaf_count, prepared_leaf_count,
+            attempt_count, created_at, updated_at
+        ) VALUES (
+            'cron-batch', 'cron-conversation', 'cron_20260414', 'ready',
+            0, 1, 2, 20,
+            'policy', 'route', 'cron-coverage',
+            '[1]', '[1]', '["hash"]',
+            '[[1,"hash"]]', 1, 1,
+            1, 1.0, 1.0
+        )
+        """
+    )
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_summary_nodes(
+            pending_id, batch_id, conversation_id, session_id, depth,
+            summary, token_count, source_token_count, source_ids,
+            previous_pending_ids, created_at, expand_hint
+        ) VALUES (
+            'cron-pending', 'cron-batch', 'cron-conversation',
+            'cron_20260414', 0, 'prepared cron summary',
+            5, 12, '[1]', '[]', 1.0, 'cron'
+        )
+        """
+    )
+    engine._store.connection.commit()
 
     result = handle_lcm_command("doctor clean apply", engine)
 
@@ -1488,6 +1522,18 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     assert engine._dag.get_session_nodes("cron_20260414") == []
     assert engine._lifecycle.get_by_conversation("cron_20260414") is None
     assert len(engine._store.get_range("normal_session")) == 1
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_compactions
+        WHERE session_id = 'cron_20260414'
+        """
+    ).fetchone()[0] == 0
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_summary_nodes
+        WHERE session_id = 'cron_20260414'
+        """
+    ).fetchone()[0] == 0
 
 
 def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
@@ -1541,6 +1587,26 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     ))
     engine._lifecycle.bind_session("cron_20260414")
     engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=store_id)
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_compactions(
+            batch_id, conversation_id, session_id, state,
+            frontier_start_store_id, frontier_end_store_id,
+            fresh_tail_count, leaf_chunk_tokens,
+            policy_fingerprint, summary_route_fingerprint, coverage_key,
+            source_ids, validation_source_ids, source_identity_hashes,
+            ordered_lineage, expected_leaf_count, prepared_leaf_count,
+            attempt_count, created_at, updated_at
+        ) VALUES (
+            'rollback-batch', 'rollback-conversation', 'cron_20260414', 'ready',
+            0, 1, 2, 20,
+            'policy', 'route', 'rollback-coverage',
+            '[1]', '[1]', '["hash"]',
+            '[[1,"hash"]]', 1, 1,
+            1, 1.0, 1.0
+        )
+        """
+    )
     engine._store._conn.execute(
         """
         CREATE TRIGGER fail_cron_node_delete
@@ -1564,6 +1630,12 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     assert len(engine._store.get_range("cron_20260414")) == 1
     assert len(engine._dag.get_session_nodes("cron_20260414")) == 1
     assert engine._lifecycle.get_by_conversation("cron_20260414") is not None
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_compactions
+        WHERE batch_id = 'rollback-batch'
+        """
+    ).fetchone()[0] == 1
 
 
 def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
