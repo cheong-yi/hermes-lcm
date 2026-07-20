@@ -701,6 +701,82 @@ def test_apply_import_uses_store_coordinated_write_transaction(
     assert admitted_paths == [target_db]
 
 
+def test_apply_summary_import_rolls_back_all_rows_on_late_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_lossless_summaries(source_db)
+    target_store = MessageStore(target_db)
+    target_store.close()
+    with sqlite3.connect(target_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE lcm_imported_messages (
+                import_id TEXT NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                source_conversation_id INTEGER NOT NULL,
+                source_session TEXT NOT NULL,
+                target_store_id INTEGER NOT NULL,
+                imported_at REAL NOT NULL,
+                PRIMARY KEY (import_id, source_message_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lcm_imported_messages(
+                import_id, source_message_id, source_conversation_id,
+                source_session, target_store_id, imported_at
+            ) VALUES ('legacy-import', 777, 1, 'legacy-session', 888, 1.0)
+            """
+        )
+    original_process_summaries = importer._process_summary_candidates
+
+    def fail_after_summary_writes(**kwargs):
+        original_process_summaries(**kwargs)
+        raise RuntimeError("forced late summary import failure")
+
+    monkeypatch.setattr(
+        importer,
+        "_process_summary_candidates",
+        fail_after_summary_writes,
+    )
+
+    with pytest.raises(RuntimeError, match="forced late summary import failure"):
+        importer.import_lossless_claw(
+            source_db=source_db,
+            target_db=target_db,
+            agent="sammy",
+            import_id="late-failure-import",
+            include_summaries=True,
+            apply=True,
+        )
+
+    with sqlite3.connect(target_db) as conn:
+        for table in ("messages", "summary_nodes", "lcm_imported_summaries"):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if exists:
+                assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(lcm_imported_messages)")
+        }
+        assert "source_message_key" not in columns
+        assert conn.execute(
+            """
+            SELECT import_id, source_message_id, target_store_id
+            FROM lcm_imported_messages
+            """
+        ).fetchall() == [("legacy-import", 777, 888)]
+
+
 def test_apply_backs_up_uri_reserved_target_db_path(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"

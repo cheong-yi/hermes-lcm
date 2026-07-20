@@ -710,7 +710,7 @@ def _ensure_import_table(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS summary_nodes (
             node_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -725,9 +725,13 @@ def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
             earliest_at REAL,
             latest_at REAL,
             expand_hint TEXT DEFAULT ''
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
-            ON summary_nodes(session_id, depth, created_at);
+            ON summary_nodes(session_id, depth, created_at)
         """
     )
     columns = _table_columns(conn, "summary_nodes")
