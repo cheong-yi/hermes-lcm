@@ -208,6 +208,53 @@ def test_preparing_claim_has_durable_bounded_lease_and_closed_state(tmp_path):
         engine.shutdown()
 
 
+def test_claim_reclaims_expired_preparing_batch_without_reinitializing_store(tmp_path):
+    engine = _engine(tmp_path / "expired-lease.db", 0)
+    engine._config.async_background_compaction_worker_enabled = False
+    messages = _messages("expired-lease")
+    try:
+        engine.ingest(messages)
+        first = engine.prepare_background_compaction_once(
+            messages,
+            leave_state="preparing",
+        )
+        first_row = engine._store.connection.execute(
+            """
+            SELECT attempt_token, attempt_count
+            FROM lcm_prepared_compactions WHERE batch_id = ?
+            """,
+            (first.batch_id,),
+        ).fetchone()
+        engine._store.connection.execute(
+            """
+            UPDATE lcm_prepared_compactions
+            SET lease_expires_at = ?, heartbeat_at = ?
+            WHERE batch_id = ?
+            """,
+            (time.time() - 1, time.time() - 2, first.batch_id),
+        )
+        engine._store.connection.commit()
+
+        reclaimed = engine.prepare_background_compaction_once(
+            messages,
+            leave_state="preparing",
+        )
+        reclaimed_row = engine._store.connection.execute(
+            """
+            SELECT attempt_token, attempt_count, lease_expires_at
+            FROM lcm_prepared_compactions WHERE batch_id = ?
+            """,
+            (first.batch_id,),
+        ).fetchone()
+
+        assert reclaimed.batch_id == first.batch_id
+        assert reclaimed_row[0] != first_row[0]
+        assert reclaimed_row[1] == first_row[1] + 1
+        assert reclaimed_row[2] > time.time()
+    finally:
+        engine.shutdown()
+
+
 def test_shutdown_cancels_inflight_preparation_before_storage_close(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()

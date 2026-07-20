@@ -268,8 +268,43 @@ class PreparedCompactionStore:
             ).fetchone()
             if existing is not None:
                 batch = _batch_from_row(existing)
-                if batch.state in {"preparing", "ready"}:
+                if batch.state == "ready":
                     return batch, None
+                if batch.state == "preparing":
+                    lease_expires_at = existing["lease_expires_at"]
+                    if (
+                        lease_expires_at is not None
+                        and float(lease_expires_at) > now
+                    ):
+                        return batch, None
+                    attempt_number = max(1, batch.attempt_count + 1)
+                    cursor = self._conn.execute(
+                        """
+                        UPDATE lcm_prepared_compactions
+                        SET attempt_count = ?, owner_id = ?, attempt_token = ?,
+                            lease_expires_at = ?, heartbeat_at = ?,
+                            next_retry_at = NULL, updated_at = ?
+                        WHERE batch_id = ? AND state = 'preparing'
+                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                        """,
+                        (
+                            attempt_number,
+                            self._owner_id,
+                            attempt_token,
+                            now + lease_seconds,
+                            now,
+                            now,
+                            batch.batch_id,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        return self.get_batch(batch.batch_id), None
+                    claimed = self._conn.execute(
+                        "SELECT * FROM lcm_prepared_compactions WHERE batch_id = ?",
+                        (batch.batch_id,),
+                    ).fetchone()
+                    return _batch_from_row(claimed), attempt_token
                 if batch.state == "pending":
                     attempt_number = max(1, batch.attempt_count + 1)
                     cursor = self._conn.execute(
