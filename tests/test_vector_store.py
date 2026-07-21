@@ -82,19 +82,17 @@ def _record_embedding(
 
 
 def test_core_migrations_omit_embedding_tables(tmp_path):
-    """A disabled install stays at schema_version 5 with no embedding tables.
+    """A disabled install stays at the core version with no embedding tables.
 
     Embedding tables are opt-in and never created by the core migration path,
-    so a base build can open the DB and the numeric counter stays free for the
-    temporal train (no v6 collision).
+    so enabling or disabling embeddings does not change the core schema stamp.
     """
     conn = sqlite3.connect(tmp_path / "core_only.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
         conn.commit()
 
-        assert db_bootstrap.SCHEMA_VERSION == 5
-        assert db_bootstrap.get_schema_version(conn) == 5
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
         assert not (EMBEDDING_TABLES & _table_names(conn))
         marker = conn.execute(
             "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
@@ -106,7 +104,7 @@ def test_core_migrations_omit_embedding_tables(tmp_path):
 
 
 def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path):
-    """VectorStore materializes the opt-in tables on first use, still at v5."""
+    """VectorStore materializes opt-in tables without changing core version."""
     db_path = tmp_path / "idempotent.db"
     first = VectorStore(db_path)
     first.close()
@@ -114,7 +112,10 @@ def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path)
     store = VectorStore(db_path)
     try:
         assert EMBEDDING_TABLES <= _table_names(store.connection)
-        assert db_bootstrap.get_schema_version(store.connection) == 5
+        assert (
+            db_bootstrap.get_schema_version(store.connection)
+            == db_bootstrap.SCHEMA_VERSION
+        )
         steps = store.connection.execute(
             "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
             (MIGRATION_STEP,),
@@ -136,11 +137,10 @@ def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path)
 def test_vector_store_upgrades_previous_schema_version(tmp_path):
     db_path = tmp_path / "previous.db"
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute(
-        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(db_bootstrap.SCHEMA_VERSION - 1),),
-    )
+    db_bootstrap.ensure_metadata_table(conn)
+    db_bootstrap.ensure_migration_state_table(conn)
+    db_bootstrap.ensure_lifecycle_state_table(conn)
+    db_bootstrap.set_schema_version(conn, db_bootstrap.SCHEMA_VERSION - 1)
     conn.commit()
     conn.close()
 
@@ -624,24 +624,26 @@ def test_large_id_metadata_resolve_scales_past_variable_limit(stores):
     now = 1.0
     vec = array("f", store._normalized([1.0, 0.0], expected_dim=2)).tobytes()
     identity = store._current_profile()["identity_hash"]
-    for node_id in range(1, 40_001):
-        conn.execute(
-            "INSERT INTO summary_nodes(node_id, session_id, depth, summary, "
-            "source_token_count, source_ids, source_type, created_at, "
-            "earliest_at, latest_at) VALUES (?, 'conversation-a', 0, 's', 1, "
-            "'[]', 'messages', ?, ?, ?)",
-            (node_id, now, now, now),
+    # VectorStore is intentionally autocommit for read freshness. Keep this
+    # large fixture in one transaction so setup does not perform 120k fsyncs.
+    with store._write_transaction():
+        for node_id in range(1, 40_001):
+            conn.execute(
+                "INSERT INTO summary_nodes(node_id, session_id, depth, summary, "
+                "source_token_count, source_ids, source_type, created_at, "
+                "earliest_at, latest_at) VALUES (?, 'conversation-a', 0, 's', 1, "
+                "'[]', 'messages', ?, ?, ?)",
+                (node_id, now, now, now),
+            )
+        conn.executemany(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
+            [(str(node_id), identity, vec) for node_id in range(1, 40_001)],
         )
-    conn.executemany(
-        "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
-        [(str(node_id), identity, vec) for node_id in range(1, 40_001)],
-    )
-    conn.executemany(
-        "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, "
-        "embedded_at, source_token_count, archived) VALUES (?, 'summary', ?, '2026', 1, 0)",
-        [(str(node_id), identity) for node_id in range(1, 40_001)],
-    )
-    conn.commit()
+        conn.executemany(
+            "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, "
+            "embedded_at, source_token_count, archived) VALUES (?, 'summary', ?, '2026', 1, 0)",
+            [(str(node_id), identity) for node_id in range(1, 40_001)],
+        )
     store._matrix_cache.clear()
 
     result = store.knn(

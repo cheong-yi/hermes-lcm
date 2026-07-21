@@ -25,6 +25,7 @@ from .db_bootstrap import (
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    ensure_summary_publication_columns,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -48,6 +49,7 @@ from .search_query import (
     sanitize_fts5_query,
     should_apply_directness_rank_adjustment,
 )
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
 
 
@@ -151,6 +153,7 @@ class SummaryNode:
     earliest_at: float | None = None
     latest_at: float | None = None
     expand_hint: str = ""  # "Expand for details about: ..."
+    coverage_key: str | None = None
     search_rank: float | None = None
     search_directness: float = 0.0
 
@@ -160,11 +163,22 @@ class SummaryDAG:
 
     DELETE_SESSION_SCOPE_TABLE = _DELETE_SESSION_SCOPE_TABLE
 
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        writer_coordinator: WriterCoordinator | None = None,
+    ):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.RLock()
+        self._writer_coordinator = writer_coordinator or get_writer_coordinator(self.db_path)
+        self._writer_owner_token = self._writer_coordinator.bind_owner()
         self._init_db()
+
+    @property
+    def writer_coordinator(self) -> WriterCoordinator:
+        return self._writer_coordinator
 
     @property
     def connection(self) -> Optional[sqlite3.Connection]:
@@ -181,9 +195,18 @@ class SummaryDAG:
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS summary_nodes (
+        configure_connection(
+            self._conn,
+            coordinator=self._writer_coordinator,
+            local_lock=self._db_lock,
+        )
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._db_lock,
+            begin_immediate=True,
+        ):
+            refuse_schema_version_too_new(self._conn)
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 depth INTEGER NOT NULL DEFAULT 0,
@@ -195,57 +218,89 @@ class SummaryDAG:
                 created_at REAL NOT NULL,
                 earliest_at REAL,
                 latest_at REAL,
-                expand_hint TEXT DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
-                ON summary_nodes(session_id, depth, created_at);
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_node
-                ON summary_nodes(session_id, node_id);
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node
-                ON summary_nodes(session_id, depth, node_id);
-
-            CREATE TABLE IF NOT EXISTS metadata (
+                expand_hint TEXT DEFAULT '',
+                coverage_key TEXT
+            )""")
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
+                   ON summary_nodes(session_id, depth, created_at)"""
+            )
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_nodes_session_node
+                   ON summary_nodes(session_id, node_id)"""
+            )
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node
+                   ON summary_nodes(session_id, depth, node_id)"""
+            )
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            );
-        """)
+            )""")
+            # A message-only v7 helper state is exact before this transaction.
+            # Complete the summary family's v6 contract before the nested
+            # migration admission re-check observes the now-full core.
+            ensure_summary_publication_columns(self._conn)
+            run_versioned_migrations(
+                self._conn,
+                coordinator=self._writer_coordinator,
+                local_lock=self._db_lock,
+            )
+            self._ensure_source_window_columns()
+            ensure_external_content_fts(
+                self._conn,
+                build_nodes_fts_spec(),
+                structural_only=True,
+                coordinator=self._writer_coordinator,
+                local_lock=self._db_lock,
+            )
+            refuse_schema_version_too_new(self._conn)
         ensure_external_content_fts(
             self._conn,
             build_nodes_fts_spec(),
+            coordinator=self._writer_coordinator,
+            local_lock=self._db_lock,
         )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_window_columns()
-        self._conn.commit()
 
     def _ensure_source_window_columns(self) -> None:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
         }
-        add_column_if_missing(
-            self._conn, columns, "earliest_at",
-            "ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL",
-        )
-        add_column_if_missing(
-            self._conn, columns, "latest_at",
-            "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_node "
-            "ON summary_nodes(session_id, node_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node "
-            "ON summary_nodes(session_id, depth, node_id)"
-        )
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._db_lock,
+            begin_immediate=True,
+        ):
+            add_column_if_missing(
+                self._conn, columns, "earliest_at",
+                "ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL",
+            )
+            add_column_if_missing(
+                self._conn, columns, "latest_at",
+                "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_session_node "
+                "ON summary_nodes(session_id, node_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node "
+                "ON summary_nodes(session_id, depth, node_id)"
+            )
 
     # -- Write --------------------------------------------------------------
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
-        with self._db_lock:
+        source_ids = json.dumps(node.source_ids)
+        created_at = node.created_at or time.time()
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._db_lock,
+        ):
             cur = self._conn.execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
@@ -257,15 +312,14 @@ class SummaryDAG:
                     node.summary,
                     node.token_count,
                     node.source_token_count,
-                    json.dumps(node.source_ids),
+                    source_ids,
                     node.source_type,
-                    node.created_at or time.time(),
+                    created_at,
                     node.earliest_at,
                     node.latest_at,
                     node.expand_hint,
                 ),
             )
-            self._conn.commit()
             node.node_id = cur.lastrowid
             return node.node_id
 
@@ -338,18 +392,16 @@ class SummaryDAG:
     ) -> int:
         deleted = 0
         while True:
-            with self._db_lock:
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    node_ids = self.delete_node_batch(
-                        self._conn,
-                        (session_id,),
-                        min_depth=min_depth,
-                    )
-                    self._conn.commit()
-                except Exception:
-                    self._conn.rollback()
-                    raise
+            with self._writer_coordinator.transaction(
+                self._conn,
+                local_lock=self._db_lock,
+                begin_immediate=True,
+            ):
+                node_ids = self.delete_node_batch(
+                    self._conn,
+                    (session_id,),
+                    min_depth=min_depth,
+                )
             if not node_ids:
                 return deleted
             deleted += len(node_ids)
@@ -393,13 +445,15 @@ class SummaryDAG:
         Used for /new carry-over where retained summaries should become part of
         the fresh session while preserving node IDs and node-to-node links.
         """
-        with self._db_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._db_lock,
+        ):
             cur = self._conn.execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
             moved = cur.rowcount
-            self._conn.commit()
         return moved
 
     # -- Read ---------------------------------------------------------------
@@ -821,18 +875,29 @@ class SummaryDAG:
             earliest_at=row[9],
             latest_at=row[10],
             expand_hint=row[11] or "",
-            search_rank=row[12] if len(row) > 12 else None,
+            coverage_key=row[12] if len(row) > 12 else None,
+            search_rank=row[13] if len(row) > 13 else None,
+        )
+
+    def commit(self) -> None:
+        """Commit pending writes under path and connection admission."""
+        self._writer_coordinator.flush(
+            self._conn,
+            local_lock=self._db_lock,
         )
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
-        if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        owner_token = getattr(self, "_writer_owner_token", None)
+        if owner_token is None:
+            return
+        self._writer_coordinator.close_owner(
+            owner_token,
+            conn,
+            local_lock=self._db_lock,
+        )
+        self._writer_owner_token = None
+        self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 import dataclasses
+from functools import wraps
 import json
 import math
 import os
@@ -17,13 +18,11 @@ from typing import Any
 import uuid
 
 from .db_bootstrap import (
-    check_external_content_fts_integrity,
-    external_content_fts_needs_repair,
+    _write_region,
     inspect_lcm_schema_health,
     join_background_integrity_scans,
     load_integrity_failed,
     remediate_interim_schema_stamp,
-    repair_external_content_fts,
 )
 from .diagnostics import (
     _has_lifecycle_fragmentation,
@@ -80,6 +79,17 @@ from .tokens import count_tokens
 from .vector_store import EmbeddingIdentity, EmbeddingPublishOutcome, VectorStore
 
 
+def _coordinated_connection_write(func):
+    """Keep legacy exact transaction semantics under path-scoped admission."""
+
+    @wraps(func)
+    def wrapper(conn: sqlite3.Connection, *args, **kwargs):
+        with _write_region(conn):
+            return func(conn, *args, **kwargs)
+
+    return wrapper
+
+
 _EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
 _EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
 _EMBEDDING_BACKFILL_BATCH_SIZE = 32
@@ -114,6 +124,7 @@ def _embedding_backfill_budget_s() -> float:
     return _env_float("LCM_EMBEDDING_BACKFILL_BUDGET_S", 0.0)
 
 
+@_coordinated_connection_write
 def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
     expected_columns = (
         ("embedded_id", "TEXT", 0, None, 1),
@@ -907,25 +918,18 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
         "messages_fts": build_message_fts_spec(),
         "nodes_fts": build_nodes_fts_spec(),
     }
-    conn = engine._store.connection
     for label, spec in specs.items():
         try:
-            structural_needs_repair = external_content_fts_needs_repair(conn, spec)
-            integrity_check = check_external_content_fts_integrity(conn, spec)
+            inspection = engine._store.inspect_fts(spec)
+            structural_needs_repair = inspection["structural_needs_repair"]
+            integrity_check = inspection["integrity"]
             integrity_status = str(integrity_check.get("status") or "fail")
             needs_repair = structural_needs_repair or integrity_status == "fail"
-            content_count = int(conn.execute(
-                f"SELECT COUNT(*) FROM {spec.content_table}"
-            ).fetchone()[0])
-            try:
-                fts_count = int(conn.execute(f"SELECT COUNT(*) FROM {spec.table_name}").fetchone()[0])
-            except sqlite3.Error:
-                fts_count = None
             checks[label] = {
                 "ok": not needs_repair,
                 "needs_repair": needs_repair,
-                "content_rows": content_count,
-                "fts_rows": fts_count,
+                "content_rows": inspection["content_rows"],
+                "fts_rows": inspection["fts_rows"],
                 "integrity_status": integrity_status,
                 "integrity_detail": integrity_check.get("detail"),
                 "error": None,
@@ -984,10 +988,9 @@ def _doctor_repair_apply_text(engine) -> str:
     # via a race (F3).
     join_background_integrity_scans()
 
-    conn = engine._store.connection
     try:
-        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
-        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+        messages_result = engine._store.repair_fts(build_message_fts_spec())
+        nodes_result = engine._store.repair_fts(build_nodes_fts_spec())
     except sqlite3.Error as exc:
         return "\n".join([
             "LCM doctor repair apply",
@@ -1304,8 +1307,9 @@ def _doctor_text(engine) -> str:
         return "ok" if status == "pass" else status
 
     try:
-        store_fts_count = int(store_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
-        store_fts_integrity = check_external_content_fts_integrity(store_conn, build_message_fts_spec())
+        store_fts_inspection = engine._store.inspect_fts(build_message_fts_spec())
+        store_fts_count = store_fts_inspection["fts_rows"]
+        store_fts_integrity = store_fts_inspection["integrity"]
         store_fts = _fts_text_status(store_fts_integrity)
         if store_fts == "fail":
             issues.append("messages_fts")
@@ -1318,8 +1322,9 @@ def _doctor_text(engine) -> str:
         issues.append("messages_fts")
 
     try:
-        node_fts_count = int(dag_conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0])
-        node_fts_integrity = check_external_content_fts_integrity(dag_conn, build_nodes_fts_spec())
+        node_fts_inspection = engine._store.inspect_fts(build_nodes_fts_spec())
+        node_fts_count = node_fts_inspection["fts_rows"]
+        node_fts_integrity = node_fts_inspection["integrity"]
         node_fts = _fts_text_status(node_fts_integrity)
         if node_fts == "fail":
             issues.append("nodes_fts")
@@ -1843,7 +1848,6 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     apply is destructive, so do the coordinated deletes on one connection to
     avoid half-cleaned state if a later table delete fails.
     """
-    conn = engine._store.connection
     # Protect the actively-bound session id, not current_session_id. While a
     # cron tick has rebound the engine, _session_id is the row the engine is
     # actively writing to via lifecycle hooks; deleting it during cleanup
@@ -1859,10 +1863,19 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
             "lifecycle_skipped": 0,
         }
 
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with engine._store.write_transaction() as conn:
         SummaryDAG.stage_delete_session_scope(conn, session_ids)
         scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
+        conn.execute(
+            f"DELETE FROM lcm_prepared_summary_nodes WHERE EXISTS ("
+            f"SELECT 1 FROM {scope_table} AS scope "
+            "WHERE scope.session_id = lcm_prepared_summary_nodes.session_id)"
+        )
+        conn.execute(
+            f"DELETE FROM lcm_prepared_compactions WHERE EXISTS ("
+            f"SELECT 1 FROM {scope_table} AS scope "
+            "WHERE scope.session_id = lcm_prepared_compactions.session_id)"
+        )
         # Capture the store_ids about to be deleted so their raw-history chunks
         # can be archived in this same transaction (chunks map to messages by
         # store_id; a deleted message's chunks must drop from ranking).
@@ -1952,10 +1965,6 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
             )
             lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
         lifecycle_skipped = scoped_count - lifecycle_deleted
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
 
     return {
         "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
@@ -2918,38 +2927,41 @@ class _BackfillLease:
         now = time.time() if now is None else float(now)
         if not force and (now - self._last_heartbeat) < self.heartbeat_s:
             return True
-        cur = self.conn.execute(
-            """
-            UPDATE metadata
-            SET value = ?
-            WHERE key = ?
-              AND json_extract(value, '$.owner') = ?
-              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
-            """,
-            (
-                self._value(now),
-                _EMBEDDING_BACKFILL_CLAIM_KEY,
-                self.lease_id,
-                self.generation,
-            ),
-        )
+        with _write_region(self.conn):
+            cur = self.conn.execute(
+                """
+                UPDATE metadata
+                SET value = ?
+                WHERE key = ?
+                  AND json_extract(value, '$.owner') = ?
+                  AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                """,
+                (
+                    self._value(now),
+                    _EMBEDDING_BACKFILL_CLAIM_KEY,
+                    self.lease_id,
+                    self.generation,
+                ),
+            )
         if not cur.rowcount:
             return False
         self._last_heartbeat = now
         return True
 
     def release(self) -> None:
-        self.conn.execute(
-            """
-            DELETE FROM metadata
-            WHERE key = ?
-              AND json_extract(value, '$.owner') = ?
-              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
-            """,
-            (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id, self.generation),
-        )
+        with _write_region(self.conn):
+            self.conn.execute(
+                """
+                DELETE FROM metadata
+                WHERE key = ?
+                  AND json_extract(value, '$.owner') = ?
+                  AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                """,
+                (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id, self.generation),
+            )
 
 
+@_coordinated_connection_write
 def _acquire_embedding_backfill_lease(
     conn: sqlite3.Connection,
     *,
@@ -2994,6 +3006,7 @@ def _acquire_embedding_backfill_lease(
         raise
 
 
+@_coordinated_connection_write
 def _prepare_inflight_for_lease(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3097,6 +3110,7 @@ def _prepare_inflight_for_lease(
         raise
 
 
+@_coordinated_connection_write
 def _mark_inflight(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3173,6 +3187,7 @@ def _mark_inflight(
         raise
 
 
+@_coordinated_connection_write
 def _mark_dispatched(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3229,6 +3244,7 @@ def _mark_dispatched(
         raise
 
 
+@_coordinated_connection_write
 def _owned_inflight_transition(
     conn: sqlite3.Connection,
     identity_hash: str,

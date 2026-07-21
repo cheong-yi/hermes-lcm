@@ -99,6 +99,23 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _parse_bool_env_with_source(
+    key: str,
+    default: bool,
+    *,
+    default_source: str = "default",
+) -> tuple[bool, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, f"env:{key}", None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, f"env:{key}", None
+    return default, default_source, f"invalid env {key}={raw!r} ignored"
+
+
 def _parse_str_env(key: str, default):
     return os.environ.get(key, default)
 
@@ -199,7 +216,13 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {
+    "context_threshold",
+    "async_background_compaction_enabled",
+    "async_background_compaction_worker_enabled",
+    "async_background_compaction_max_batches",
+    "async_background_compaction_retry_backoff_seconds",
+}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -380,6 +403,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_aggregate_max_tokens", "LCM_ROLLUP_AGGREGATE_MAX_TOKENS", int),
     _EnvFieldSpec("rollup_builds_per_pass", "LCM_ROLLUP_BUILDS_PER_PASS", int),
     _EnvFieldSpec("rollup_maintenance_budget_ms", "LCM_ROLLUP_MAINTENANCE_BUDGET_MS", int),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
+    _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
 )
 
 _PARSER_BY_TYPE = {
@@ -400,6 +427,10 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
+    "async_background_compaction_enabled",
+    "async_background_compaction_worker_enabled",
+    "async_background_compaction_max_batches",
+    "async_background_compaction_retry_backoff_seconds",
 })
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
@@ -550,6 +581,14 @@ class LCMConfig:
     summary_timeout_ms: int = 60_000
     expansion_timeout_ms: int = 120_000
 
+    # -- Opt-in background leaf preparation ---
+    # Both flags default off.  The first exposes manual one-shot preparation;
+    # the second permits the process-wide scheduler to enqueue it after ingest.
+    async_background_compaction_enabled: bool = False
+    async_background_compaction_worker_enabled: bool = False
+    async_background_compaction_max_batches: int = 2
+    async_background_compaction_retry_backoff_seconds: float = 300.0
+
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
@@ -688,7 +727,44 @@ class LCMConfig:
             if warning:
                 config_source_warnings.append(warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        yaml_config = _load_hermes_config_yaml()
+        yaml_lcm = yaml_config.get("lcm") if isinstance(yaml_config, dict) else None
+        if isinstance(yaml_lcm, dict):
+            for field_name, field_type in (
+                ("async_background_compaction_enabled", bool),
+                ("async_background_compaction_worker_enabled", bool),
+                ("async_background_compaction_max_batches", int),
+                ("async_background_compaction_retry_backoff_seconds", float),
+            ):
+                if field_name not in yaml_lcm:
+                    continue
+                raw_value = yaml_lcm[field_name]
+                try:
+                    if field_type is bool:
+                        if isinstance(raw_value, bool):
+                            parsed_value = raw_value
+                        elif isinstance(raw_value, str):
+                            normalized = raw_value.strip().lower()
+                            if normalized in {"1", "true", "yes", "on"}:
+                                parsed_value = True
+                            elif normalized in {"0", "false", "no", "off"}:
+                                parsed_value = False
+                            else:
+                                raise ValueError("invalid boolean")
+                        elif raw_value in {0, 1}:
+                            parsed_value = bool(raw_value)
+                        else:
+                            raise ValueError("invalid boolean")
+                    else:
+                        parsed_value = field_type(raw_value)
+                    setattr(c, field_name, parsed_value)
+                    config_sources[field_name] = f"config_yaml:lcm.{field_name}"
+                except (TypeError, ValueError):
+                    config_source_warnings.append(
+                        f"invalid config.yaml lcm.{field_name}={raw_value!r} ignored"
+                    )
+
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(yaml_config)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
@@ -740,6 +816,35 @@ class LCMConfig:
             default_source=summary_timeout_source,
         )
         _record("summary_timeout_ms", source, warning)
+        for field_name, env_key, parser in (
+            (
+                "async_background_compaction_enabled",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED",
+                _parse_bool_env_with_source,
+            ),
+            (
+                "async_background_compaction_worker_enabled",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED",
+                _parse_bool_env_with_source,
+            ),
+            (
+                "async_background_compaction_max_batches",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES",
+                _parse_int_env_with_source,
+            ),
+            (
+                "async_background_compaction_retry_backoff_seconds",
+                "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS",
+                _parse_float_env_with_source,
+            ),
+        ):
+            value, source, warning = parser(
+                env_key,
+                getattr(c, field_name),
+                default_source=config_sources.get(field_name, "default"),
+            )
+            setattr(c, field_name, value)
+            _record(field_name, source, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:

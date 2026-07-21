@@ -9,6 +9,7 @@ import pytest
 import hermes_lcm.command as command_mod
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.store import MessageStore
 from hermes_lcm.vector_store import VectorStore
 
 
@@ -49,19 +50,11 @@ def _engine(tmp_path, *, enabled: bool = True):
 
 
 def _seed_messages(engine, rows, *, register: bool = True):
+    # Seed through the real message-store bootstrap so backfill tests exercise a
+    # supported schema shape rather than a hand-built partial v7 core table.
+    message_store = MessageStore(engine._store.db_path)
+    message_store.close()
     conn = sqlite3.connect(engine._store.db_path)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            store_id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            source TEXT DEFAULT '',
-            role TEXT NOT NULL,
-            content TEXT,
-            timestamp REAL NOT NULL
-        )
-        """
-    )
     conn.executemany(
         "INSERT INTO messages(store_id, session_id, source, role, content, timestamp) "
         "VALUES(?, ?, ?, ?, ?, ?)",

@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -126,6 +127,13 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
+from .sqlite_writer import get_writer_coordinator
+from .publication import AtomicPublicationStore
+from .prepared_compaction import (
+    BackgroundCompactionMixin,
+    PreparedCompactionStore,
+    get_background_compaction_scheduler,
+)
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -146,7 +154,7 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -168,6 +176,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_compaction_storage_lock = threading.RLock()
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
@@ -230,7 +239,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "action": "none",
             "reason": "not run",
         }
-
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
         self.base_url = ""
@@ -339,6 +347,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        # Exact durable provenance aligned with the cached active replay.  The
+        # values come only from MessageStore insert return values; they are not
+        # inferred from message content.  This lets the current runtime publish
+        # rows whose replay identity is intentionally transformed (notably
+        # Hermes persisted-output markers) without weakening restart/rollover
+        # ambiguity checks.
+        self._last_active_replay_store_ids: list[Optional[int]] = []
+        # Strong-reference associations prevent Python object-id reuse from
+        # rebinding a new message to an old durable row. Each association also
+        # records the raw active payload identity so in-place dict mutation
+        # invalidates the provenance instead of silently publishing the wrong
+        # source.
+        self._current_active_replay_store_associations_by_message_id: dict[
+            int, tuple[Dict[str, Any], tuple[str, str, str, str], int]
+        ] = {}
+        # Exact process-local replay identity for the most recent snapshot that
+        # completed ingest. Hermes can call on_session_end() with that original
+        # pre-compaction list after compress() has shortened the active cursor;
+        # retaining the full ordered identity makes that lifecycle flush
+        # idempotent without guessing from a partial content prefix.
+        self._last_fully_ingested_snapshot_session_id = ""
+        self._last_fully_ingested_snapshot_conversation_id = ""
+        self._last_fully_ingested_snapshot_signature: tuple[int, str] = (0, "")
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -376,6 +407,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        self._async_compaction_publish_failure_hook = ""
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -447,28 +479,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        writer_coordinator = get_writer_coordinator(db_path)
         self._store = MessageStore(
             db_path,
             ingest_protection_config=self._config,
             hermes_home=hermes_home,
+            writer_coordinator=writer_coordinator,
         )
-        self._dag = SummaryDAG(db_path)
+        self._dag = SummaryDAG(db_path, writer_coordinator=writer_coordinator)
         if self._config.temporal_rollups_enabled:
             # Install the transaction-coupled summary mutation triggers before
             # this engine can publish or delete a DAG node.
             initialize_rollup_invalidation_outbox(self._dag)
-        self._lifecycle = LifecycleStateStore(db_path)
+        self._lifecycle = LifecycleStateStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
+        self._prepared_compactions = PreparedCompactionStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
+        self._publication = AtomicPublicationStore(
+            db_path,
+            writer_coordinator=writer_coordinator,
+        )
+        self._background_compaction_scheduler = get_background_compaction_scheduler(db_path)
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        self._cancel_background_compaction()
+        # Close the lazy publisher first so a helper with an initialized
+        # connection remains as the final owner and can perform the shared
+        # graceful checkpoint even when no publication ever opened its DB.
+        with self._background_compaction_storage_lock:
+            for attr in ("_publication", "_prepared_compactions", "_store", "_dag", "_lifecycle"):
+                helper = getattr(self, attr, None)
+                close = getattr(helper, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
@@ -531,6 +582,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
+            self._cancel_background_compaction()
+            with self._background_compaction_storage_lock:
+                self._prepared_compactions.release_owned_preparations()
             self._hermes_home = hermes_home
             store = getattr(self, "_store", None)
             if store is not None:
@@ -1234,6 +1288,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._ingest_messages(messages)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                if self._config.async_background_compaction_worker_enabled:
+                    self.schedule_background_compaction(messages)
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
@@ -1298,6 +1354,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             serialized = self._serialize_messages(attempt_chunk)
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
+
+            capture_callback = getattr(
+                self._thread_context,
+                "leaf_publication_capture_callback",
+                None,
+            )
+            if capture_callback is None:
+                capture_callback = getattr(
+                    self,
+                    "_leaf_publication_capture_callback",
+                    None,
+                )
+            if callable(capture_callback):
+                capture_callback(attempt_chunk)
 
             try:
                 timeout_seconds = self._config.summary_timeout_ms / 1000
@@ -2141,6 +2211,58 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self._session_id
         self._lcm_current_start_allows_bypass_lineage = False
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
+        same_id_compression_continuation = bool(
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id == session_id
+            and previous_session_id == session_id
+            and not self._session_ignored
+            and not self._session_stateless
+            and (
+                not requested_conversation_id
+                or not self._conversation_id
+                or requested_conversation_id == self._conversation_id
+            )
+        )
+        if same_id_compression_continuation:
+            preserved_cursor = self._ingest_cursor
+            preserved_frontier = self._last_compacted_store_id
+            preserved_conversation_id = self._conversation_id
+            self._clear_thread_context_stateless()
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=(
+                    requested_conversation_id
+                    or preserved_conversation_id
+                    or None
+                ),
+            )
+            if preserved_frontier > 0:
+                state = self._lifecycle.advance_frontier(
+                    self._conversation_id,
+                    session_id,
+                    preserved_frontier,
+                )
+                if state is not None:
+                    self._last_compacted_store_id = max(
+                        preserved_frontier,
+                        int(state.current_frontier_store_id or 0),
+                    )
+            self._ingest_cursor = preserved_cursor
+            self._ingest_cursor_needs_reconcile = False
+            self._clear_pending_reset_boundary()
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._log_session_filter_diagnostics()
+            logger.debug(
+                "LCM same-id compression continuation preserved session=%s "
+                "cursor=%d frontier=%d",
+                session_id,
+                preserved_cursor,
+                self._last_compacted_store_id,
+            )
+            return
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
         pre_reset_preserve_ambiguous_no_frame_old_session = False
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
@@ -3027,7 +3149,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    if self._matches_last_fully_ingested_snapshot(
+                        session_id,
+                        messages,
+                    ):
+                        logger.debug(
+                            "LCM session-end ingest already durable: session=%s messages=%d",
+                            session_id,
+                            len(messages),
+                        )
+                    else:
+                        self._ingest_messages(messages)
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -3426,6 +3558,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
         status["ingest_protection"] = sensitive_pattern_status(self._config)
+        status["async_compaction"] = self.get_async_compaction_status()
         try:
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
@@ -3750,6 +3883,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         original_messages: List[Dict[str, Any]],
         active_replay_messages: List[Dict[str, Any]],
+        store_ids: Optional[List[Optional[int]]] = None,
     ) -> List[Dict[str, Any]]:
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
@@ -3757,6 +3891,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
+        aligned_store_ids = list(store_ids or [])
+        if len(aligned_store_ids) != len(active_replay_messages):
+            aligned_store_ids = [None] * len(active_replay_messages)
+        self._last_active_replay_store_ids = aligned_store_ids
+        self._current_active_replay_store_associations_by_message_id = {
+            id(message): (
+                message,
+                self._raw_externalized_placeholder_replay_identity(message),
+                int(store_id),
+            )
+            for message, store_id in zip(active_replay_messages, aligned_store_ids)
+            if store_id is not None
+        }
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
         )
@@ -3764,6 +3911,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
         )
         return active_replay_messages
+
+    def _remember_fully_ingested_snapshot(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        self._last_fully_ingested_snapshot_session_id = self._session_id
+        self._last_fully_ingested_snapshot_conversation_id = self._conversation_id
+        self._last_fully_ingested_snapshot_signature = (
+            self._fully_ingested_snapshot_signature(messages)
+        )
+
+    def _fully_ingested_snapshot_signature(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        for message in messages:
+            digest.update(self._lcm_bypass_message_fingerprint(message).encode("ascii"))
+        return len(messages), digest.hexdigest()
+
+    def _matches_last_fully_ingested_snapshot(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        if (
+            not session_id
+            or session_id != self._session_id
+            or session_id != self._last_fully_ingested_snapshot_session_id
+            or self._conversation_id
+            != self._last_fully_ingested_snapshot_conversation_id
+        ):
+            return False
+        return (
+            self._fully_ingested_snapshot_signature(messages)
+            == self._last_fully_ingested_snapshot_signature
+        )
 
     def _cached_active_replay_messages(
         self,
@@ -3773,7 +3957,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                copied = self._copy_active_replay_messages_preserving_generated_ids(cached)
+                cached_store_ids = getattr(self, "_last_active_replay_store_ids", [])
+                self._current_active_replay_store_associations_by_message_id = {
+                    id(message): (
+                        message,
+                        self._raw_externalized_placeholder_replay_identity(message),
+                        int(store_id),
+                    )
+                    for message, store_id in zip(copied, cached_store_ids)
+                    if store_id is not None
+                }
+                return copied
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -3990,6 +4185,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return self._redact_active_replay_messages(messages)
 
+        ambiguous_reconciliation_warning_pending = False
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
@@ -4048,7 +4244,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            ambiguous_reconciliation_warning_pending = (
+                self._last_ingest_reconciliation.get("reason")
+                == "persisted ambiguous delta"
+            )
         cursor = min(max(self._ingest_cursor, 0), n)
+        active_replay_store_ids: list[Optional[int]] = [None] * n
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4062,6 +4263,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     self._message_replay_identity(message) for message in messages[:cursor]
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
+                    cached_store_ids = getattr(
+                        self, "_last_active_replay_store_ids", []
+                    )
+                    if len(cached_store_ids) >= cursor:
+                        active_replay_store_ids[:cursor] = cached_store_ids[:cursor]
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
                             cached_active_replay_messages[:cursor]
@@ -4083,9 +4289,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._remember_fully_ingested_snapshot(messages)
             if cached_replay is not None:
                 return cached_replay
-            return self._remember_active_replay_messages(messages, replay_messages)
+            return self._remember_active_replay_messages(
+                messages,
+                replay_messages,
+                active_replay_store_ids,
+            )
 
         active_replay_messages = replay_messages
         compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
@@ -4314,7 +4525,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            self._remember_fully_ingested_snapshot(messages)
+            return self._remember_active_replay_messages(
+                messages,
+                active_replay_messages,
+                active_replay_store_ids,
+            )
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -4352,7 +4568,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        inserted_store_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
@@ -4364,6 +4580,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # raw ingest: marking a period stale before its covering summary exists
         # would let a rebuild publish 'ready' from old sources and omit the leaf
         # (maintainer #388 P1).
+        if ambiguous_reconciliation_warning_pending:
+            try:
+                durable_rows = self._store.get_session_count(self._session_id)
+            except Exception:
+                durable_rows = -1
+            logger.warning(
+                "LCM persisted ambiguous ingest delta: session=%s conversation=%s "
+                "incoming=%d cursor_before=%d inserted=%d store_id_min=%s "
+                "store_id_max=%s durable_rows=%d",
+                self._session_id,
+                self._conversation_id,
+                n,
+                cursor,
+                len(inserted_store_ids),
+                min(inserted_store_ids) if inserted_store_ids else "none",
+                max(inserted_store_ids) if inserted_store_ids else "none",
+                durable_rows,
+            )
+        for (absolute_idx, _message), store_id in zip(
+            messages_to_store_with_index,
+            inserted_store_ids,
+        ):
+            active_replay_store_ids[absolute_idx] = int(store_id)
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4371,11 +4610,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+        self._remember_fully_ingested_snapshot(messages)
         # Most ``protected_messages`` changes are storage-only: inline media and
-        # data/base64 substrings stay provider-usable in active replay. The
-        # exceptions are whole-message ``raw_payload`` externalization and the
-        # separately opt-in textual tool-result interceptor above.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        # data/base64 substrings stay provider-usable in active replay. Whole-message
+        # ``raw_payload`` externalization and the separately opt-in textual
+        # tool-result interceptor intentionally return compact active stubs.
+        return self._remember_active_replay_messages(
+            messages,
+            active_replay_messages,
+            active_replay_store_ids,
+        )
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
@@ -4387,6 +4631,354 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
         return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
+
+    @staticmethod
+    def _publication_identity_without_preserved_todo_suffix(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        """Ignore only Hermes' exact trailing task-list continuity block.
+
+        Hermes can append this synthetic block to an already-ingested message
+        while preserving task state across host compression. Publication still
+        needs to bind the unchanged durable prefix to its original row, but all
+        other role/content/tool identity remains exact.
+        """
+
+        role, content, third, fourth = identity
+        marker = f"\n\n{_PRESERVED_TODO_CONTEXT_PREFIX}"
+        marker_index = content.rfind(marker)
+        if marker_index < 0:
+            return identity
+        task_block = content[marker_index + 2 :]
+        task_block_prefix = f"{_PRESERVED_TODO_CONTEXT_PREFIX}\n"
+        if not task_block.startswith(task_block_prefix):
+            return identity
+        task_records = task_block[len(task_block_prefix) :]
+        if not task_records or "\r" in task_records:
+            return identity
+        record_headers = list(
+            re.finditer(
+                r"(?m)^- \[(>| )\] ([^\r\n]+?)\. ",
+                task_records,
+            )
+        )
+        if not record_headers or record_headers[0].start() != 0:
+            return identity
+        for index, header in enumerate(record_headers):
+            marker_state, item_id = header.groups()
+            if not item_id or item_id != item_id.strip():
+                return identity
+            record_end = (
+                record_headers[index + 1].start()
+                if index + 1 < len(record_headers)
+                else len(task_records)
+            )
+            record_body = task_records[header.end() : record_end]
+            if index + 1 < len(record_headers):
+                if not record_body.endswith("\n"):
+                    return identity
+                record_body = record_body[:-1]
+            expected_status = (
+                "in_progress"
+                if marker_state == ">"
+                else "pending"
+            )
+            status_suffix = f" ({expected_status})"
+            if not record_body.endswith(status_suffix):
+                return identity
+            item_content = record_body[: -len(status_suffix)]
+            if not item_content or item_content != item_content.strip():
+                return identity
+        return role, content[:marker_index], third, fourth
+
+    def _get_publication_store_id_map(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[int, int]:
+        """Resolve current rows plus bounded same-conversation rollover rows.
+
+        The normal mapper intentionally scans only the current session. During
+        a compression rollover, however, fresh raw tail messages can remain in
+        the old session while their active context and DAG nodes move to the
+        new one. Publication still needs exact durable row identity for those
+        carried messages, so unmatched objects get one ordered, read-only scan
+        of the same conversation after the current frontier.
+        """
+
+        mapped = self._get_store_id_map_for_messages(messages)
+        if len(mapped) == len(messages) or not self._conversation_id:
+            return mapped
+
+        exact_runtime_associations = getattr(
+            self,
+            "_current_active_replay_store_associations_by_message_id",
+            {},
+        )
+        exact_suffix_candidates: dict[int, int] = {}
+        exact_suffix_store_ids: set[int] = set()
+        for message in messages:
+            if id(message) in mapped:
+                continue
+            exact_association = exact_runtime_associations.get(id(message))
+            if exact_association is None:
+                continue
+            associated_message, associated_identity, exact_store_id = exact_association
+            current_raw_identity = self._raw_externalized_placeholder_replay_identity(message)
+            stripped_raw_identity = self._publication_identity_without_preserved_todo_suffix(
+                current_raw_identity
+            )
+            if (
+                associated_message is not message
+                or stripped_raw_identity == current_raw_identity
+                or stripped_raw_identity != associated_identity
+            ):
+                continue
+            exact_store_id = int(exact_store_id)
+            if (
+                exact_store_id <= self._last_compacted_store_id
+                or exact_store_id in mapped.values()
+                or exact_store_id in exact_suffix_store_ids
+            ):
+                continue
+            durable_row = self._store.get(exact_store_id)
+            if (
+                durable_row is None
+                or str(durable_row.get("conversation_id") or "") != self._conversation_id
+            ):
+                continue
+            stripped_replay_identity = self._publication_identity_without_preserved_todo_suffix(
+                self._message_replay_identity(message)
+            )
+            if self._message_replay_identity(
+                durable_row,
+                stored_row=True,
+            ) != stripped_replay_identity:
+                continue
+            exact_suffix_candidates[id(message)] = exact_store_id
+            exact_suffix_store_ids.add(exact_store_id)
+
+        # Proven suffix associations still obey the same monotonic source-row
+        # order as all other publication mapping. Respect both already-mapped
+        # neighbors and earlier accepted exact suffix associations.
+        next_mapped_store_id: list[int | None] = [None] * len(messages)
+        next_store_id: int | None = None
+        for index in range(len(messages) - 1, -1, -1):
+            next_mapped_store_id[index] = next_store_id
+            existing_store_id = mapped.get(id(messages[index]))
+            if existing_store_id is not None:
+                next_store_id = int(existing_store_id)
+        previous_store_id = self._last_compacted_store_id
+        for index, message in enumerate(messages):
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                previous_store_id = int(existing_store_id)
+                continue
+            exact_store_id = exact_suffix_candidates.get(id(message))
+            if exact_store_id is None or exact_store_id <= previous_store_id:
+                continue
+            following_store_id = next_mapped_store_id[index]
+            if following_store_id is not None and exact_store_id >= following_store_id:
+                continue
+            mapped[id(message)] = exact_store_id
+            previous_store_id = exact_store_id
+
+        if len(mapped) == len(messages):
+            return mapped
+
+        unmatched_messages = [
+            message
+            for message in messages
+            if id(message) not in mapped
+            and id(message) not in exact_runtime_associations
+        ]
+        unmatched_message_ids = {id(message) for message in unmatched_messages}
+        first_unmatched_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if id(message) in unmatched_message_ids
+            ),
+            0,
+        )
+        last_unmatched_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if id(messages[index]) in unmatched_message_ids
+            ),
+            len(messages) - 1,
+        )
+        scan_after_store_id = self._last_compacted_store_id
+        for message in messages[:first_unmatched_index]:
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                scan_after_store_id = int(existing_store_id)
+        scan_through_store_id = self._store.get_conversation_max_store_id(
+            self._conversation_id
+        )
+        for message in messages[last_unmatched_index + 1 :]:
+            existing_store_id = mapped.get(id(message))
+            if existing_store_id is not None:
+                scan_through_store_id = int(existing_store_id)
+                break
+        # The scan is paginated beyond SQLite's historical 1000-row page, but
+        # remains bounded in direct proportion to the publication request.
+        # Exact ordered neighbors narrow sparse rollover gaps so unrelated
+        # later rows cannot make a small provable gap look unbounded. If that
+        # bounded interval still cannot be exhausted, fail closed rather than
+        # guessing that an early duplicate is the intended carried row.
+        max_scan_rows = min(16_384, max(64, len(unmatched_messages) * 4))
+        candidates: list[Dict[str, Any]] = []
+        next_after = scan_after_store_id
+        page_size = min(512, max_scan_rows)
+        while next_after < scan_through_store_id and len(candidates) < max_scan_rows:
+            page = self._store.get_conversation_messages_after(
+                self._conversation_id,
+                after_store_id=next_after,
+                through_store_id=scan_through_store_id,
+                limit=min(page_size, max_scan_rows - len(candidates)),
+            )
+            if not page:
+                break
+            candidates.extend(page)
+            next_after = int(page[-1]["store_id"])
+        if next_after < scan_through_store_id:
+            return mapped
+
+        used = set(mapped.values())
+        candidate_identities_by_store_id = {
+            int(candidate["store_id"]): self._message_replay_identity(
+                candidate,
+                stored_row=True,
+            )
+            for candidate in candidates
+        }
+        candidates_by_identity: defaultdict[tuple[str, str, str, str], deque[int]] = (
+            defaultdict(deque)
+        )
+        for candidate in candidates:
+            store_id = int(candidate["store_id"])
+            if store_id not in used:
+                candidates_by_identity[
+                    candidate_identities_by_store_id[store_id]
+                ].append(store_id)
+        unmatched_counts: defaultdict[tuple[str, str, str, str], int] = defaultdict(int)
+        for message in unmatched_messages:
+            unmatched_counts[self._message_replay_identity(message)] += 1
+        for identity, count in unmatched_counts.items():
+            if len(candidates_by_identity.get(identity, ())) != count:
+                # Missing and surplus candidates are both unsafe: the latter
+                # is ambiguous when identical carried rows exist.
+                candidates_by_identity.pop(identity, None)
+
+        for message in unmatched_messages:
+            if id(message) in mapped:
+                continue
+            identity = self._message_replay_identity(message)
+            matching_ids = candidates_by_identity.get(identity)
+            if matching_ids:
+                mapped[id(message)] = matching_ids.popleft()
+
+        used = set(mapped.values())
+        compatibility_candidates: defaultdict[
+            tuple[str, str, str, str],
+            deque[int],
+        ] = defaultdict(deque)
+        for candidate in candidates:
+            store_id = int(candidate["store_id"])
+            if store_id in used:
+                continue
+            compatibility_candidates[
+                candidate_identities_by_store_id[store_id]
+            ].append(store_id)
+        compatibility_counts: defaultdict[
+            tuple[str, str, str, str],
+            int,
+        ] = defaultdict(int)
+        compatibility_messages: list[
+            tuple[Dict[str, Any], tuple[str, str, str, str]]
+        ] = []
+        for message in messages:
+            if (
+                id(message) in mapped
+                or id(message) in exact_runtime_associations
+            ):
+                continue
+            identity = self._message_replay_identity(message)
+            stripped_identity = self._publication_identity_without_preserved_todo_suffix(
+                identity
+            )
+            if stripped_identity == identity:
+                continue
+            compatibility_messages.append((message, stripped_identity))
+            compatibility_counts[stripped_identity] += 1
+        for identity, count in compatibility_counts.items():
+            if len(compatibility_candidates.get(identity, ())) != count:
+                # Without exact runtime provenance, duplicate durable prefixes
+                # are ambiguous and must remain unmapped.
+                compatibility_candidates.pop(identity, None)
+        compatibility_mapped_message_ids: set[int] = set()
+        for message, stripped_identity in compatibility_messages:
+            matching_ids = compatibility_candidates.get(stripped_identity)
+            if matching_ids:
+                mapped[id(message)] = matching_ids.popleft()
+                compatibility_mapped_message_ids.add(id(message))
+
+        ordered_mappings: list[tuple[int, int, bool]] = []
+        for message in messages:
+            message_id = id(message)
+            store_id = mapped.get(message_id)
+            if store_id is None:
+                continue
+            store_id = int(store_id)
+            is_compatibility_mapping = (
+                message_id in compatibility_mapped_message_ids
+            )
+            while (
+                ordered_mappings
+                and store_id <= ordered_mappings[-1][1]
+                and ordered_mappings[-1][2]
+            ):
+                mapped.pop(ordered_mappings[-1][0], None)
+                ordered_mappings.pop()
+            previous_store_id = (
+                ordered_mappings[-1][1]
+                if ordered_mappings
+                else self._last_compacted_store_id
+            )
+            if store_id <= previous_store_id:
+                if is_compatibility_mapping:
+                    mapped.pop(message_id, None)
+                continue
+            ordered_mappings.append(
+                (message_id, store_id, is_compatibility_mapping)
+            )
+
+        final_store_ids = [
+            int(mapped[id(message)])
+            for message in messages
+            if id(message) in mapped
+        ]
+        if any(
+            current_store_id <= previous_store_id
+            for previous_store_id, current_store_id in zip(
+                [self._last_compacted_store_id, *final_store_ids],
+                final_store_ids,
+            )
+        ):
+            # Base mappings are authoritative. If they are unexpectedly
+            # non-monotonic, discard every optional compatibility addition so
+            # this method cannot report a complete reordered lineage.
+            for message_id in compatibility_mapped_message_ids:
+                mapped.pop(message_id, None)
+        return mapped
+
+    def _get_publication_store_ids_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[int]:
+        mapped = self._get_publication_store_id_map(messages)
+        return [mapped[id(message)] for message in messages if id(message) in mapped]
 
     # -- Internal: summarization -------------------------------------------
 
@@ -5987,6 +6579,4 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
+        self._close_storage()

@@ -34,6 +34,7 @@ from .db_bootstrap import (
     verify_embedding_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +284,7 @@ class VectorStore:
         *,
         config: LCMConfig | None = None,
         bounded_scan_rows: int | None = None,
+        writer_coordinator: WriterCoordinator | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,7 +337,20 @@ class VectorStore:
         self._binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_schema_ready = False
-        self._init_db()
+        self._writer_coordinator = writer_coordinator or get_writer_coordinator(
+            self.db_path
+        )
+        self._owner_token = self._writer_coordinator.bind_owner()
+        try:
+            self._init_db()
+        except BaseException:
+            self._writer_coordinator.close_owner(
+                self._owner_token,
+                self._conn,
+                local_lock=self._write_lock,
+            )
+            self._conn = None
+            raise
 
     def _init_db(self) -> None:
         # isolation_level=None (autocommit) so every read runs as its own
@@ -351,12 +366,17 @@ class VectorStore:
             check_same_thread=False,
             isolation_level=None,
         )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._ensure_embedding_schema()
-        self._conn.commit()
+        with self._writer_coordinator.write_region(self._write_lock):
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            self._conn.row_factory = sqlite3.Row
+            run_versioned_migrations(
+                self._conn,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
+            self._ensure_embedding_schema()
+            self._conn.commit()
 
     def _ensure_embedding_schema(self) -> None:
         """Materialize (and verify) the opt-in embedding tables on VectorStore use.
@@ -372,7 +392,7 @@ class VectorStore:
         VERIFIED every init — a set marker over a missing table is repaired
         rather than believed. Only a fully-materialized schema keeps the marker.
         """
-        with self._write_lock:
+        with self._writer_coordinator.write_region(self._write_lock):
             ensure_embedding_tables(self._conn)
             errors = verify_embedding_schema(self._conn)
             if errors:
@@ -409,7 +429,11 @@ class VectorStore:
         # to its own savepoint and re-raises, leaving the earlier rows of the
         # batch intact for the outer COMMIT.
         try:
-            with self._write_lock, self._cache_lock:
+            with self._writer_coordinator.transaction(
+                self._conn,
+                local_lock=self._write_lock,
+                begin_immediate=True,
+            ), self._cache_lock:
                 if self._txn_depth > 0:
                     savepoint = f"lcm_pub_sp_{self._txn_depth}"
                     self._conn.execute(f"SAVEPOINT {savepoint}")
@@ -424,14 +448,9 @@ class VectorStore:
                     finally:
                         self._txn_depth -= 1
                     return
-                self._conn.execute("BEGIN IMMEDIATE")
                 self._txn_depth = 1
                 try:
                     yield
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
                 finally:
                     self._txn_depth = 0
                     self._matrix_cache.clear()
@@ -1998,7 +2017,7 @@ class VectorStore:
         """
         if self._chunk_schema_ready:
             return
-        with self._write_lock:
+        with self._writer_coordinator.write_region(self._write_lock):
             ensure_embedding_tables(self._conn)
             ensure_chunk_tables(self._conn)
             errors = verify_chunk_schema(self._conn)
@@ -2501,11 +2520,11 @@ class VectorStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            self._writer_coordinator.close_owner(
+                self._owner_token,
+                conn,
+                local_lock=self._write_lock,
+            )
             self._conn = None
         with self._cache_lock:
             self._matrix_cache.clear()

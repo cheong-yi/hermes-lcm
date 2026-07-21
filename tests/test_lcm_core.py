@@ -655,6 +655,68 @@ class TestConfig:
         assert c.large_output_active_replay_stub_threshold_tokens == 8192
         assert c.large_output_transcript_gc_enabled is True
 
+    def test_from_env_reads_async_background_compaction_controls_with_provenance(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", "true")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", "1")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", "4")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", "12.5")
+
+        c = LCMConfig.from_env()
+
+        assert c.async_background_compaction_enabled is True
+        assert c.async_background_compaction_worker_enabled is True
+        assert c.async_background_compaction_max_batches == 4
+        assert c.async_background_compaction_retry_backoff_seconds == 12.5
+        assert c.config_sources["async_background_compaction_enabled"] == (
+            "env:LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED"
+        )
+        assert c.config_sources["async_background_compaction_worker_enabled"] == (
+            "env:LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED"
+        )
+        assert c.config_sources["async_background_compaction_max_batches"] == (
+            "env:LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES"
+        )
+        assert c.config_sources["async_background_compaction_retry_backoff_seconds"] == (
+            "env:LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS"
+        )
+
+    def test_async_background_compaction_env_overrides_yaml(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n"
+            "  async_background_compaction_enabled: false\n"
+            "  async_background_compaction_worker_enabled: false\n"
+            "  async_background_compaction_max_batches: 2\n"
+            "  async_background_compaction_retry_backoff_seconds: 300\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", "true")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", "yes")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", "5")
+        monkeypatch.setenv("LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", "9")
+
+        c = LCMConfig.from_env()
+
+        assert c.async_background_compaction_enabled is True
+        assert c.async_background_compaction_worker_enabled is True
+        assert c.async_background_compaction_max_batches == 5
+        assert c.async_background_compaction_retry_backoff_seconds == 9.0
+        assert all(
+            c.config_sources[field].startswith("env:LCM_ASYNC_BACKGROUND_COMPACTION_")
+            for field in (
+                "async_background_compaction_enabled",
+                "async_background_compaction_worker_enabled",
+                "async_background_compaction_max_batches",
+                "async_background_compaction_retry_backoff_seconds",
+            )
+        )
+
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")

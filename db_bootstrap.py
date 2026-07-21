@@ -15,7 +15,11 @@ import shutil
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Iterable, Sequence
+
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +33,18 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-# The core schema ladder stops at 5. Optional embedding tables are NOT part of
-# this counter: they are created lazily+idempotently by VectorStore on first use
-# (see ``ensure_embedding_tables`` / ``VectorStore._ensure_embedding_schema``) and
-# recorded via the named ``embeddings_v1`` migration-state marker instead of a
-# numeric bump. This keeps a disabled install at schema_version 5 with no
-# embedding tables, fully openable by a base build, and leaves the numeric
-# counter free for the temporal train so neither collides on a v6.
-SCHEMA_VERSION = 5
+# The core schema ladder includes atomic publication (v6) and durable prepared
+# compactions (v7). Optional rollup, embedding, and chunk tables remain lazy
+# named migrations and do not advance this numeric counter.
+SCHEMA_VERSION = 7
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
     "metadata",
     "summary_nodes",
+    "lcm_prepared_compactions",
+    "lcm_prepared_summary_nodes",
     "lcm_lifecycle_state",
     "lcm_migration_state",
     "messages_fts",
@@ -67,7 +69,72 @@ class ExternalContentFtsSpec:
         self.trigger_sqls = tuple(trigger_sqls)
 
 
-def configure_connection(conn: sqlite3.Connection) -> None:
+def _connection_coordinator(
+    conn: sqlite3.Connection,
+    coordinator: WriterCoordinator | None = None,
+) -> WriterCoordinator | None:
+    if coordinator is not None:
+        return coordinator
+    path = _database_path_for_connection(conn)
+    if not path:
+        return None
+    return get_writer_coordinator(path)
+
+
+@contextmanager
+def _write_region(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+):
+    resolved = _connection_coordinator(conn, coordinator)
+    if resolved is None:
+        with (local_lock if local_lock is not None else nullcontext()):
+            yield
+        return
+    with resolved.write_region(local_lock):
+        yield
+
+
+@contextmanager
+def _write_transaction(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+    begin_immediate: bool = False,
+):
+    resolved = _connection_coordinator(conn, coordinator)
+    if resolved is None:
+        lock_context = local_lock if local_lock is not None else nullcontext()
+        with lock_context:
+            started = not conn.in_transaction
+            if started:
+                conn.execute("BEGIN IMMEDIATE" if begin_immediate else "BEGIN")
+            try:
+                yield
+                if started and conn.in_transaction:
+                    conn.commit()
+            except BaseException:
+                if started and conn.in_transaction:
+                    conn.rollback()
+                raise
+        return
+    with resolved.transaction(
+        conn,
+        local_lock=local_lock,
+        begin_immediate=begin_immediate,
+    ):
+        yield
+
+
+def configure_connection(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+) -> None:
     """Configure SQLite connection for WAL durability and hygiene.
 
     In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
@@ -99,12 +166,17 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
     """
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    with _write_region(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+    ):
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA wal_autocheckpoint=500")
+        conn.execute("PRAGMA journal_size_limit=67108864")
+        conn.execute("PRAGMA mmap_size=268435456")
 
 
 def add_column_if_missing(
@@ -127,11 +199,12 @@ def add_column_if_missing(
     """
     if column in existing_columns:
         return
-    try:
-        conn.execute(alter_sql)
-    except sqlite3.OperationalError as exc:
-        if "duplicate column name" not in str(exc).lower():
-            raise
+    with _write_transaction(conn, begin_immediate=True):
+        try:
+            conn.execute(alter_sql)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def ensure_metadata_table(conn: sqlite3.Connection) -> None:
@@ -180,13 +253,40 @@ def read_existing_schema_version(conn: sqlite3.Connection) -> int:
 
 def refuse_schema_version_too_new(conn: sqlite3.Connection) -> None:
     """Raise before any startup DDL when a newer build owns the DB."""
-    current_version = read_existing_schema_version(conn)
-    if current_version <= SCHEMA_VERSION:
+    inspection = inspect_core_schema(conn)
+    current_version = inspection.stamp
+    actual_version = inspection.actual_version
+    supported_stamp_ahead_of_shape = (
+        current_version in {6, 7}
+        and actual_version is not None
+        and current_version > actual_version
+    )
+    ambiguous_supported_shape = (
+        current_version in {5, 6, 7}
+        and not inspection.exact_for_stamp
+        and not supported_stamp_ahead_of_shape
+    )
+    if (
+        current_version <= SCHEMA_VERSION
+        and not supported_stamp_ahead_of_shape
+        and not ambiguous_supported_shape
+    ):
         return
-    if classify_version_mismatch(conn) == VERSION_MISMATCH_INTERIM_STAMP:
+    if ambiguous_supported_shape:
         raise SchemaVersionTooNewError(
             f"LCM database is stamped schema_version {current_version}, but its "
-            f"actual schema is the v{SCHEMA_VERSION} shape plus named feature "
+            "tables do not match any exact compatible core shape. Refusing to "
+            "open or repair an ambiguous partial/out-of-order migration."
+        )
+    if classify_version_mismatch(conn) == VERSION_MISMATCH_INTERIM_STAMP:
+        shape_description = (
+            f"compatible only through v{actual_version}"
+            if actual_version is not None
+            else f"the v{SCHEMA_VERSION} shape plus named feature markers"
+        )
+        raise SchemaVersionTooNewError(
+            f"LCM database is stamped schema_version {current_version}, but its "
+            f"actual core schema is {shape_description} plus named feature "
             f"markers — the signature of an interim development build that "
             f"recorded a numeric version it never migrated to. There is no newer "
             f"hermes-lcm to upgrade to; do NOT upgrade the plugin. Run "
@@ -213,8 +313,10 @@ def refuse_schema_version_too_new(conn: sqlite3.Connection) -> None:
 VERSION_MISMATCH_INTERIM_STAMP = "interim_stamp"
 VERSION_MISMATCH_GENUINELY_NEWER = "genuinely_newer"
 
-# The exact v5 column contract for every core table that carries one. A missing
-# OR an unexpected column both disqualify a DB from the interim-stamp path.
+# The minimum v5 column contract for every core table that carries one. The v6
+# coverage key and v7 prepared-compaction tables are compatible numeric-migration
+# additions; classification accepts their exact known shapes as well as a v5 DB
+# that has not run those migrations yet. Unknown columns still fail closed.
 _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     "messages": frozenset({
         "store_id", "session_id", "source", "conversation_id", "role",
@@ -237,6 +339,30 @@ _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     }),
 }
 
+_KNOWN_CORE_ADDITIONAL_COLUMNS: dict[str, frozenset[str]] = {
+    "summary_nodes": frozenset({"coverage_key"}),
+}
+
+_KNOWN_CORE_MIGRATION_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "lcm_prepared_compactions": frozenset({
+        "batch_id", "conversation_id", "session_id", "state",
+        "frontier_start_store_id", "frontier_end_store_id",
+        "fresh_tail_count", "leaf_chunk_tokens", "policy_fingerprint",
+        "summary_route_fingerprint", "coverage_key", "source_ids",
+        "validation_source_ids", "source_identity_hashes", "ordered_lineage",
+        "expected_leaf_count", "prepared_leaf_count", "attempt_count",
+        "owner_id", "attempt_token", "lease_expires_at", "heartbeat_at",
+        "next_retry_at", "last_error", "rejected_reason", "created_at",
+        "updated_at", "promoted_at",
+    }),
+    "lcm_prepared_summary_nodes": frozenset({
+        "pending_id", "batch_id", "conversation_id", "session_id", "depth",
+        "summary", "token_count", "source_token_count", "source_ids",
+        "previous_pending_ids", "created_at", "earliest_at", "latest_at",
+        "expand_hint",
+    }),
+}
+
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
 # the FTS5 module, not by this schema contract.
 _V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
@@ -245,6 +371,170 @@ _V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
 # family (temporal-rollup / embedding / chunk) or are FTS5 shadow tables of the
 # core FTS indexes. Anything else means a newer build owns the schema.
 _KNOWN_FEATURE_TABLE_PREFIXES = ("lcm_rollup", "lcm_embedding", "lcm_chunk")
+_KNOWN_AUXILIARY_TABLES = frozenset({
+    "lcm_imported_messages",
+    "lcm_imported_summaries",
+})
+
+_CORE_TABLE_SHAPES: dict[
+    str, tuple[tuple[str, str, int, int, str | None], ...]
+] = {
+    "messages": (
+        ("store_id", "INTEGER", 0, 1, None),
+        ("session_id", "TEXT", 1, 0, None),
+        ("source", "TEXT", 0, 0, "''"),
+        ("conversation_id", "TEXT", 0, 0, "''"),
+        ("role", "TEXT", 1, 0, None),
+        ("content", "TEXT", 0, 0, None),
+        ("tool_call_id", "TEXT", 0, 0, None),
+        ("tool_calls", "TEXT", 0, 0, None),
+        ("tool_name", "TEXT", 0, 0, None),
+        ("timestamp", "REAL", 1, 0, None),
+        ("token_estimate", "INTEGER", 0, 0, "0"),
+        ("pinned", "INTEGER", 0, 0, "0"),
+    ),
+    "summary_nodes": (
+        ("node_id", "INTEGER", 0, 1, None),
+        ("session_id", "TEXT", 1, 0, None),
+        ("depth", "INTEGER", 1, 0, "0"),
+        ("summary", "TEXT", 1, 0, None),
+        ("token_count", "INTEGER", 0, 0, "0"),
+        ("source_token_count", "INTEGER", 0, 0, "0"),
+        ("source_ids", "TEXT", 1, 0, "'[]'"),
+        ("source_type", "TEXT", 1, 0, "'messages'"),
+        ("created_at", "REAL", 1, 0, None),
+        ("earliest_at", "REAL", 0, 0, None),
+        ("latest_at", "REAL", 0, 0, None),
+        ("expand_hint", "TEXT", 0, 0, "''"),
+    ),
+    "metadata": (
+        ("key", "TEXT", 0, 1, None),
+        ("value", "TEXT", 0, 0, None),
+    ),
+    "lcm_migration_state": (
+        ("step_name", "TEXT", 0, 1, None),
+        ("completed_at", "REAL", 1, 0, None),
+    ),
+    "lcm_lifecycle_state": (
+        ("conversation_id", "TEXT", 0, 1, None),
+        ("current_session_id", "TEXT", 0, 0, None),
+        ("last_finalized_session_id", "TEXT", 0, 0, None),
+        ("current_frontier_store_id", "INTEGER", 1, 0, "0"),
+        ("last_finalized_frontier_store_id", "INTEGER", 1, 0, "0"),
+        ("debt_kind", "TEXT", 0, 0, None),
+        ("debt_size_estimate", "INTEGER", 1, 0, "0"),
+        ("current_bound_at", "REAL", 0, 0, None),
+        ("last_finalized_at", "REAL", 0, 0, None),
+        ("debt_updated_at", "REAL", 0, 0, None),
+        ("last_maintenance_attempt_at", "REAL", 0, 0, None),
+        ("last_rollover_at", "REAL", 0, 0, None),
+        ("last_reset_at", "REAL", 0, 0, None),
+        ("updated_at", "REAL", 1, 0, "strftime('%s','now')"),
+    ),
+    "lcm_prepared_compactions": (
+        ("batch_id", "TEXT", 0, 1, None),
+        ("conversation_id", "TEXT", 1, 0, None),
+        ("session_id", "TEXT", 1, 0, None),
+        ("state", "TEXT", 1, 0, None),
+        ("frontier_start_store_id", "INTEGER", 1, 0, None),
+        ("frontier_end_store_id", "INTEGER", 1, 0, None),
+        ("fresh_tail_count", "INTEGER", 1, 0, None),
+        ("leaf_chunk_tokens", "INTEGER", 1, 0, None),
+        ("policy_fingerprint", "TEXT", 1, 0, None),
+        ("summary_route_fingerprint", "TEXT", 1, 0, None),
+        ("coverage_key", "TEXT", 1, 0, None),
+        ("source_ids", "TEXT", 1, 0, None),
+        ("validation_source_ids", "TEXT", 1, 0, None),
+        ("source_identity_hashes", "TEXT", 1, 0, None),
+        ("ordered_lineage", "TEXT", 1, 0, None),
+        ("expected_leaf_count", "INTEGER", 1, 0, "1"),
+        ("prepared_leaf_count", "INTEGER", 1, 0, "0"),
+        ("attempt_count", "INTEGER", 1, 0, "0"),
+        ("owner_id", "TEXT", 0, 0, None),
+        ("attempt_token", "TEXT", 0, 0, None),
+        ("lease_expires_at", "REAL", 0, 0, None),
+        ("heartbeat_at", "REAL", 0, 0, None),
+        ("next_retry_at", "REAL", 0, 0, None),
+        ("last_error", "TEXT", 0, 0, None),
+        ("rejected_reason", "TEXT", 0, 0, None),
+        ("created_at", "REAL", 1, 0, None),
+        ("updated_at", "REAL", 1, 0, None),
+        ("promoted_at", "REAL", 0, 0, None),
+    ),
+    "lcm_prepared_summary_nodes": (
+        ("pending_id", "TEXT", 0, 1, None),
+        ("batch_id", "TEXT", 1, 0, None),
+        ("conversation_id", "TEXT", 1, 0, None),
+        ("session_id", "TEXT", 1, 0, None),
+        ("depth", "INTEGER", 1, 0, "0"),
+        ("summary", "TEXT", 1, 0, None),
+        ("token_count", "INTEGER", 1, 0, None),
+        ("source_token_count", "INTEGER", 1, 0, None),
+        ("source_ids", "TEXT", 1, 0, None),
+        ("previous_pending_ids", "TEXT", 1, 0, "'[]'"),
+        ("created_at", "REAL", 1, 0, None),
+        ("earliest_at", "REAL", 0, 0, None),
+        ("latest_at", "REAL", 0, 0, None),
+        ("expand_hint", "TEXT", 1, 0, "''"),
+    ),
+}
+
+_CORE_TABLE_SHAPE_ALTERNATIVES = {
+    # Historical MessageStore builds used 'unknown' as the SQL default. Modern
+    # writes always provide the normalized source explicitly, so both defaults
+    # encode the same durable behavior and are exact supported v5+ signatures.
+    "messages": (
+        tuple(
+            (name, kind, not_null, pk, "'unknown'" if name == "source" else default)
+            for name, kind, not_null, pk, default in _CORE_TABLE_SHAPES["messages"]
+        ),
+    ),
+}
+
+_PREPARED_CHECKS = {
+    "lcm_prepared_compactions": {
+        "statein('pending','preparing','ready','promoted','rejected','failed','superseded')"
+    },
+    "lcm_prepared_summary_nodes": {"depth=0"},
+}
+
+_CORE_INDEX_SHAPES: dict[
+    str, tuple[str, tuple[tuple[str, int], ...], int, str | None]
+] = {
+    "idx_summary_nodes_coverage_key_unique": (
+        "summary_nodes", (("coverage_key", 0),), 1, "coverage_keyisnotnull"
+    ),
+    "idx_lcm_prepared_conversation_state": (
+        "lcm_prepared_compactions",
+        (("conversation_id", 0), ("state", 0), ("created_at", 0)),
+        0,
+        None,
+    ),
+    "idx_lcm_prepared_session_state": (
+        "lcm_prepared_compactions",
+        (("session_id", 0), ("state", 0), ("created_at", 0)),
+        0,
+        None,
+    ),
+    "idx_lcm_prepared_retry": (
+        "lcm_prepared_compactions", (("next_retry_at", 0), ("state", 0)), 0, None
+    ),
+    "idx_lcm_prepared_lease": (
+        "lcm_prepared_compactions", (("lease_expires_at", 0), ("state", 0)), 0, None
+    ),
+    "idx_lcm_prepared_node_batch": (
+        "lcm_prepared_summary_nodes", (("batch_id", 0),), 0, None
+    ),
+}
+
+
+@dataclass(frozen=True)
+class CoreSchemaInspection:
+    stamp: int
+    actual_version: int | None
+    family_state: str
+    exact_for_stamp: bool
+    findings: tuple[str, ...]
 
 # The known opt-in feature families whose derived tables an interim build may
 # have created in an EARLY variant (missing later-added columns/tables). Each is
@@ -311,6 +601,280 @@ def _user_table_names(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+def _core_table_shape(
+    conn: sqlite3.Connection, table: str
+) -> tuple[tuple[str, str, int, int, str | None], ...]:
+    return tuple(
+        (
+            str(row[1]),
+            str(row[2]).upper(),
+            int(row[3]),
+            int(row[5]),
+            None if row[4] is None else str(row[4]).lower(),
+        )
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    )
+
+
+def _core_table_matches(
+    actual: tuple[tuple[str, str, int, int, str | None], ...],
+    expected: tuple[tuple[str, str, int, int, str | None], ...],
+) -> bool:
+    """Compare semantic column contracts without treating ALTER order as damage."""
+    return len(actual) == len(expected) and {
+        row[0]: row[1:] for row in actual
+    } == {row[0]: row[1:] for row in expected}
+
+
+def _core_table_has_known_shape(
+    table: str,
+    actual: tuple[tuple[str, str, int, int, str | None], ...],
+) -> bool:
+    candidates = (_CORE_TABLE_SHAPES[table],) + _CORE_TABLE_SHAPE_ALTERNATIVES.get(
+        table, ()
+    )
+    return any(_core_table_matches(actual, expected) for expected in candidates)
+
+
+def _normalized_index_predicate(sql: object) -> str | None:
+    match = re.search(r"\bwhere\b(.+)$", str(sql or ""), re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    return re.sub(r"\s+", "", match.group(1).lower()).rstrip(";")
+
+
+def _core_index_matches(
+    conn: sqlite3.Connection,
+    name: str,
+    expected: tuple[str, tuple[tuple[str, int], ...], int, str | None],
+) -> bool:
+    table, columns, unique, predicate = expected
+    metadata = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?",
+        (name,),
+    ).fetchone()
+    if metadata is None or str(metadata[0]) != table:
+        return False
+    listed = next(
+        (
+            row
+            for row in conn.execute(f"PRAGMA index_list({table})").fetchall()
+            if str(row[1]) == name
+        ),
+        None,
+    )
+    actual_columns = tuple(
+        (str(row[2]), int(row[3] or 0))
+        for row in conn.execute(f"PRAGMA index_xinfo({name})").fetchall()
+        if int(row[5] or 0) == 1 and row[2] is not None
+    )
+    return bool(
+        listed is not None
+        and int(listed[2] or 0) == unique
+        and int(listed[4] or 0) == int(predicate is not None)
+        and actual_columns == columns
+        and _normalized_index_predicate(metadata[1]) == predicate
+    )
+
+
+def _prepared_schema_findings(conn: sqlite3.Connection) -> list[str]:
+    findings: list[str] = []
+    for table in _KNOWN_CORE_MIGRATION_TABLE_COLUMNS:
+        if not _core_table_matches(
+            _core_table_shape(conn, table), _CORE_TABLE_SHAPES[table]
+        ):
+            findings.append(f"malformed-table:{table}")
+
+    table_sql = {
+        str(row[0]): str(row[1] or "")
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' "
+            "AND name IN (?, ?)",
+            tuple(_KNOWN_CORE_MIGRATION_TABLE_COLUMNS),
+        ).fetchall()
+    }
+    for table, expected in _PREPARED_CHECKS.items():
+        if _sql_check_expressions(table_sql.get(table, "")) != expected:
+            findings.append(f"malformed-check:{table}")
+
+    expected_unique_semantics = {
+        "lcm_prepared_compactions": {("pk", ("batch_id",), 0)},
+        "lcm_prepared_summary_nodes": {
+            ("pk", ("pending_id",), 0),
+            ("u", ("batch_id",), 0),
+        },
+    }
+    for table, expected in expected_unique_semantics.items():
+        actual = {
+            (
+                str(index[3]),
+                tuple(
+                    str(row[2])
+                    for row in conn.execute(
+                        f"PRAGMA index_xinfo({quote_sql_identifier(str(index[1]))})"
+                    ).fetchall()
+                    if int(row[5] or 0) == 1
+                ),
+                int(index[4] or 0),
+            )
+            for index in conn.execute(
+                f"PRAGMA index_list({quote_sql_identifier(table)})"
+            ).fetchall()
+            if int(index[2] or 0)
+        }
+        if actual != expected:
+            findings.append(f"malformed-unique:{table}")
+
+    foreign_keys = {
+        (
+            str(row[2]), str(row[3]), str(row[4]), str(row[5]),
+            str(row[6]), str(row[7]),
+        )
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(lcm_prepared_summary_nodes)"
+        ).fetchall()
+    }
+    expected_foreign_key = {
+        (
+            "lcm_prepared_compactions", "batch_id", "batch_id",
+            "NO ACTION", "CASCADE", "NONE",
+        )
+    }
+    if foreign_keys != expected_foreign_key:
+        findings.append("malformed-foreign-key:lcm_prepared_summary_nodes.batch_id")
+
+    for name, expected in _CORE_INDEX_SHAPES.items():
+        if name == "idx_summary_nodes_coverage_key_unique":
+            continue
+        if not _core_index_matches(conn, name, expected):
+            findings.append(f"malformed-index:{name}")
+    return findings
+
+
+def inspect_core_schema(conn: sqlite3.Connection) -> CoreSchemaInspection:
+    """Return one semantic verdict for full and helper-owned core shapes.
+
+    FTS tables and optional feature families are derived/independently verified;
+    the numeric core stamp covers durable table semantics, the v6 coverage
+    uniqueness contract, and the v7 prepared-state constraints.
+    """
+    stamp = read_existing_schema_version(conn)
+    findings: list[str] = []
+    try:
+        tables = _user_table_names(conn)
+        allowed_tables = (
+            set(_CORE_TABLE_SHAPES)
+            | set(_V5_CORE_PRESENCE_ONLY)
+            | set(_KNOWN_AUXILIARY_TABLES)
+        )
+        for fts in _V5_CORE_PRESENCE_ONLY:
+            allowed_tables.update(get_fts_shadow_table_names(fts))
+        for table in tables:
+            if table in allowed_tables:
+                continue
+            if any(table.startswith(prefix) for prefix in _KNOWN_FEATURE_TABLE_PREFIXES):
+                continue
+            findings.append(f"unknown-table:{table}")
+
+        message_present = "messages" in tables
+        summary_present = "summary_nodes" in tables
+        shared_tables = {"metadata", "lcm_migration_state", "lcm_lifecycle_state"}
+        shared_presence = shared_tables & tables
+        shared_present = shared_presence == shared_tables
+        if shared_presence and not shared_present:
+            findings.append("partial-shared-family")
+
+        prepared_tables = set(_KNOWN_CORE_MIGRATION_TABLE_COLUMNS)
+        prepared_presence = prepared_tables & tables
+        prepared_present = prepared_presence == prepared_tables
+        if prepared_presence and not prepared_present:
+            findings.append("partial-prepared-family")
+
+        for table in ("messages", "metadata", "lcm_migration_state", "lcm_lifecycle_state"):
+            if table in tables and not _core_table_has_known_shape(
+                table, _core_table_shape(conn, table)
+            ):
+                findings.append(f"malformed-table:{table}")
+
+        has_coverage = False
+        coverage_index = False
+        if summary_present:
+            actual_summary = _core_table_shape(conn, "summary_nodes")
+            base_summary = _CORE_TABLE_SHAPES["summary_nodes"]
+            current_summary = base_summary + (("coverage_key", "TEXT", 0, 0, None),)
+            if _core_table_matches(actual_summary, current_summary):
+                has_coverage = True
+                coverage_index = _core_index_matches(
+                    conn,
+                    "idx_summary_nodes_coverage_key_unique",
+                    _CORE_INDEX_SHAPES["idx_summary_nodes_coverage_key_unique"],
+                )
+                if not coverage_index:
+                    findings.append("malformed-index:idx_summary_nodes_coverage_key_unique")
+            elif not _core_table_matches(actual_summary, base_summary):
+                findings.append("malformed-table:summary_nodes")
+            elif conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='idx_summary_nodes_coverage_key_unique'"
+            ).fetchone():
+                findings.append("coverage-index-without-column")
+
+        if (message_present or summary_present or prepared_presence) and not shared_present:
+            findings.append("core-family-without-shared-state")
+        if prepared_present:
+            findings.extend(_prepared_schema_findings(conn))
+
+        if message_present and summary_present:
+            family_state = "full"
+        elif message_present:
+            family_state = "message"
+        elif summary_present:
+            family_state = "summary"
+        elif shared_present:
+            family_state = "shared"
+        else:
+            family_state = "empty"
+
+        actual_version: int | None = None
+        if family_state == "full" and not findings:
+            if prepared_present and has_coverage and coverage_index:
+                actual_version = 7
+            elif not prepared_presence and has_coverage and coverage_index:
+                actual_version = 6
+            elif not prepared_presence and not has_coverage:
+                actual_version = 5
+
+        exact_for_stamp = False
+        if stamp in {5, 6, 7} and shared_present and not findings:
+            prepared_expected = stamp >= 7
+            coverage_expected = stamp >= 6 and summary_present
+            exact_for_stamp = (
+                prepared_present == prepared_expected
+                and not (prepared_presence and not prepared_present)
+                and has_coverage == coverage_expected
+                and (not coverage_expected or coverage_index)
+            )
+        return CoreSchemaInspection(
+            stamp=stamp,
+            actual_version=actual_version,
+            family_state=family_state,
+            exact_for_stamp=exact_for_stamp,
+            findings=tuple(sorted(set(findings))),
+        )
+    except sqlite3.DatabaseError as exc:
+        return CoreSchemaInspection(
+            stamp=stamp,
+            actual_version=None,
+            family_state="ambiguous",
+            exact_for_stamp=False,
+            findings=(f"database-error:{exc}",),
+        )
+
+
+def _compatible_core_schema_version(conn: sqlite3.Connection) -> int | None:
+    return inspect_core_schema(conn).actual_version
+
+
 def classify_version_mismatch(conn: sqlite3.Connection) -> str:
     """Classify a DB whose stored ``schema_version`` exceeds ``SCHEMA_VERSION``.
 
@@ -333,41 +897,18 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
     Never mutates schema; the safe default is ``genuinely_newer`` so an
     unrecognised shape is never re-stamped/downgraded.
     """
-    try:
-        tables = _user_table_names(conn)
-    except sqlite3.DatabaseError:
+    inspection = inspect_core_schema(conn)
+    return _classify_version_mismatch(conn, inspection)
+
+
+def _classify_version_mismatch(
+    conn: sqlite3.Connection, inspection: CoreSchemaInspection
+) -> str:
+    """Classify one already-inspected core shape including feature families."""
+    if inspection.actual_version is None or inspection.findings:
         return VERSION_MISMATCH_GENUINELY_NEWER
 
-    # Every v5 core table must be present.
-    for table in (*_V5_CORE_TABLE_COLUMNS, *_V5_CORE_PRESENCE_ONLY):
-        if table not in tables:
-            return VERSION_MISMATCH_GENUINELY_NEWER
-
-    # Core tables must match the v5 column contract exactly — a missing or an
-    # unexpected column both mean this is not a v5-shaped DB.
-    for table, expected in _V5_CORE_TABLE_COLUMNS.items():
-        try:
-            actual = {
-                str(row[1])
-                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-        except sqlite3.DatabaseError:
-            return VERSION_MISMATCH_GENUINELY_NEWER
-        if actual != set(expected):
-            return VERSION_MISMATCH_GENUINELY_NEWER
-
-    # Any extra table must belong to a known feature family or be an FTS5 shadow.
-    # The feature table's *internal* shape is intentionally NOT checked here — an
-    # early-variant feature table is still an interim stamp, repaired on apply.
-    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY)
-    for fts in _V5_CORE_PRESENCE_ONLY:
-        allowed.update(get_fts_shadow_table_names(fts))
-    for table in tables:
-        if table in allowed:
-            continue
-        if any(table.startswith(prefix) for prefix in _KNOWN_FEATURE_TABLE_PREFIXES):
-            continue
-        return VERSION_MISMATCH_GENUINELY_NEWER
+    tables = _user_table_names(conn)
 
     # A present feature-family table that carries an EXTRA column this build does
     # not recognise is a newer-build signature, not an early interim variant —
@@ -390,6 +931,49 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
             return VERSION_MISMATCH_GENUINELY_NEWER
 
     return VERSION_MISMATCH_INTERIM_STAMP
+
+
+def _interim_schema_remediation_plan(conn: sqlite3.Connection) -> dict[str, object]:
+    """Return a complete repair decision from one current database snapshot."""
+    inspection = inspect_core_schema(conn)
+    current_version = inspection.stamp
+    actual_version = inspection.actual_version
+    target_version = actual_version if actual_version is not None else SCHEMA_VERSION
+    plan: dict[str, object] = {
+        "current_version": current_version,
+        "target_version": target_version,
+        "classification": None,
+        "status": "noop",
+        "drop_plan": [],
+    }
+    supported_stamp_ahead_of_shape = (
+        current_version in {6, 7}
+        and actual_version is not None
+        and current_version > actual_version
+    )
+    ambiguous_supported_shape = (
+        current_version in {5, 6, 7}
+        and not inspection.exact_for_stamp
+        and not supported_stamp_ahead_of_shape
+    )
+    if (
+        current_version <= SCHEMA_VERSION
+        and not supported_stamp_ahead_of_shape
+        and not ambiguous_supported_shape
+    ):
+        return plan
+    if ambiguous_supported_shape:
+        plan["classification"] = VERSION_MISMATCH_GENUINELY_NEWER
+        plan["status"] = "refused"
+        return plan
+    classification = _classify_version_mismatch(conn, inspection)
+    plan["classification"] = classification
+    if classification != VERSION_MISMATCH_INTERIM_STAMP:
+        plan["status"] = "refused"
+        return plan
+    plan["status"] = "repairable"
+    plan["drop_plan"] = _interim_family_drops(conn)
+    return plan
 
 
 def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -442,57 +1026,61 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
 def remediate_interim_schema_stamp(
     conn: sqlite3.Connection, *, apply: bool = False
 ) -> dict[str, object]:
-    """Reset an interim-build schema stamp back to ``SCHEMA_VERSION``.
+    """Reset an interim-build stamp to the exact compatible core version.
 
     Dry-run by default: classifies and reports the drop plan without mutating.
     With ``apply=True`` and an ``interim_stamp`` classification it (1) drops any
     early-variant feature-family tables that fail their own final-shape verifier
     — derived caches that each feature's marker-gated init rebuilds — and then
-    (2) rewrites ``metadata.schema_version`` to ``SCHEMA_VERSION``. Refuses —
+    (2) rewrites ``metadata.schema_version`` to the highest exact compatible
+    core shape so normal startup can replay every later migration. Refuses —
     never mutates — a ``genuinely_newer`` DB. Callers are responsible for taking
     a backup before ``apply`` (see
     :func:`hermes_lcm.maintenance.backup_database`).
     """
-    current_version = read_existing_schema_version(conn)
+    plan = _interim_schema_remediation_plan(conn) if not apply else None
     result: dict[str, object] = {
-        "current_version": current_version,
-        "target_version": SCHEMA_VERSION,
+        "current_version": None,
+        "target_version": None,
         "classification": None,
         "applied": False,
         "status": "noop",
         "drop_plan": [],
         "dropped_tables": [],
     }
-    if current_version <= SCHEMA_VERSION:
-        return result
-    classification = classify_version_mismatch(conn)
-    result["classification"] = classification
-    if classification != VERSION_MISMATCH_INTERIM_STAMP:
-        result["status"] = "refused"
-        return result
-    drop_plan = _interim_family_drops(conn)
-    result["drop_plan"] = drop_plan
     if not apply:
-        result["status"] = "dry-run"
+        assert plan is not None
+        result.update(plan)
+        if result["status"] == "repairable":
+            result["status"] = "dry-run"
         return result
 
     dropped: list[str] = []
-    for plan in drop_plan:
-        for trigger in plan["triggers"]:  # type: ignore[index]
-            conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(str(trigger))}")
-        for table in plan["tables"]:  # type: ignore[index]
-            conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(str(table))}")
-            dropped.append(str(table))
-    set_schema_version(conn, SCHEMA_VERSION)
-    conn.commit()
+    with _write_transaction(conn, begin_immediate=True):
+        plan = _interim_schema_remediation_plan(conn)
+        result.update(plan)
+        if result["status"] != "repairable":
+            return result
+        drop_plan = plan["drop_plan"]
+        for plan in drop_plan:
+            for trigger in plan["triggers"]:  # type: ignore[index]
+                conn.execute(
+                    f"DROP TRIGGER IF EXISTS {quote_sql_identifier(str(trigger))}"
+                )
+            for table in plan["tables"]:  # type: ignore[index]
+                conn.execute(
+                    f"DROP TABLE IF EXISTS {quote_sql_identifier(str(table))}"
+                )
+                dropped.append(str(table))
+        set_schema_version(conn, int(result["target_version"]))
     result["dropped_tables"] = dropped
     result["applied"] = True
     result["status"] = "ok"
     logger.info(
         "Reset interim schema stamp from v%s to v%s (dropped %d early feature "
         "table(s): %s)",
-        current_version,
-        SCHEMA_VERSION,
+        result["current_version"],
+        result["target_version"],
         len(dropped),
         ", ".join(dropped) or "none",
     )
@@ -1237,6 +1825,130 @@ def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_summary_publication_columns(conn: sqlite3.Connection) -> None:
+    """Install the nullable v6 coverage key without invalidating legacy nodes."""
+
+    table_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone()
+    if not table_row:
+        return
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
+    }
+    if "coverage_key" not in columns:
+        try:
+            conn.execute("ALTER TABLE summary_nodes ADD COLUMN coverage_key TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_nodes_coverage_key_unique
+        ON summary_nodes(coverage_key)
+        WHERE coverage_key IS NOT NULL
+        """
+    )
+
+
+def ensure_prepared_compaction_tables(conn: sqlite3.Connection) -> None:
+    """Install v7 non-canonical background preparation storage.
+
+    Prepared rows deliberately live outside ``summary_nodes`` and its FTS
+    triggers.  The CHECK constraint is the durable closed-state guard; callers
+    additionally validate legal transitions before issuing updates.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_prepared_compactions (
+            batch_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('pending', 'preparing', 'ready', 'promoted',
+                          'rejected', 'failed', 'superseded')
+            ),
+            frontier_start_store_id INTEGER NOT NULL,
+            frontier_end_store_id INTEGER NOT NULL,
+            fresh_tail_count INTEGER NOT NULL,
+            leaf_chunk_tokens INTEGER NOT NULL,
+            policy_fingerprint TEXT NOT NULL,
+            summary_route_fingerprint TEXT NOT NULL,
+            coverage_key TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            validation_source_ids TEXT NOT NULL,
+            source_identity_hashes TEXT NOT NULL,
+            ordered_lineage TEXT NOT NULL,
+            expected_leaf_count INTEGER NOT NULL DEFAULT 1,
+            prepared_leaf_count INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            owner_id TEXT,
+            attempt_token TEXT,
+            lease_expires_at REAL,
+            heartbeat_at REAL,
+            next_retry_at REAL,
+            last_error TEXT,
+            rejected_reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            promoted_at REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_prepared_summary_nodes (
+            pending_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL UNIQUE
+                REFERENCES lcm_prepared_compactions(batch_id) ON DELETE CASCADE,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            depth INTEGER NOT NULL DEFAULT 0 CHECK (depth = 0),
+            summary TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            source_token_count INTEGER NOT NULL,
+            source_ids TEXT NOT NULL,
+            previous_pending_ids TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            earliest_at REAL,
+            latest_at REAL,
+            expand_hint TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_conversation_state
+        ON lcm_prepared_compactions(conversation_id, state, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_session_state
+        ON lcm_prepared_compactions(session_id, state, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_retry
+        ON lcm_prepared_compactions(next_retry_at, state)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_lease
+        ON lcm_prepared_compactions(lease_expires_at, state)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lcm_prepared_node_batch
+        ON lcm_prepared_summary_nodes(batch_id)
+        """
+    )
+
+
 # The tables and indexes ``ensure_embedding_tables`` is responsible for. Used to
 # VERIFY the schema on VectorStore init rather than trusting the ``embeddings_v1``
 # marker alone: the named marker can be present while a table/index is absent
@@ -1321,10 +2033,10 @@ def _sql_check_expressions(sql: str) -> set[str]:
     expressions: set[str] = set()
     offset = 0
     while True:
-        start = lowered.find("check(", offset)
-        if start < 0:
+        match = re.search(r"\bcheck\s*\(", lowered[offset:])
+        if match is None:
             return expressions
-        body_start = start + len("check(")
+        body_start = offset + match.end()
         depth = 1
         cursor = body_start
         while cursor < len(lowered) and depth:
@@ -1822,16 +2534,17 @@ def _load_integrity_checked_at(
 def _record_integrity_checked(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
 ) -> None:
-    ensure_metadata_table(conn)
     current = time.time() if now is None else now
-    conn.execute(
-        """
-        INSERT INTO metadata(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_integrity_marker_key(spec), str(current)),
-    )
+    with _write_transaction(conn, begin_immediate=True):
+        ensure_metadata_table(conn)
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_integrity_marker_key(spec), str(current)),
+        )
 
 
 def _should_run_integrity_check(
@@ -2004,8 +2717,8 @@ def _run_background_integrity_scan(
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
+            with _write_transaction(scan_conn, begin_immediate=True):
+                _record_scan_started(scan_conn, spec, now=started_at)
             result = check_external_content_fts_integrity(scan_conn, spec)
         finally:
             scan_conn.close()
@@ -2013,24 +2726,24 @@ def _run_background_integrity_scan(
         meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
-                logger.warning(
-                    "Background FTS integrity-check found corruption in '%s': %s. "
-                    "Run `/lcm doctor repair apply` to rebuild the index.",
-                    spec.table_name,
-                    result.get("detail", ""),
-                )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
+            with _write_transaction(meta_conn, begin_immediate=True):
+                status = result.get("status")
+                if status == "pass":
+                    _record_integrity_checked(meta_conn, spec, now=started_at)
+                    _clear_integrity_failed(meta_conn, spec)
+                elif status == "fail":
+                    _record_integrity_failed(
+                        meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    )
+                    logger.warning(
+                        "Background FTS integrity-check found corruption in '%s': %s. "
+                        "Run `/lcm doctor repair apply` to rebuild the index.",
+                        spec.table_name,
+                        result.get("detail", ""),
+                    )
+                # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                # so the next bind retries; do not stamp or flag.
+                _clear_scan_started(meta_conn, spec, expected=started_at)
         finally:
             meta_conn.close()
     except Exception:  # pragma: no cover - defensive
@@ -2040,8 +2753,8 @@ def _run_background_integrity_scan(
         try:
             cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
+                with _write_transaction(cleanup, begin_immediate=True):
+                    _clear_scan_started(cleanup, spec, expected=started_at)
             finally:
                 cleanup.close()
         except sqlite3.DatabaseError:
@@ -2091,9 +2804,8 @@ def _dispatch_background_integrity_scan(
             )
             try:
                 claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
+                with _write_transaction(claim_conn, begin_immediate=True):
+                    _record_scan_started(claim_conn, spec, now=current)
             finally:
                 claim_conn.close()
         except sqlite3.DatabaseError:
@@ -2187,34 +2899,32 @@ def check_external_content_fts_integrity(
 
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
     savepoint_sql = quote_sql_identifier(savepoint)
-    try:
-        conn.execute(f"SAVEPOINT {savepoint_sql}")
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
-        )
-    except sqlite3.DatabaseError as exc:
+    with _write_region(conn):
+        try:
+            conn.execute(f"SAVEPOINT {savepoint_sql}")
+            conn.execute(
+                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
+            )
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute(f"ROLLBACK TO {savepoint_sql}")
+                conn.execute(f"RELEASE {savepoint_sql}")
+            except sqlite3.DatabaseError:
+                pass
+            detail = str(exc)
+            lowered = detail.lower()
+            if "readonly" in lowered or "read-only" in lowered:
+                return {"status": "unchecked", "detail": detail}
+            if _is_fts_corruption_error(detail):
+                return {"status": "fail", "detail": detail}
+            # Busy/locked/timeouts are transient, not evidence of corruption.
+            return {"status": "unchecked", "detail": detail}
+
         try:
             conn.execute(f"ROLLBACK TO {savepoint_sql}")
             conn.execute(f"RELEASE {savepoint_sql}")
-        except sqlite3.DatabaseError:
-            pass
-        detail = str(exc)
-        lowered = detail.lower()
-        if "readonly" in lowered or "read-only" in lowered:
-            return {"status": "unchecked", "detail": detail}
-        if _is_fts_corruption_error(detail):
-            return {"status": "fail", "detail": detail}
-        # A transient lock/busy/timeout — or any other non-corruption error — must
-        # NOT be reported as corruption: the background scan would otherwise wedge
-        # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
-        # signature (malformed / disk image / not-a-database) fails the check.
-        return {"status": "unchecked", "detail": detail}
-
-    try:
-        conn.execute(f"ROLLBACK TO {savepoint_sql}")
-        conn.execute(f"RELEASE {savepoint_sql}")
-    except sqlite3.DatabaseError as exc:
-        return {"status": "fail", "detail": str(exc)}
+        except sqlite3.DatabaseError as exc:
+            return {"status": "fail", "detail": str(exc)}
 
     return {"status": "pass", "detail": "ok"}
 
@@ -2283,10 +2993,17 @@ def repair_external_content_fts(
     *,
     now: float | None = None,
     throttle: bool = False,
+    structural_only: bool = False,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
 ) -> dict[str, bool]:
-    rebuilt = False
-    degraded = False
-    if _fts_needs_rebuild(conn, spec, now=now, throttle=throttle):
+    needs_rebuild = (
+        _fts_needs_rebuild_structural(conn, spec)
+        if structural_only
+        else _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
+    )
+    low_disk = False
+    if needs_rebuild:
         db_path = conn.execute("PRAGMA database_list").fetchone()
         if db_path:
             db_file = db_path[2]
@@ -2296,88 +3013,128 @@ def repair_external_content_fts(
                     spec.table_name,
                     _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
-                _drop_fts_artifacts(conn, spec)
-                # The corrupt index is gone (degraded to LIKE search); a stale
-                # integrity-failed flag would otherwise keep `/lcm doctor`
-                # reporting issues-found for an index that no longer exists.
-                _clear_integrity_failed(conn, spec)
-                conn.commit()
-                return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
-        _drop_fts_table(conn, spec.table_name)
-        conn.execute(
-            f"""
-            CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
-                {quote_sql_identifier(spec.indexed_column)},
-                content={quote_sql_identifier(spec.content_table)},
-                content_rowid={quote_sql_identifier(spec.content_rowid)}
-            )
-            """
-        )
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
-        )
-        rebuilt = True
-
+                low_disk = True
     triggers_were_missing = _fts_missing_triggers(conn, spec)
-    for trigger_sql in spec.trigger_sqls:
-        conn.execute(trigger_sql)
-    if rebuilt:
-        # A freshly rebuilt index is known-consistent; record the marker so the
-        # next startup can skip the deep integrity-check within the interval.
-        _record_integrity_checked(conn, spec, now=now)
-    # A completed repair resolves any prior background-scan corruption flag: clear
-    # it in the SAME transaction that commits the rebuild so `/lcm doctor` stops
-    # reporting issues-found (and the next self-healing scan is not pushed out a
-    # full interval). Without this an explicit `repair apply` left the flag stuck.
-    _clear_integrity_failed(conn, spec)
-    conn.commit()
-    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+    rebuilt = False
+    degraded = False
+    with _write_transaction(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+        begin_immediate=True,
+    ):
+        refuse_schema_version_too_new(conn)
+        if needs_rebuild and low_disk:
+            _drop_fts_artifacts(conn, spec)
+            degraded = True
+        elif needs_rebuild:
+            _drop_fts_table(conn, spec.table_name)
+            conn.execute(
+                f"""
+                CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
+                    {quote_sql_identifier(spec.indexed_column)},
+                    content={quote_sql_identifier(spec.content_table)},
+                    content_rowid={quote_sql_identifier(spec.content_rowid)}
+                )
+                """
+            )
+            conn.execute(
+                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
+            )
+            rebuilt = True
+
+        if not degraded:
+            for trigger_sql in spec.trigger_sqls:
+                conn.execute(trigger_sql)
+        if rebuilt:
+            # A freshly rebuilt index is known-consistent; record the marker so
+            # the next startup can skip the deep check within the interval.
+            _record_integrity_checked(conn, spec, now=now)
+        # A completed repair resolves any prior background-scan corruption flag.
+        # Clear it in the same transaction as the rebuild/degrade decision.
+        _clear_integrity_failed(conn, spec)
+    return {
+        "rebuilt": rebuilt,
+        "degraded": degraded,
+        "triggers_recreated": triggers_were_missing and not degraded,
+    }
 
 
 def ensure_external_content_fts(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    structural_only: bool = False,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
 ) -> None:
     # Startup path: throttle the deep integrity-check. Explicit repair callers
     # use ``repair_external_content_fts(..., throttle=False)`` for a forced check.
-    repair_external_content_fts(conn, spec, now=now, throttle=True)
+    repair_external_content_fts(
+        conn,
+        spec,
+        now=now,
+        throttle=True,
+        structural_only=structural_only,
+        coordinator=coordinator,
+        local_lock=local_lock,
+    )
 
 
-def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+def run_versioned_migrations(
+    conn: sqlite3.Connection,
+    *,
+    coordinator: WriterCoordinator | None = None,
+    local_lock=None,
+) -> None:
     refuse_schema_version_too_new(conn)
+    with _write_transaction(
+        conn,
+        coordinator=coordinator,
+        local_lock=local_lock,
+        begin_immediate=True,
+    ):
+        # Re-check after writer admission, before mutating even bootstrap
+        # support tables. Another helper/process may have migrated while this
+        # caller waited for the SQLite writer slot.
+        refuse_schema_version_too_new(conn)
+        ensure_metadata_table(conn)
+        ensure_migration_state_table(conn)
+        current_version = get_schema_version(conn)
+        if current_version < 2:
+            mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
+            current_version = 2
 
-    ensure_metadata_table(conn)
-    ensure_migration_state_table(conn)
+        if current_version < 3:
+            ensure_lifecycle_state_table(conn)
+            mark_migration_step_complete(conn, "v3_lifecycle_state")
+            current_version = 3
+        else:
+            ensure_lifecycle_state_table(conn)
 
-    refuse_schema_version_too_new(conn)
-    current_version = get_schema_version(conn)
-    if current_version < 2:
-        mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
-        current_version = 2
+        ensure_lifecycle_state_columns(conn)
+        if current_version < 4:
+            mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
+            current_version = 4
 
-    if current_version < 3:
-        ensure_lifecycle_state_table(conn)
-        mark_migration_step_complete(conn, "v3_lifecycle_state")
-        current_version = 3
-    else:
-        ensure_lifecycle_state_table(conn)
+        ensure_message_origin_columns(conn)
+        if current_version < 5:
+            mark_migration_step_complete(conn, "v5_message_conversation_id")
+            current_version = 5
 
-    ensure_lifecycle_state_columns(conn)
-    if current_version < 4:
-        mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
-        current_version = 4
+        # Run this unconditionally because MessageStore can advance metadata to
+        # v6 before SummaryDAG creates summary_nodes on a brand-new database.
+        ensure_summary_publication_columns(conn)
+        if current_version < 6:
+            mark_migration_step_complete(conn, "v6_atomic_publication")
+            current_version = 6
 
-    ensure_message_origin_columns(conn)
-    if current_version < 5:
-        mark_migration_step_complete(conn, "v5_message_conversation_id")
-        current_version = 5
+        ensure_prepared_compaction_tables(conn)
+        if current_version < 7:
+            mark_migration_step_complete(conn, "v7_prepared_compactions")
+            current_version = 7
 
-    # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
-    # Creating them would advance the core schema for every install (even with
-    # the feature off) and make the DB unreadable by a base build. They are
-    # created lazily by RollupStore on the enabled path via a NAMED migration
-    # step (``temporal_rollups_v1``), independent of this numeric counter.
-    # Embedding tables are intentionally NOT created here: they are an opt-in
-    # feature materialized lazily by VectorStore (recorded via the named
-    # ``embeddings_v1`` marker), so a disabled install stays at v5 with no
-    # embedding tables and the numeric counter is free for the temporal train.
-    set_schema_version(conn, current_version)
+        # Opt-in temporal-rollup, embedding, and chunk tables are deliberately
+        # not created here. Their feature stores own lazy named migrations.
+        set_schema_version(conn, current_version)

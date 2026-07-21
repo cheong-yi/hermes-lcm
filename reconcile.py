@@ -991,7 +991,9 @@ class ReconcileMixin:
         # the memo below) since most rows never need them.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
+        candidate_index_by_store_id: dict[int, int] = {}
         for stored in candidates:
+            candidate_index_by_store_id[int(stored["store_id"])] = len(stored_identities)
             identity = self._message_replay_identity(stored, stored_row=True)
             stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
@@ -1118,8 +1120,38 @@ class ReconcileMixin:
             return matched_message_ids
 
         ids_by_message_id: dict[int, int] = {}
+        exact_runtime_associations = getattr(
+            self,
+            "_current_active_replay_store_associations_by_message_id",
+            {},
+        )
         store_idx = 0
         for msg_idx, msg in enumerate(messages):
+            exact_association = exact_runtime_associations.get(id(msg))
+            if exact_association is not None:
+                associated_message, associated_identity, exact_store_id = exact_association
+                current_identity = self._raw_externalized_placeholder_replay_identity(msg)
+                if associated_message is not msg or associated_identity != current_identity:
+                    # A known exact association that no longer describes this
+                    # object is invalid provenance. Never downgrade it to the
+                    # heuristic duplicate matcher.
+                    continue
+            else:
+                exact_store_id = None
+            exact_store_idx = (
+                candidate_index_by_store_id.get(int(exact_store_id))
+                if exact_store_id is not None
+                else None
+            )
+            if exact_store_idx is not None and exact_store_idx >= store_idx:
+                ids_by_message_id[id(msg)] = int(exact_store_id)
+                store_idx = exact_store_idx + 1
+                continue
+            if exact_association is not None:
+                # The durable row is behind the current monotonic cursor or no
+                # longer belongs to this candidate set. Known provenance must
+                # fail closed rather than rebind to a later identical row.
+                continue
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)

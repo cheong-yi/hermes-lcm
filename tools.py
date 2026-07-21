@@ -31,7 +31,6 @@ from .diagnostics import (
 )
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
-    check_external_content_fts_integrity,
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
@@ -4628,6 +4627,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 f"d{depth}": info for depth, info in sorted(depths.items())
             },
         },
+        "async_compaction": full_status.get("async_compaction", engine.get_async_compaction_status()),
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
@@ -4652,6 +4652,10 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
             "expansion_model": engine._config.expansion_model or "(summary model)",
+            "async_background_compaction_enabled": engine._config.async_background_compaction_enabled,
+            "async_background_compaction_worker_enabled": engine._config.async_background_compaction_worker_enabled,
+            "async_background_compaction_max_batches": engine._config.async_background_compaction_max_batches,
+            "async_background_compaction_retry_backoff_seconds": engine._config.async_background_compaction_retry_backoff_seconds,
         },
         "proactive_recall": {
             "enabled": bool(getattr(engine._config, "proactive_recall_enabled", False)),
@@ -4779,12 +4783,12 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
     # inverted indexes point at the exact table and repair path.
-    for check_name, conn, spec in (
-        ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
-        ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
+    for check_name, spec in (
+        ("messages_fts_integrity", build_message_fts_spec()),
+        ("nodes_fts_integrity", build_nodes_fts_spec()),
     ):
         try:
-            fts_integrity = check_external_content_fts_integrity(conn, spec)
+            fts_integrity = engine._store.check_fts_integrity(spec)
             status = fts_integrity["status"]
             checks.append({
                 "check": check_name,
@@ -4965,6 +4969,12 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
     if c.incremental_max_depth == 0:
         config_warnings.append("incremental_max_depth=0 disables condensation entirely")
+    if c.async_background_compaction_max_batches < 1:
+        config_warnings.append("async_background_compaction_max_batches must be at least 1")
+    if c.async_background_compaction_retry_backoff_seconds < 0:
+        config_warnings.append("async_background_compaction_retry_backoff_seconds must not be negative")
+    if c.async_background_compaction_worker_enabled and not c.async_background_compaction_enabled:
+        config_warnings.append("async background worker is enabled while async background compaction is disabled")
     for warning in getattr(c, "config_source_warnings", []) or []:
         config_warnings.append(warning)
     for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:
@@ -4977,6 +4987,29 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "status": "pass" if not config_warnings else "warn",
         "detail": config_warnings if config_warnings else "all settings within normal ranges",
     })
+
+    try:
+        async_status = engine.get_async_compaction_status()
+        async_warn = bool(
+            async_status.get("preparing_batches")
+            or async_status.get("failed_batches")
+            or async_status.get("last_error")
+            or async_status.get("stale_ready_policy_batches")
+            or async_status.get("stale_ready_route_batches")
+            or async_status.get("expired_retry_batches")
+            or async_status.get("orphan_pending_summaries")
+        )
+        checks.append({
+            "check": "async_compaction_health",
+            "status": "warn" if async_warn else "pass",
+            "detail": async_status,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "async_compaction_health",
+            "status": "fail",
+            "detail": str(e),
+        })
 
     # 5. Source-lineage hygiene
     try:

@@ -38,7 +38,10 @@ _ensure_local_package_importable()
 
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.dag import build_nodes_fts_spec  # noqa: E402
-from hermes_lcm.db_bootstrap import ensure_external_content_fts  # noqa: E402
+from hermes_lcm.db_bootstrap import (  # noqa: E402
+    ensure_external_content_fts,
+    ensure_summary_publication_columns,
+)
 from hermes_lcm.ingest_protection import protect_message_for_ingest  # noqa: E402
 from hermes_lcm.message_content import normalize_content_value  # noqa: E402
 from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
@@ -710,7 +713,7 @@ def _ensure_import_table(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS summary_nodes (
             node_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -725,9 +728,13 @@ def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
             earliest_at REAL,
             latest_at REAL,
             expand_hint TEXT DEFAULT ''
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
-            ON summary_nodes(session_id, depth, created_at);
+            ON summary_nodes(session_id, depth, created_at)
         """
     )
     columns = _table_columns(conn, "summary_nodes")
@@ -738,6 +745,7 @@ def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
     )
+    ensure_summary_publication_columns(conn)
     ensure_external_content_fts(conn, build_nodes_fts_spec())
 
 
@@ -1183,39 +1191,35 @@ def _process_import_candidates(
         ingest_protection_config=protection_config,
         hermes_home=str(target_path.parent),
     )
-    conn = store._conn
-    _ensure_import_table(conn)
-    imported_message_map = _imported_message_map_from_conn(conn, import_id)
     summary_stats = SummaryImportStats(scanned=len(summary_candidates))
-    if include_summaries:
-        _ensure_summary_nodes_schema(conn)
-        _ensure_summary_import_table(conn)
-
     imported = 0
     try:
-        for candidate in to_import:
-            store_id = _insert_import_candidate(
-                conn,
-                import_id=import_id,
-                candidate=candidate,
-                protection_config=protection_config,
-                target_path=target_path,
-            )
-            imported_message_map[candidate.source_message_id] = store_id
-            imported += 1
-        if include_summaries:
-            summary_stats = _process_summary_candidates(
-                conn=conn,
-                import_id=import_id,
-                candidates=summary_candidates,
-                imported_messages=imported_message_map,
-                imported_summaries=_imported_summary_map_from_conn(conn, import_id),
-                dry_run=False,
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        with store.write_transaction() as conn:
+            _ensure_import_table(conn)
+            imported_message_map = _imported_message_map_from_conn(conn, import_id)
+            if include_summaries:
+                _ensure_summary_nodes_schema(conn)
+                _ensure_summary_import_table(conn)
+
+            for candidate in to_import:
+                store_id = _insert_import_candidate(
+                    conn,
+                    import_id=import_id,
+                    candidate=candidate,
+                    protection_config=protection_config,
+                    target_path=target_path,
+                )
+                imported_message_map[candidate.source_message_id] = store_id
+                imported += 1
+            if include_summaries:
+                summary_stats = _process_summary_candidates(
+                    conn=conn,
+                    import_id=import_id,
+                    candidates=summary_candidates,
+                    imported_messages=imported_message_map,
+                    imported_summaries=_imported_summary_map_from_conn(conn, import_id),
+                    dry_run=False,
+                )
     finally:
         store.close()
 

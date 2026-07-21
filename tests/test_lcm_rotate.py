@@ -408,9 +408,7 @@ def test_rotate_apply_does_not_corrupt_source_lineage_on_next_compress(tmp_path,
     messages = [{"role": "system", "content": "You are a helpful assistant."}]
     for i in range(10):
         messages.append({"role": "user", "content": f"msg-{i} " + "x" * 200})
-    for msg in messages[1:]:
-        engine._store.append(engine._session_id, msg, source="test")
-    engine._store._conn.commit()
+    engine.ingest(messages)
 
     # Apply rotate. The persisted frontier moves to 8 (store_id of msg-8,
     # the second-to-last message; tail keeps the last 3 store rows). The
@@ -432,8 +430,7 @@ def test_rotate_apply_does_not_corrupt_source_lineage_on_next_compress(tmp_path,
     # the same process. The in-memory active context still has all the
     # pre-rotate messages.
     messages.append({"role": "assistant", "content": "ack-msg-9"})
-    engine._store.append(engine._session_id, messages[-1], source="test")
-    engine._store._conn.commit()
+    engine.ingest(messages)
 
     # Stub the summarizer so the test is deterministic and we can verify
     # exactly which raw messages get compacted.

@@ -1026,12 +1026,17 @@ def test_inflight_maintenance_processes_only_one_bounded_chunk(tmp_path):
         conn = store.connection
         command_mod._ensure_inflight_table(conn)
         identity = "identity"
-        conn.executemany(
-            "INSERT INTO lcm_embedding_backfill_inflight("
-            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
-            "state, updated_at) VALUES (?, ?, 'stale', 1, 1, 'claimed', 1)",
-            ((str(index), identity) for index in range(250_001)),
-        )
+        # VectorStore uses autocommit so ordinary reads never pin a WAL
+        # snapshot. Seed this large fixture in one explicit transaction rather
+        # than forcing 250,001 durability fsyncs unrelated to the behavior under
+        # test.
+        with store._write_transaction():
+            conn.executemany(
+                "INSERT INTO lcm_embedding_backfill_inflight("
+                "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+                "state, updated_at) VALUES (?, ?, 'stale', 1, 1, 'claimed', 1)",
+                ((str(index), identity) for index in range(250_001)),
+            )
         lease = command_mod._acquire_embedding_backfill_lease(
             conn, ttl_s=600.0, heartbeat_s=60.0
         )
@@ -1344,32 +1349,15 @@ def test_inflight_schema_rejects_incompatible_primary_key(tmp_path):
 def test_concurrent_first_run_inflight_schema_creation_is_idempotent(tmp_path):
     db_path = tmp_path / "concurrent-inflight.db"
     sqlite3.connect(db_path).close()
-    begin_barrier = threading.Barrier(2)
+    start_barrier = threading.Barrier(2)
     outcomes: list[str] = []
     outcome_lock = threading.Lock()
-
-    class BeginBarrierConnection:
-        def __init__(self, conn):
-            self._conn = conn
-            self._synchronized = False
-
-        @property
-        def in_transaction(self):
-            return self._conn.in_transaction
-
-        def execute(self, sql, params=()):
-            if sql == "BEGIN IMMEDIATE" and not self._synchronized:
-                self._synchronized = True
-                begin_barrier.wait(timeout=2)
-            return self._conn.execute(sql, params)
-
-        def __getattr__(self, name):
-            return getattr(self._conn, name)
 
     def initialize() -> None:
         conn = sqlite3.connect(db_path, timeout=3, check_same_thread=False)
         try:
-            command_mod._ensure_inflight_table(BeginBarrierConnection(conn))
+            start_barrier.wait(timeout=2)
+            command_mod._ensure_inflight_table(conn)
             outcome = "success"
         except Exception as exc:  # pragma: no cover - assertion reports detail
             outcome = f"{type(exc).__name__}: {exc}"

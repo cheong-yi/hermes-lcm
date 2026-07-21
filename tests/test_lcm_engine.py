@@ -20165,7 +20165,7 @@ class TestSessionRollover:
         failing_messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "epsilon " * 80},
-            {"role": "assistant", "content": "zeta " * 80},
+            {"role": "assistant", "content": "zeta"},
             {"role": "user", "content": "eta " * 80},
             {"role": "assistant", "content": "theta " * 80},
             {"role": "user", "content": "iota " * 80},
@@ -25485,7 +25485,7 @@ class TestEngineTools:
         assert all(c["status"] == "pass" for c in result["checks"])
 
     def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
-        def fake_fts_integrity(_conn, spec):
+        def fake_fts_integrity(spec):
             if spec.table_name == "nodes_fts":
                 return {
                     "status": "fail",
@@ -25493,7 +25493,7 @@ class TestEngineTools:
                 }
             return {"status": "pass", "detail": "ok"}
 
-        monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+        monkeypatch.setattr(engine._store, "check_fts_integrity", fake_fts_integrity)
 
         result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
