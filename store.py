@@ -22,9 +22,12 @@ from typing import Any, Callable, Dict, List, Optional
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    check_external_content_fts_integrity,
     configure_connection,
     ensure_external_content_fts,
+    external_content_fts_needs_repair,
     refuse_schema_version_too_new,
+    repair_external_content_fts,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -49,6 +52,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -261,7 +265,14 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        ingest_protection_config=None,
+        hermes_home: str = "",
+        writer_coordinator: WriterCoordinator | None = None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
@@ -284,14 +295,29 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        self._writer_coordinator = writer_coordinator or get_writer_coordinator(self.db_path)
+        self._writer_owner_token = self._writer_coordinator.bind_owner()
         self._init_db()
+
+    @property
+    def writer_coordinator(self) -> WriterCoordinator:
+        return self._writer_coordinator
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS messages (
+        configure_connection(
+            self._conn,
+            coordinator=self._writer_coordinator,
+            local_lock=self._write_lock,
+        )
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+            begin_immediate=True,
+        ):
+            refuse_schema_version_too_new(self._conn)
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 source TEXT DEFAULT '',
@@ -307,50 +333,75 @@ class MessageStore:
                 ingested_at REAL,
                 observed_at REAL,
                 observed_at_source TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_msg_session
-                ON messages(session_id, store_id);
-            CREATE INDEX IF NOT EXISTS idx_msg_session_ts
-                ON messages(session_id, timestamp);
+            )""")
+            self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_msg_session
+                ON messages(session_id, store_id)""")
+            self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_msg_session_ts
+                ON messages(session_id, timestamp)""")
 
-            CREATE TABLE IF NOT EXISTS metadata (
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            );
-        """)
+            )""")
+            run_versioned_migrations(
+                self._conn,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
+            self._ensure_source_column()
+            self._ensure_conversation_id_column()
+            self._ensure_time_contract_columns()
+            ensure_external_content_fts(
+                self._conn,
+                build_message_fts_spec(),
+                structural_only=True,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
+            refuse_schema_version_too_new(self._conn)
+        # Structural FTS DDL is committed with the core bootstrap above. The
+        # throttled deep scan remains outside that writer transaction so a
+        # large integrity check never extends constructor writer hold time.
         ensure_external_content_fts(
             self._conn,
             build_message_fts_spec(),
+            coordinator=self._writer_coordinator,
+            local_lock=self._write_lock,
         )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_column()
-        self._ensure_conversation_id_column()
-        self._ensure_time_contract_columns()
-        self._conn.commit()
 
     def _ensure_source_column(self) -> None:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
-        add_column_if_missing(
-            self._conn, columns, "source",
-            "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
-        )
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+            begin_immediate=True,
+        ):
+            add_column_if_missing(
+                self._conn, columns, "source",
+                "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
+            )
 
     def _ensure_conversation_id_column(self) -> None:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
-        add_column_if_missing(
-            self._conn, columns, "conversation_id",
-            "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
-        )
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+            begin_immediate=True,
+        ):
+            add_column_if_missing(
+                self._conn, columns, "conversation_id",
+                "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+            )
 
     def _ensure_time_contract_columns(self) -> None:
         """Add the backward-compatible V4.2 source-time sidecar columns.
@@ -401,7 +452,10 @@ class MessageStore:
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
 
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -425,7 +479,6 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
-            self._conn.commit()
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -463,35 +516,43 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
+        prepared_rows = []
+        for msg, est in zip(messages, token_estimates):
+            tc = msg.get("tool_calls")
+            ingested_at = time.time()
+            observed_at = _normalize_observed_at(msg.get("timestamp"))
+            prepared_rows.append(
+                (
+                    session_id,
+                    _normalize_source_value(source),
+                    _normalize_conversation_id_value(conversation_id),
+                    msg.get("role", "unknown"),
+                    _normalize_content_value(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    json.dumps(tc) if tc else None,
+                    msg.get("tool_name"),
+                    ingested_at,
+                    est,
+                    0,
+                    ingested_at,
+                    observed_at,
+                    "host_message_timestamp" if observed_at is not None else None,
+                )
+            )
+
         ids = []
-        with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                observed_at = _normalize_observed_at(msg.get("timestamp"))
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
+            for row in prepared_rows:
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
                         observed_at, observed_at_source)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
+                    row,
                 )
                 ids.append(cur.lastrowid)
         return ids
@@ -500,22 +561,26 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
-            self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
-            self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
@@ -535,7 +600,10 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -552,30 +620,37 @@ class MessageStore:
                     "tool_call_id": tool_call_id,
                 }
             )
-            self._conn.execute(
-                "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
-                (placeholder, placeholder_tokens, store_id),
+            cur = self._conn.execute(
+                """UPDATE messages
+                   SET content = ?, token_estimate = ?
+                   WHERE store_id = ? AND role = 'tool' AND pinned = 0 AND content = ?""",
+                (placeholder, placeholder_tokens, store_id, current_content),
             )
+            if cur.rowcount != 1:
+                return False
             if before_commit is not None:
                 before_commit(self._conn, store_id)
-            self._conn.commit()
             return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -798,6 +873,44 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_conversation_messages_after(
+        self,
+        conversation_id: str,
+        *,
+        after_store_id: int = 0,
+        limit: int = 1000,
+        through_store_id: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Read one bounded page of carried publication-lineage rows."""
+
+        bounded_limit = max(1, int(limit))
+        upper_bound = (
+            int(through_store_id)
+            if through_store_id is not None
+            else self.get_conversation_max_store_id(conversation_id)
+        )
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                WHERE conversation_id = ? AND store_id > ? AND store_id <= ?
+                ORDER BY store_id LIMIT ?""",
+            (
+                conversation_id,
+                int(after_store_id or 0),
+                upper_bound,
+                bounded_limit,
+            ),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get_conversation_max_store_id(self, conversation_id: str) -> int:
+        """Return a read-only upper bound for a paginated lineage scan."""
+
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(store_id), 0) FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
@@ -970,7 +1083,10 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
+        with self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+        ):
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1039,25 +1155,32 @@ class MessageStore:
         if conn is None:
             return False
         wrote = False
-        with self._write_lock:
+        with self._writer_coordinator.transaction(
+            conn,
+            local_lock=self._write_lock,
+        ):
             for key in keys:
                 if skip_unchanged:
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                conn.execute(
-                    """
-                    INSERT INTO metadata(key, value)
-                    VALUES(?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (key, serialized),
-                )
-                wrote = True
-            if wrote:
-                conn.commit()
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        WHERE metadata.value IS NOT excluded.value
+                        """,
+                        (key, serialized),
+                    )
+                    wrote = wrote or cursor.rowcount > 0
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, serialized),
+                    )
+                    wrote = True
         return wrote
 
     # -- Compaction telemetry ------------------------------------------------
@@ -1530,7 +1653,75 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        self._writer_coordinator.flush(
+            self._conn,
+            local_lock=self._write_lock,
+        )
+
+    def check_fts_integrity(
+        self,
+        spec: ExternalContentFtsSpec,
+    ) -> dict[str, str]:
+        """Run an FTS integrity savepoint under canonical store admission."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            return check_external_content_fts_integrity(self._conn, spec)
+
+    def inspect_fts(self, spec: ExternalContentFtsSpec) -> dict[str, Any]:
+        """Return structural, deep-integrity, and row-count FTS status."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            structural_needs_repair = external_content_fts_needs_repair(
+                self._conn,
+                spec,
+            )
+            integrity = check_external_content_fts_integrity(self._conn, spec)
+            content_rows = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM {spec.content_table}"
+                ).fetchone()[0]
+            )
+            try:
+                fts_rows = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.table_name}"
+                    ).fetchone()[0]
+                )
+            except sqlite3.Error:
+                fts_rows = None
+            return {
+                "structural_needs_repair": structural_needs_repair,
+                "integrity": integrity,
+                "content_rows": content_rows,
+                "fts_rows": fts_rows,
+            }
+
+    def repair_fts(
+        self,
+        spec: ExternalContentFtsSpec,
+    ) -> dict[str, bool]:
+        """Repair one FTS index under the store permit, lock, and transaction."""
+
+        with self._writer_coordinator.write_region(self._write_lock):
+            return repair_external_content_fts(
+                self._conn,
+                spec,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
+
+    def write_transaction(self):
+        """Return the store connection's canonical coordinated transaction.
+
+        Cross-table maintenance owns SQL at the command layer, but it must not
+        reach private locks or bypass the one-writer admission boundary.
+        """
+
+        return self._writer_coordinator.transaction(
+            self._conn,
+            local_lock=self._write_lock,
+            begin_immediate=True,
+        )
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1545,16 +1736,16 @@ class MessageStore:
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
-        if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
-            self._conn = None
+        owner_token = getattr(self, "_writer_owner_token", None)
+        if owner_token is None:
+            return
+        self._writer_coordinator.close_owner(
+            owner_token,
+            conn,
+            local_lock=self._write_lock,
+        )
+        self._writer_owner_token = None
+        self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

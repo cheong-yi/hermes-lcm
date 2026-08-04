@@ -1,24 +1,19 @@
 """RED spike tests for opt-in async/background compaction.
 
-These tests intentionally describe the desired public/private contract before
-implementation exists. They stay xfailed on the design branch so the normal
-suite remains green, but strict xfail means each scenario becomes a real gate as
-soon as the feature starts landing.
+These tests describe the public/private contract for async preparation and
+atomic promotion.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 
 import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="async/background compaction with atomic publish is design-only; implementation not landed",
-)
 
 
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):
@@ -239,7 +234,7 @@ def test_summary_failure_backoff_does_not_wedge_foreground_compaction(tmp_path, 
         engine.shutdown()
 
 
-def test_restart_recovers_or_discards_pending_batches_safely(tmp_path):
+def test_restart_recovers_pending_batch_with_fresh_attempt(tmp_path, monkeypatch):
     """Given pending/preparing rows at shutdown, restart never treats them as canonical."""
     db_path = tmp_path / "restart.db"
     config = LCMConfig(database_path=str(db_path), fresh_tail_count=2, leaf_chunk_tokens=20)
@@ -262,7 +257,22 @@ def test_restart_recovers_or_discards_pending_batches_safely(tmp_path):
 
         assert restarted._dag.get_session_node_count(restarted.current_session_id) == 0
         assert status["preparing_batches"] == 0
-        assert status["pending_batches"] + status["rejected_batches"] + status["failed_batches"] >= 1
+        assert status["pending_batches"] == 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("restarted prepared summary", 1),
+        )
+        retried = restarted.prepare_background_compaction_once(messages)
+
+        assert retried.state == "ready"
+        assert retried.batch_id == batch.batch_id
+        assert retried.attempt_count == 2
+        row = restarted._store.connection.execute(
+            "SELECT owner_id, attempt_token FROM lcm_prepared_compactions WHERE batch_id = ?",
+            (batch.batch_id,),
+        ).fetchone()
+        assert tuple(row) == (None, None)
     finally:
         restarted.shutdown()
 
@@ -329,5 +339,77 @@ def test_status_and_doctor_report_async_compaction_counts(tmp_path):
         async_checks = [check for check in doctor["checks"] if check["check"].startswith("async_compaction")]
         assert async_checks
         assert any("prepared_batches" in check["detail"] for check in async_checks)
+    finally:
+        engine.shutdown()
+
+
+def test_status_preserves_last_events_and_doctor_reports_async_debt(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    messages = _messages()
+    try:
+        engine.ingest(messages)
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("first prepared summary", 1),
+        )
+        rejected = engine.prepare_background_compaction_once(messages)
+        engine.reject_prepared_compaction(rejected.batch_id, reason="historical rejection")
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("historical failure")),
+        )
+        failed = engine.prepare_background_compaction_once(messages)
+        assert failed.state == "failed"
+        engine._store.connection.execute(
+            "UPDATE lcm_prepared_compactions SET next_retry_at = ? WHERE batch_id = ?",
+            (time.time() - 1, failed.batch_id),
+        )
+        engine._store.connection.commit()
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("newest prepared summary", 1),
+        )
+        ready = engine.prepare_background_compaction_once(messages)
+        assert ready.state == "ready"
+
+        # The newest row has no error/rejection, but status must preserve the
+        # most recent non-null event from older generations.
+        engine._config.fresh_tail_count += 1
+        engine._config.summary_model = "changed-route"
+
+        # Foreign keys are connection-local.  This simulates an interrupted or
+        # externally repaired DB containing a pending node whose batch vanished.
+        with sqlite3.connect(engine._store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO lcm_prepared_summary_nodes(
+                    pending_id, batch_id, conversation_id, session_id, depth,
+                    summary, token_count, source_token_count, source_ids,
+                    previous_pending_ids, created_at, expand_hint
+                ) VALUES ('orphan-node', 'missing-batch', ?, ?, 0,
+                          'orphan', 1, 1, '[]', '[]', ?, '')
+                """,
+                (engine.current_conversation_id, engine.current_session_id, time.time()),
+            )
+
+        status = engine.get_async_compaction_status()
+        doctor = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+        health = next(
+            check for check in doctor["checks"] if check["check"] == "async_compaction_health"
+        )
+
+        assert status["last_rejected_reason"] == "historical rejection"
+        assert status["last_error"] == "historical failure"
+        assert status["stale_ready_policy_batches"] == 1
+        assert status["stale_ready_route_batches"] == 1
+        assert status["expired_retry_batches"] == 1
+        assert status["orphan_pending_summaries"] == 1
+        assert health["status"] == "warn"
+        assert health["detail"]["stale_ready_policy_batches"] == 1
+        assert health["detail"]["stale_ready_route_batches"] == 1
+        assert health["detail"]["expired_retry_batches"] == 1
+        assert health["detail"]["orphan_pending_summaries"] == 1
     finally:
         engine.shutdown()

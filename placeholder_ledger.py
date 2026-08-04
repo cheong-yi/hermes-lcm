@@ -630,6 +630,34 @@ class PlaceholderLedgerMixin:
         records.append({"store": store_digest, "content": content_digest or ""})
         self._write_generated_ignored_dependent_reply_records(records)
 
+    def _carry_generated_ignored_dependent_replies(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Keep retained replies recognizable after their source frontier advances."""
+
+        content_digests = {
+            digest
+            for message in messages
+            for digest in (
+                self._ignored_dependent_reply_content_fingerprint(
+                    message,
+                    text_content_for_pattern_matching(message.get("content")) or "",
+                ),
+            )
+            if digest
+        }
+        if not content_digests:
+            return
+        records = self._load_generated_ignored_dependent_reply_records()
+        retained = [
+            record
+            for record in records
+            if record.get("content") not in content_digests
+        ]
+        retained.extend({"content": digest} for digest in sorted(content_digests))
+        self._write_generated_ignored_dependent_reply_records(retained)
+
     def _apply_ignored_active_replay_placeholders(
         self,
         original_messages: List[Dict[str, Any]],

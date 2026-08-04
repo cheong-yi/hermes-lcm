@@ -24,6 +24,7 @@ from .db_bootstrap import (
     verify_temporal_rollup_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_writer import WriterCoordinator, get_writer_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +53,30 @@ class RollupBuildToken(NamedTuple):
 class RollupStore:
     """SQLite-backed store for temporal rollups and their source nodes."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        writer_coordinator: WriterCoordinator | None = None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
-        self._init_db()
+        self._writer_coordinator = writer_coordinator or get_writer_coordinator(
+            self.db_path
+        )
+        self._owner_token = self._writer_coordinator.bind_owner()
+        try:
+            self._init_db()
+        except BaseException:
+            self._writer_coordinator.close_owner(
+                self._owner_token,
+                self._conn,
+                local_lock=self._write_lock,
+            )
+            self._conn = None
+            raise
 
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
@@ -65,37 +84,43 @@ class RollupStore:
             timeout=5.0,
             check_same_thread=False,
         )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        # The rollup tables are a lazy, opt-in feature: they are NOT part of the
-        # core numeric schema_version (see db_bootstrap.run_versioned_migrations).
-        # RollupStore is only constructed on the temporal_rollups_enabled path, so
-        # creating them here keeps a disabled install at the base schema with no
-        # rollup tables while still being idempotent under concurrent construction.
-        ensure_temporal_rollup_tables(self._conn)
-        # Do NOT trust the named marker alone: it can be present on a DB whose
-        # tables were dropped or left partial by a crash mid-create. Verify the
-        # required tables+indexes actually exist and re-ensure (idempotent
-        # CREATE IF NOT EXISTS makes this safe) before recording the step, so a
-        # stale marker can never mask a missing table (maintainer #387 A3).
-        missing = verify_temporal_rollup_schema(self._conn)
-        if missing:
+        with self._writer_coordinator.write_region(self._write_lock):
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            self._conn.row_factory = sqlite3.Row
+            run_versioned_migrations(
+                self._conn,
+                coordinator=self._writer_coordinator,
+                local_lock=self._write_lock,
+            )
+            # The rollup tables are a lazy, opt-in feature: they are NOT part of the
+            # core numeric schema_version (see db_bootstrap.run_versioned_migrations).
+            # RollupStore is only constructed on the temporal_rollups_enabled path, so
+            # creating them here keeps a disabled install at the base schema with no
+            # rollup tables while still being idempotent under concurrent construction.
             ensure_temporal_rollup_tables(self._conn)
             missing = verify_temporal_rollup_schema(self._conn)
             if missing:
-                raise RuntimeError(
-                    "temporal rollup schema incomplete after ensure: "
-                    + ", ".join(missing)
-                )
-        mark_migration_step_complete(self._conn, "temporal_rollups_v1")
-        self._conn.commit()
+                # Do NOT trust the named marker alone: re-ensure once before
+                # refusing an incomplete schema.
+                ensure_temporal_rollup_tables(self._conn)
+                missing = verify_temporal_rollup_schema(self._conn)
+                if missing:
+                    raise RuntimeError(
+                        "temporal rollup schema incomplete after ensure: "
+                        + ", ".join(missing)
+                    )
+            mark_migration_step_complete(self._conn, "temporal_rollups_v1")
+            self._conn.commit()
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         try:
-            with self._write_lock, self._conn:
+            with self._writer_coordinator.transaction(
+                self._conn,
+                local_lock=self._write_lock,
+                begin_immediate=True,
+            ):
                 yield
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
@@ -834,11 +859,11 @@ class RollupStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            self._writer_coordinator.close_owner(
+                self._owner_token,
+                conn,
+                local_lock=self._write_lock,
+            )
             self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup

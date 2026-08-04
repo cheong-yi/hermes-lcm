@@ -1,6 +1,7 @@
 """Tests for /lcm command surface and diagnostics."""
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 import importlib.util
 import sqlite3
@@ -222,6 +223,10 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
         "lcm:\n"
         "  context_threshold: 0.61\n"
         "  fresh_tail_count: 999\n"
+        "  async_background_compaction_enabled: true\n"
+        "  async_background_compaction_worker_enabled: true\n"
+        "  async_background_compaction_max_batches: 2\n"
+        "  async_background_compaction_retry_backoff_seconds: 45\n"
         "compression:\n"
         "  threshold: 0.92\n"
         "auxiliary:\n"
@@ -249,12 +254,17 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config"]["summary_spend_max_calls"] == 0
     assert payload["config"]["summary_spend_window_seconds"] == 123.5
     assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
+    assert payload["config"]["async_background_compaction_enabled"] is True
+    assert payload["config"]["async_background_compaction_worker_enabled"] is True
+    assert payload["config"]["async_background_compaction_max_batches"] == 2
+    assert payload["config"]["async_background_compaction_retry_backoff_seconds"] == 45.0
     assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
     assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
     assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
     assert payload["config_sources"]["summary_spend_max_calls"] == "env:LCM_SUMMARY_SPEND_MAX_CALLS"
     assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
     assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
+    assert payload["config_sources"]["async_background_compaction_enabled"] == "config_yaml:lcm.async_background_compaction_enabled"
     assert engine._summary_spend_guard.max_calls == 0
     assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
 
@@ -1073,12 +1083,18 @@ def test_lcm_doctor_text_reports_same_count_stale_message_fts(engine):
 
 
 def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkeypatch):
-    def fake_fts_integrity(_conn, spec):
-        if spec.table_name == "messages_fts":
-            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
-        return {"status": "pass", "detail": "ok"}
+    original_inspect = engine._store.inspect_fts
 
-    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", fake_fts_integrity)
+    def fake_inspect(spec):
+        inspection = original_inspect(spec)
+        if spec.table_name == "messages_fts":
+            inspection["integrity"] = {
+                "status": "unchecked",
+                "detail": "attempt to write a readonly database",
+            }
+        return inspection
+
+    monkeypatch.setattr(engine._store, "inspect_fts", fake_inspect)
 
     text_result = handle_lcm_command("doctor", engine)
 
@@ -1092,12 +1108,12 @@ def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkey
 
 
 def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, monkeypatch):
-    def fake_fts_integrity(_conn, spec):
+    def fake_fts_integrity(spec):
         if spec.table_name == "messages_fts":
             return {"status": "unchecked", "detail": "attempt to write a readonly database"}
         return {"status": "pass", "detail": "ok"}
 
-    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+    monkeypatch.setattr(engine._store, "check_fts_integrity", fake_fts_integrity)
 
     doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
     messages_check = next(check for check in doctor["checks"] if check["check"] == "messages_fts_integrity")
@@ -1128,9 +1144,9 @@ def test_lcm_doctor_surfaces_background_fts_integrity_failed_flag(engine, monkey
 
     # Live deep check reports clean so the persisted flag is the sole signal.
     monkeypatch.setattr(
-        command_mod,
-        "check_external_content_fts_integrity",
-        lambda _conn, _spec: {"status": "pass", "detail": "ok"},
+        engine._store,
+        "check_fts_integrity",
+        lambda _spec: {"status": "pass", "detail": "ok"},
     )
 
     text_result = handle_lcm_command("doctor", engine)
@@ -1228,9 +1244,22 @@ def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
     class FakeStore:
         _conn = ro_conn
 
-        @property
-        def connection(self):
-            return self._conn
+        def inspect_fts(self, spec):
+            integrity = check_external_content_fts_integrity(self._conn, spec)
+            return {
+                "structural_needs_repair": False,
+                "integrity": integrity,
+                "content_rows": int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.content_table}"
+                    ).fetchone()[0]
+                ),
+                "fts_rows": int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.table_name}"
+                    ).fetchone()[0]
+                ),
+            }
 
     class FakeEngine:
         _store = FakeStore()
@@ -1476,6 +1505,40 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     ))
     engine._lifecycle.bind_session("cron_20260414")
     engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=1)
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_compactions(
+            batch_id, conversation_id, session_id, state,
+            frontier_start_store_id, frontier_end_store_id,
+            fresh_tail_count, leaf_chunk_tokens,
+            policy_fingerprint, summary_route_fingerprint, coverage_key,
+            source_ids, validation_source_ids, source_identity_hashes,
+            ordered_lineage, expected_leaf_count, prepared_leaf_count,
+            attempt_count, created_at, updated_at
+        ) VALUES (
+            'cron-batch', 'cron-conversation', 'cron_20260414', 'ready',
+            0, 1, 2, 20,
+            'policy', 'route', 'cron-coverage',
+            '[1]', '[1]', '["hash"]',
+            '[[1,"hash"]]', 1, 1,
+            1, 1.0, 1.0
+        )
+        """
+    )
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_summary_nodes(
+            pending_id, batch_id, conversation_id, session_id, depth,
+            summary, token_count, source_token_count, source_ids,
+            previous_pending_ids, created_at, expand_hint
+        ) VALUES (
+            'cron-pending', 'cron-batch', 'cron-conversation',
+            'cron_20260414', 0, 'prepared cron summary',
+            5, 12, '[1]', '[]', 1.0, 'cron'
+        )
+        """
+    )
+    engine._store.connection.commit()
 
     result = handle_lcm_command("doctor clean apply", engine)
 
@@ -1488,6 +1551,18 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     assert engine._dag.get_session_nodes("cron_20260414") == []
     assert engine._lifecycle.get_by_conversation("cron_20260414") is None
     assert len(engine._store.get_range("normal_session")) == 1
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_compactions
+        WHERE session_id = 'cron_20260414'
+        """
+    ).fetchone()[0] == 0
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_summary_nodes
+        WHERE session_id = 'cron_20260414'
+        """
+    ).fetchone()[0] == 0
 
 
 def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
@@ -1541,6 +1616,26 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     ))
     engine._lifecycle.bind_session("cron_20260414")
     engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=store_id)
+    engine._store.connection.execute(
+        """
+        INSERT INTO lcm_prepared_compactions(
+            batch_id, conversation_id, session_id, state,
+            frontier_start_store_id, frontier_end_store_id,
+            fresh_tail_count, leaf_chunk_tokens,
+            policy_fingerprint, summary_route_fingerprint, coverage_key,
+            source_ids, validation_source_ids, source_identity_hashes,
+            ordered_lineage, expected_leaf_count, prepared_leaf_count,
+            attempt_count, created_at, updated_at
+        ) VALUES (
+            'rollback-batch', 'rollback-conversation', 'cron_20260414', 'ready',
+            0, 1, 2, 20,
+            'policy', 'route', 'rollback-coverage',
+            '[1]', '[1]', '["hash"]',
+            '[[1,"hash"]]', 1, 1,
+            1, 1.0, 1.0
+        )
+        """
+    )
     engine._store._conn.execute(
         """
         CREATE TRIGGER fail_cron_node_delete
@@ -1564,6 +1659,12 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     assert len(engine._store.get_range("cron_20260414")) == 1
     assert len(engine._dag.get_session_nodes("cron_20260414")) == 1
     assert engine._lifecycle.get_by_conversation("cron_20260414") is not None
+    assert engine._store.connection.execute(
+        """
+        SELECT COUNT(*) FROM lcm_prepared_compactions
+        WHERE batch_id = 'rollback-batch'
+        """
+    ).fetchone()[0] == 1
 
 
 def test_clean_apply_stages_250001_sessions_and_bounds_node_purge_batches(tmp_path):
@@ -1579,9 +1680,17 @@ def test_clean_apply_stages_250001_sessions_and_bounds_node_purge_batches(tmp_pa
             session_id TEXT NOT NULL,
             depth INTEGER NOT NULL
         );
-        CREATE INDEX idx_nodes_session_node
-            ON summary_nodes(session_id, node_id);
-        CREATE TABLE lcm_lifecycle_state(
+            CREATE INDEX idx_nodes_session_node
+                ON summary_nodes(session_id, node_id);
+            CREATE TABLE lcm_prepared_compactions(
+                batch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL
+            );
+            CREATE TABLE lcm_prepared_summary_nodes(
+                pending_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL
+            );
+            CREATE TABLE lcm_lifecycle_state(
             conversation_id TEXT PRIMARY KEY,
             current_session_id TEXT,
             last_finalized_session_id TEXT
@@ -1614,7 +1723,10 @@ def test_clean_apply_stages_250001_sessions_and_bounds_node_purge_batches(tmp_pa
         batches.append(list(batch))
 
     engine = SimpleNamespace(
-        _store=SimpleNamespace(connection=conn),
+        _store=SimpleNamespace(
+            connection=conn,
+            write_transaction=lambda: nullcontext(conn),
+        ),
         _session_id="",
         _purge_embeddings_for_nodes=purge,
     )

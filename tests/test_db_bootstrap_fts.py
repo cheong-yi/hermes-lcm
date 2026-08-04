@@ -369,13 +369,13 @@ def test_doctor_repair_apply_joins_background_scans_first(tmp_path, monkeypatch)
         command, "join_background_integrity_scans",
         lambda *a, **k: order.append("join"),
     )
-    real_repair = command.repair_external_content_fts
+    real_repair = engine._store.repair_fts
 
-    def spy_repair(conn, spec, **kwargs):
+    def spy_repair(spec, **kwargs):
         order.append("repair")
-        return real_repair(conn, spec, **kwargs)
+        return real_repair(spec, **kwargs)
 
-    monkeypatch.setattr(command, "repair_external_content_fts", spy_repair)
+    monkeypatch.setattr(engine._store, "repair_fts", spy_repair)
     command._doctor_repair_apply_text(engine)
     assert order[0] == "join"
     assert "repair" in order

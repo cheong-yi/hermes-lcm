@@ -279,7 +279,8 @@ Doctor should warn, not fail, for normal disabled state. It should warn on:
 
 ## Test matrix
 
-These are mirrored in `tests/test_async_background_compaction_design.py` as xfailed RED spike tests until the implementation exists.
+These are enforced by `tests/test_async_background_compaction_design.py` and
+`tests/test_background_compaction_scheduler.py` as active regression gates.
 
 | Test | Proves |
 | --- | --- |
