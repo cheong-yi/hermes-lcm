@@ -5104,6 +5104,19 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         """
 
         mapped = self._get_store_id_map_for_messages(messages)
+        mapped_store_ids = [
+            int(mapped[id(message)])
+            for message in messages
+            if id(message) in mapped
+        ]
+        if any(
+            current_store_id <= previous_store_id
+            for previous_store_id, current_store_id in zip(
+                [self._last_compacted_store_id, *mapped_store_ids],
+                mapped_store_ids,
+            )
+        ):
+            return {}
         if len(mapped) == len(messages) or not self._conversation_id:
             return mapped
 
@@ -5364,11 +5377,9 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 final_store_ids,
             )
         ):
-            # Base mappings are authoritative. If they are unexpectedly
-            # non-monotonic, discard every optional compatibility addition so
-            # this method cannot report a complete reordered lineage.
-            for message_id in compatibility_mapped_message_ids:
-                mapped.pop(message_id, None)
+            # A non-monotonic final map cannot identify one ordered durable
+            # lineage. Fail closed rather than publishing reordered sources.
+            return {}
         return mapped
 
     def _get_publication_store_ids_for_messages(

@@ -1010,6 +1010,108 @@ def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
         engine.shutdown()
 
 
+def test_twenty_four_of_twenty_six_lineage_mapping_fails_safe(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+):
+    """The incident-shaped incomplete lineage must not publish or advance."""
+
+    db_path = tmp_path / "rollover-24-of-26.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=False,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-24-of-26"
+    old_session_id = "session:old-24-of-26"
+    mapped_messages = [
+        {"role": "user", "content": f"durable-lineage-{index:02d}"}
+        for index in range(24)
+    ]
+    missing_messages = [
+        {"role": "assistant", "content": "missing-lineage-a"},
+        {"role": "user", "content": "missing-lineage-b"},
+    ]
+    source_ids = engine._store.append_batch(
+        old_session_id,
+        mapped_messages,
+        conversation_id=conversation_id,
+    )
+    active = [*mapped_messages[:12], *missing_messages, *mapped_messages[12:]]
+    original_active = copy.deepcopy(active)
+    engine.on_session_start(
+        "session:new-24-of-26",
+        conversation_id=conversation_id,
+        platform="discord",
+        context_length=100_000,
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    mapped = engine._get_publication_store_id_map(active)
+
+    assert len(active) == 26
+    assert len(source_ids) == 24
+    assert [mapped[id(message)] for message in mapped_messages[:12]] == source_ids[:12]
+    assert [mapped[id(message)] for message in mapped_messages[12:]] == source_ids[12:]
+    assert all(id(message) not in mapped for message in missing_messages)
+    assert list(mapped.values()) == sorted(mapped.values())
+
+    def forbidden_summary(*_args, **_kwargs):
+        raise AssertionError("incomplete 24-of-26 lineage must fail before summarization")
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", forbidden_summary)
+    try:
+        compressed = engine.compress(active, force=True)
+
+        assert active == original_active
+        assert compressed == original_active
+        assert _node_count(db_path) == 0
+        assert _frontier(db_path, conversation_id) == 0
+        assert "validation=26 mapped=24 missing=2" in caplog.text
+        assert "frontier=0" in caplog.text
+    finally:
+        engine.shutdown()
+
+
+def test_reversed_authoritative_mapping_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "reversed-authoritative.db")),
+    )
+    engine.on_session_start(
+        "session:reversed-authoritative",
+        conversation_id="conversation:reversed-authoritative",
+        platform="cli",
+        context_length=10_000,
+    )
+    active = [
+        {"role": "user", "content": "authoritative-a"},
+        {"role": "assistant", "content": "authoritative-b"},
+    ]
+    ids = engine._store.append_batch(
+        engine._session_id,
+        active,
+        conversation_id=engine._conversation_id,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_get_store_id_map_for_messages",
+        lambda _messages: {id(active[0]): ids[1], id(active[1]): ids[0]},
+    )
+    try:
+        assert engine._get_publication_store_id_map(active) == {}
+    finally:
+        engine.shutdown()
+
+
 def test_missing_mapping_stays_noop_when_scaffold_cleanup_changes_context(
     tmp_path: Path,
     monkeypatch,
