@@ -952,8 +952,47 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
-    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+    def _skipped_store_candidates_are_safe(
+        self,
+        candidates: List[Dict[str, Any]],
+        start_idx: int,
+        match_idx: int,
+    ) -> bool:
+        ignore_matcher = getattr(self, "_matches_ignore_message_patterns", None)
+        scaffold_matcher = getattr(self, "_is_replayed_context_scaffold_message", None)
+        matched_source = str(candidates[match_idx].get("source") or "unknown")
+        for candidate in candidates[start_idx:match_idx]:
+            if (
+                (callable(ignore_matcher) and ignore_matcher(candidate, stored_row=True))
+                or (callable(scaffold_matcher) and scaffold_matcher(candidate))
+            ):
+                continue
+            candidate_source = str(candidate.get("source") or "unknown")
+            # Same-source partial-tail replay is an existing reconciliation
+            # contract. A source change is the hard boundary: the active
+            # surface cannot prove coverage for another surface's row.
+            if candidate_source != matched_source:
+                return False
+        return True
+
+    def _get_store_id_map_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        stop_at_cross_source_gap: bool = False,
+        covered_prefix_messages: Optional[List[Dict[str, Any]]] = None,
+        blocked_message_ids: Optional[set[int]] = None,
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
+
+        ``stop_at_cross_source_gap`` is reserved for compaction, where mapping
+        a later active message across omitted history from another source could
+        advance the persisted frontier without lineage coverage. General
+        lookups retain suffix/partial-tail matching semantics.
+
+        ``covered_prefix_messages`` contains leading anchors intentionally
+        excluded from the returned mapping. Their replay identities may cover
+        matching stored rows before the first compactable message.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
         content from older already-compacted history cannot hijack the mapping.
@@ -978,6 +1017,7 @@ class ReconcileMixin:
         for msg in messages:
             identity = self._message_replay_identity(msg)
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
+
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
         stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
         # Capture each candidate's identity (and its cleanup variant) here - both
@@ -1126,6 +1166,11 @@ class ReconcileMixin:
             {},
         )
         store_idx = 0
+        for prefix_message in covered_prefix_messages or []:
+            prefix_match_idx = find_message_match_index(prefix_message, store_idx)
+            if prefix_match_idx != store_idx:
+                break
+            store_idx += 1
         for msg_idx, msg in enumerate(messages):
             exact_association = exact_runtime_associations.get(id(msg))
             if exact_association is not None:
@@ -1144,6 +1189,18 @@ class ReconcileMixin:
                 else None
             )
             if exact_store_idx is not None and exact_store_idx >= store_idx:
+                if (
+                    stop_at_cross_source_gap
+                    and exact_store_idx > store_idx
+                    and not self._skipped_store_candidates_are_safe(
+                        candidates,
+                        store_idx,
+                        exact_store_idx,
+                    )
+                ):
+                    if blocked_message_ids is not None:
+                        blocked_message_ids.add(id(msg))
+                    break
                 ids_by_message_id[id(msg)] = int(exact_store_id)
                 store_idx = exact_store_idx + 1
                 continue
@@ -1158,6 +1215,18 @@ class ReconcileMixin:
                 if placeholder_identity_counts.get(raw_identity, 0) > 1:
                     match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
                     if match_idx is not None:
+                        if (
+                            stop_at_cross_source_gap
+                            and match_idx > store_idx
+                            and not self._skipped_store_candidates_are_safe(
+                                candidates,
+                                store_idx,
+                                match_idx,
+                            )
+                        ):
+                            if blocked_message_ids is not None:
+                                blocked_message_ids.add(id(msg))
+                            break
                         ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                         store_idx = match_idx + 1
                 else:
@@ -1184,6 +1253,18 @@ class ReconcileMixin:
                             if not baseline_suffix_ids.issubset(candidate_suffix_ids):
                                 probe_idx -= 1
                                 continue
+                            if (
+                                stop_at_cross_source_gap
+                                and probe_idx > store_idx
+                                and not self._skipped_store_candidates_are_safe(
+                                    candidates,
+                                    store_idx,
+                                    probe_idx,
+                                )
+                            ):
+                                if blocked_message_ids is not None:
+                                    blocked_message_ids.add(id(msg))
+                                break
                             ids_by_message_id[id(msg)] = stored["store_id"]
                             store_idx = probe_idx + 1
                             break
@@ -1199,6 +1280,18 @@ class ReconcileMixin:
                 continue
             match_idx = find_message_match_index(msg, store_idx)
             if match_idx is not None:
+                if (
+                    stop_at_cross_source_gap
+                    and match_idx > store_idx
+                    and not self._skipped_store_candidates_are_safe(
+                        candidates,
+                        store_idx,
+                        match_idx,
+                    )
+                ):
+                    if blocked_message_ids is not None:
+                        blocked_message_ids.add(id(msg))
+                    break
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 

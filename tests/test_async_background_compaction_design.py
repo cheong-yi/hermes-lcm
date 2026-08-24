@@ -101,6 +101,72 @@ def test_pending_summaries_are_invisible_until_atomic_promotion(tmp_path):
         engine.shutdown()
 
 
+def test_background_preparation_rejects_cross_source_gap(tmp_path, monkeypatch):
+    engine = _engine(
+        tmp_path,
+        session_id="async-source-gap",
+        conversation_id="async-source-gap-conversation",
+    )
+    engine._config.fresh_tail_count = 1
+    engine._config.leaf_chunk_tokens = 1
+    engine._config.dynamic_leaf_chunk_enabled = False
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **_kwargs: ("unsafe background summary", 1),
+    )
+    try:
+        prefix = {"role": "user", "content": "background prefix " + "a " * 20}
+        omitted = {"role": "assistant", "content": "omitted telegram row " + "b " * 20}
+        suffix = {"role": "user", "content": "background suffix " + "c " * 20}
+        fresh = {"role": "assistant", "content": "fresh tail"}
+        prefix_id = engine._store.append(
+            engine._session_id,
+            prefix,
+            source="desktop",
+            conversation_id=engine._conversation_id,
+        )
+        engine._store.append(
+            engine._session_id,
+            omitted,
+            source="telegram",
+            conversation_id=engine._conversation_id,
+        )
+        suffix_id = engine._store.append(
+            engine._session_id,
+            suffix,
+            source="desktop",
+            conversation_id=engine._conversation_id,
+        )
+        fresh_id = engine._store.append(
+            engine._session_id,
+            fresh,
+            source="desktop",
+            conversation_id=engine._conversation_id,
+        )
+        messages = [
+            {"role": "system", "content": "stable system prompt"},
+            prefix,
+            suffix,
+            fresh,
+        ]
+        engine._remember_active_replay_messages(
+            messages,
+            messages,
+            [None, prefix_id, suffix_id, fresh_id],
+        )
+        engine._ingest_cursor = len(messages)
+        engine._ingest_cursor_needs_reconcile = False
+
+        batch = engine.prepare_background_compaction_once(messages)
+
+        assert batch is None
+        assert engine.get_async_compaction_status()["prepared_batches"] == 0
+        assert engine.get_status()["lifecycle"]["current_frontier_store_id"] == 0
+        assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    finally:
+        engine.shutdown()
+
+
 def test_atomic_promotion_rejects_stale_source_identity(tmp_path):
     """Given source rows changed after prep, promotion rejects without canonical mutation."""
     engine = _engine(tmp_path)

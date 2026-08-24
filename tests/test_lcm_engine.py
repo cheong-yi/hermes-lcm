@@ -123,6 +123,318 @@ def test_discord_short_turn_ingest_preserves_conversation_id(tmp_path):
         engine.shutdown()
 
 
+def test_compaction_stops_before_unmapped_cross_source_store_gap(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "durable-frontier-gap.db"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+    )
+    engine = LCMEngine(config=config)
+    captured: dict[str, str] = {}
+
+    def capture_summary(**kwargs):
+        captured["text"] = kwargs["text"]
+        return "contiguous prefix summary\n[Expand for details: contiguous prefix]", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+    try:
+        conversation_id = "agent:main:telegram:dm:durable-gap"
+        engine.on_session_start(
+            "durable-gap-session",
+            platform="desktop",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+        prefix = {"role": "user", "content": "PREFIX " + "a" * 200}
+        omitted = {"role": "assistant", "content": "OMITTED " + "b" * 200}
+        suffix = {"role": "user", "content": "SUFFIX " + "c" * 200}
+        fresh_tail = {"role": "assistant", "content": "FRESH_TAIL"}
+
+        prefix_id = engine._store.append(
+            "durable-gap-session",
+            prefix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        omitted_id = engine._store.append(
+            "durable-gap-session",
+            omitted,
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        suffix_id = engine._store.append(
+            "durable-gap-session",
+            suffix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        engine._store.append(
+            "durable-gap-session",
+            fresh_tail,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+
+        active_context = [prefix, suffix, fresh_tail]
+        engine._ingest_cursor = len(active_context)
+        engine._ingest_cursor_needs_reconcile = False
+
+        result = engine.compress(active_context, current_tokens=10_000, force=True)
+
+        nodes = engine._dag.get_session_nodes("durable-gap-session", depth=0)
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [prefix_id]
+        assert engine._last_compacted_store_id == prefix_id
+        assert omitted_id not in nodes[0].source_ids
+        assert suffix_id not in nodes[0].source_ids
+        assert "SUFFIX" not in captured["text"]
+        assert any(message.get("content", "").startswith("SUFFIX") for message in result)
+    finally:
+        engine.shutdown()
+
+
+def test_compaction_stops_before_cross_source_gap_with_exact_runtime_associations(
+    tmp_path,
+    monkeypatch,
+):
+    config = LCMConfig(
+        database_path=str(tmp_path / "exact-durable-frontier-gap.db"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+    )
+    engine = LCMEngine(config=config)
+    captured: dict[str, str] = {}
+
+    def capture_summary(**kwargs):
+        captured["text"] = kwargs["text"]
+        return "contiguous prefix summary\n[Expand for details: contiguous prefix]", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+    try:
+        conversation_id = "agent:main:telegram:dm:exact-durable-gap"
+        engine.on_session_start(
+            "exact-durable-gap-session",
+            platform="desktop",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+        prefix = {"role": "user", "content": "PREFIX " + "a" * 200}
+        omitted = {"role": "assistant", "content": "OMITTED " + "b" * 200}
+        suffix = {"role": "user", "content": "SUFFIX " + "c" * 200}
+        fresh_tail = {"role": "assistant", "content": "FRESH_TAIL"}
+
+        prefix_id = engine._store.append(
+            engine._session_id,
+            prefix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        omitted_id = engine._store.append(
+            engine._session_id,
+            omitted,
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        suffix_id = engine._store.append(
+            engine._session_id,
+            suffix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        fresh_tail_id = engine._store.append(
+            engine._session_id,
+            fresh_tail,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+
+        active_context = [prefix, suffix, fresh_tail]
+        engine._remember_active_replay_messages(
+            active_context,
+            active_context,
+            [prefix_id, suffix_id, fresh_tail_id],
+        )
+        engine._ingest_cursor = len(active_context)
+        engine._ingest_cursor_needs_reconcile = False
+
+        result = engine.compress(active_context, current_tokens=10_000, force=True)
+
+        nodes = engine._dag.get_session_nodes(engine._session_id, depth=0)
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [prefix_id]
+        assert engine._last_compacted_store_id == prefix_id
+        assert omitted_id not in nodes[0].source_ids
+        assert suffix_id not in nodes[0].source_ids
+        assert "SUFFIX" not in captured["text"]
+        assert any(message.get("content", "").startswith("SUFFIX") for message in result)
+    finally:
+        engine.shutdown()
+
+
+def test_compaction_allows_same_source_gap_with_exact_runtime_associations(
+    tmp_path,
+    monkeypatch,
+):
+    config = LCMConfig(
+        database_path=str(tmp_path / "exact-same-source-gap.db"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        dynamic_leaf_chunk_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+
+    def capture_summary(**_kwargs):
+        return "same-source summary\n[Expand for details: same-source]", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+    try:
+        conversation_id = "agent:main:desktop:exact-same-source-gap"
+        engine.on_session_start(
+            "exact-same-source-gap-session",
+            platform="desktop",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+        prefix = {"role": "user", "content": "PREFIX " + "a" * 200}
+        omitted = {"role": "assistant", "content": "OMITTED " + "b" * 200}
+        suffix = {"role": "user", "content": "SUFFIX " + "c" * 200}
+        fresh_tail = {"role": "assistant", "content": "FRESH_TAIL"}
+        prefix_id = engine._store.append(
+            engine._session_id,
+            prefix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        omitted_id = engine._store.append(
+            engine._session_id,
+            omitted,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        suffix_id = engine._store.append(
+            engine._session_id,
+            suffix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        fresh_tail_id = engine._store.append(
+            engine._session_id,
+            fresh_tail,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        active_context = [prefix, suffix, fresh_tail]
+        engine._remember_active_replay_messages(
+            active_context,
+            active_context,
+            [prefix_id, suffix_id, fresh_tail_id],
+        )
+        engine._ingest_cursor = len(active_context)
+        engine._ingest_cursor_needs_reconcile = False
+
+        result = engine.compress(active_context, current_tokens=10_000, force=True)
+
+        nodes = engine._dag.get_session_nodes(engine._session_id, depth=0)
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [prefix_id, suffix_id]
+        assert omitted_id not in nodes[0].source_ids
+        assert engine._last_compacted_store_id == suffix_id
+        assert result[-1] == fresh_tail
+    finally:
+        engine.shutdown()
+
+
+def test_compaction_keeps_cross_source_boundary_when_blocker_is_ignored(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_lcm import message_patterns as message_patterns_mod
+
+    monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+    config = LCMConfig(
+        database_path=str(tmp_path / "ignored-exact-durable-gap.db"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        dynamic_leaf_chunk_enabled=False,
+        ignore_message_patterns=["IGNORE_BLOCKER"],
+    )
+    engine = LCMEngine(config=config)
+    captured: dict[str, str] = {}
+
+    def capture_summary(**kwargs):
+        captured["text"] = kwargs["text"]
+        return "contiguous prefix summary\n[Expand for details: contiguous prefix]", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+    try:
+        conversation_id = "agent:main:telegram:dm:ignored-exact-durable-gap"
+        engine.on_session_start(
+            "ignored-exact-durable-gap-session",
+            platform="desktop",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+        prefix = {"role": "user", "content": "PREFIX " + "a" * 200}
+        omitted = {"role": "assistant", "content": "OMITTED " + "b" * 200}
+        blocker = {"role": "assistant", "content": "IGNORE_BLOCKER " + "c" * 200}
+        later = {"role": "user", "content": "LATER " + "d" * 200}
+        fresh_tail = {"role": "assistant", "content": "FRESH_TAIL"}
+
+        prefix_id = engine._store.append(
+            engine._session_id,
+            prefix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        omitted_id = engine._store.append(
+            engine._session_id,
+            omitted,
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        blocker_id = engine._store.append(
+            engine._session_id,
+            blocker,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        later_id = engine._store.append(
+            engine._session_id,
+            later,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        fresh_tail_id = engine._store.append(
+            engine._session_id,
+            fresh_tail,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+
+        active_context = [prefix, blocker, later, fresh_tail]
+        engine._remember_active_replay_messages(
+            active_context,
+            active_context,
+            [prefix_id, blocker_id, later_id, fresh_tail_id],
+        )
+        engine._ingest_cursor = len(active_context)
+        engine._ingest_cursor_needs_reconcile = False
+
+        result = engine.compress(active_context, current_tokens=10_000, force=True)
+
+        nodes = engine._dag.get_session_nodes(engine._session_id, depth=0)
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [prefix_id]
+        assert engine._last_compacted_store_id == prefix_id
+        assert omitted_id not in nodes[0].source_ids
+        assert blocker_id not in nodes[0].source_ids
+        assert later_id not in nodes[0].source_ids
+        assert "LATER" not in captured["text"]
+        assert any(message.get("content", "").startswith("LATER") for message in result)
+    finally:
+        engine.shutdown()
+
+
 def test_webui_like_local_short_turn_ingest_preserves_lane_metadata(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "webui-local.db"))
     engine = LCMEngine(config=config)
@@ -1139,7 +1451,7 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
 
     assert identity["engine"] == "lcm"
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "0.21.0-rc1"
+    assert identity["plugin_version"] == "0.21.0-rc2"
     assert Path(identity["plugin_path"]) == repo_root
     assert Path(identity["module_path"]).name == "engine.py"
     assert Path(identity["database_path"]) == db_path
@@ -1165,11 +1477,11 @@ def test_plugin_metadata_refreshes_when_manifest_changes(tmp_path, monkeypatch):
 
     initial = identity_mod._plugin_metadata()
     assert initial["name"] == "hermes-lcm"
-    assert initial["version"] == "0.21.0-rc1"
+    assert initial["version"] == "0.21.0-rc2"
 
-    updated = original.replace('version: "0.21.0-rc1"', 'version: "9.9.9-test"')
+    updated = original.replace('version: "0.21.0-rc2"', 'version: "9.9.9-test"')
     if updated == original:
-        updated = original.replace('version: 0.21.0-rc1', 'version: 9.9.9-test')
+        updated = original.replace('version: 0.21.0-rc2', 'version: 9.9.9-test')
     assert updated != original
 
     try:
@@ -1207,7 +1519,7 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
-    assert payload["runtime_identity"]["plugin_version"] == "0.21.0-rc1"
+    assert payload["runtime_identity"]["plugin_version"] == "0.21.0-rc2"
     assert "plugin_git_commit" in payload["runtime_identity"]
 
 

@@ -5089,6 +5089,83 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 return identity
         return role, content[:marker_index], third, fourth
 
+    def _retain_complete_publication_lineage(
+        self,
+        messages: List[Dict[str, Any]],
+        mapped: Dict[int, int],
+    ) -> Dict[int, int]:
+        """Keep only the mapped prefix that does not skip another source."""
+        if not mapped or not self._conversation_id:
+            return mapped
+
+        through_store_id = max(int(store_id) for store_id in mapped.values())
+        frontier_store_id = int(self._last_compacted_store_id or 0)
+        candidates_by_store_id: dict[int, Dict[str, Any]] = {}
+
+        next_after = frontier_store_id
+        while self._session_id and next_after < through_store_id:
+            page = self._store.get_session_messages_after(
+                self._session_id,
+                after_store_id=next_after,
+                limit=512,
+            )
+            if not page:
+                break
+            for candidate in page:
+                store_id = int(candidate["store_id"])
+                if store_id <= through_store_id:
+                    candidates_by_store_id[store_id] = candidate
+            next_after = int(page[-1]["store_id"])
+
+        next_after = frontier_store_id
+        while next_after < through_store_id:
+            page = self._store.get_conversation_messages_after(
+                self._conversation_id,
+                after_store_id=next_after,
+                through_store_id=through_store_id,
+                limit=512,
+            )
+            if not page:
+                break
+            for candidate in page:
+                candidates_by_store_id[int(candidate["store_id"])] = candidate
+            next_after = int(page[-1]["store_id"])
+
+        candidates = [
+            candidates_by_store_id[store_id]
+            for store_id in sorted(candidates_by_store_id)
+        ]
+
+        candidate_index_by_store_id = {
+            int(candidate["store_id"]): index
+            for index, candidate in enumerate(candidates)
+        }
+        retained = dict(mapped)
+        candidate_cursor = 0
+        for message_index, message in enumerate(messages):
+            message_id = id(message)
+            store_id = retained.get(message_id)
+            if store_id is None:
+                continue
+            match_idx = candidate_index_by_store_id.get(int(store_id))
+            if (
+                match_idx is None
+                or match_idx < candidate_cursor
+                or (
+                    match_idx > candidate_cursor
+                    and not self._skipped_store_candidates_are_safe(
+                        candidates,
+                        candidate_cursor,
+                        match_idx,
+                    )
+                )
+            ):
+                for remaining in messages[message_index:]:
+                    retained.pop(id(remaining), None)
+                break
+            candidate_cursor = match_idx + 1
+        return retained
+
     def _get_publication_store_id_map(
         self,
         messages: List[Dict[str, Any]],
@@ -5105,7 +5182,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
 
         mapped = self._get_store_id_map_for_messages(messages)
         if len(mapped) == len(messages) or not self._conversation_id:
-            return mapped
+            return self._retain_complete_publication_lineage(messages, mapped)
 
         exact_runtime_associations = getattr(
             self,
@@ -5181,7 +5258,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             previous_store_id = exact_store_id
 
         if len(mapped) == len(messages):
-            return mapped
+            return self._retain_complete_publication_lineage(messages, mapped)
 
         unmatched_messages = [
             message
@@ -5241,7 +5318,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             candidates.extend(page)
             next_after = int(page[-1]["store_id"])
         if next_after < scan_through_store_id:
-            return mapped
+            return self._retain_complete_publication_lineage(messages, mapped)
 
         used = set(mapped.values())
         candidate_identities_by_store_id = {
@@ -5369,7 +5446,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             # this method cannot report a complete reordered lineage.
             for message_id in compatibility_mapped_message_ids:
                 mapped.pop(message_id, None)
-        return mapped
+        return self._retain_complete_publication_lineage(messages, mapped)
 
     def _get_publication_store_ids_for_messages(
         self,

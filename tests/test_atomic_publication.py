@@ -955,6 +955,97 @@ def test_sparse_rollover_gap_maps_between_exact_neighbors_in_large_conversation(
         engine.shutdown()
 
 
+def test_rollover_publication_does_not_cross_cross_source_gap(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "rollover-source-gap.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=False,
+            incremental_max_depth=0,
+        )
+    )
+    conversation_id = "conversation:rollover-source-gap"
+    current_session_id = "session:current-source-gap"
+    old_session_id = "session:old-source-gap"
+    engine.on_session_start(
+        current_session_id,
+        conversation_id=conversation_id,
+        platform="desktop",
+        context_length=10_000,
+    )
+    first = {"role": "user", "content": "exact current prefix"}
+    omitted = {"role": "assistant", "content": "omitted telegram rollover row"}
+    carried = {"role": "user", "content": "carried desktop rollover row"}
+    following = {"role": "assistant", "content": "exact current following row"}
+    fresh = {"role": "user", "content": "fresh tail canary"}
+    first_id = engine._store.append(
+        current_session_id,
+        first,
+        source="desktop",
+        conversation_id=conversation_id,
+    )
+    omitted_id = engine._store.append(
+        old_session_id,
+        omitted,
+        source="telegram",
+        conversation_id=conversation_id,
+    )
+    carried_id = engine._store.append(
+        old_session_id,
+        carried,
+        source="desktop",
+        conversation_id=conversation_id,
+    )
+    following_id = engine._store.append(
+        current_session_id,
+        following,
+        source="desktop",
+        conversation_id=conversation_id,
+    )
+    fresh_id = engine._store.append(
+        current_session_id,
+        fresh,
+        source="desktop",
+        conversation_id=conversation_id,
+    )
+    active = [
+        {"role": "system", "content": "stable system prompt"},
+        first,
+        carried,
+        following,
+        fresh,
+    ]
+    original_active = copy.deepcopy(active)
+    engine._remember_active_replay_messages(
+        active,
+        active,
+        [None, first_id, None, following_id, fresh_id],
+    )
+    engine._ingest_cursor = len(active)
+    engine._ingest_cursor_needs_reconcile = False
+
+    def summarize(chunk, focus_topic=None):
+        assert chunk == active[1:4]
+        text = "unsafe rollover summary\n[Expand for details: unsafe-rollover]"
+        return list(chunk), count_messages_tokens(chunk), text, 1, 1
+
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize)
+    try:
+        compressed = engine.compress(active, force=True)
+
+        assert compressed == original_active
+        assert engine._dag.get_session_nodes(current_session_id) == []
+        assert _frontier(db_path, conversation_id) == 0
+        assert engine._last_compression_status == "noop"
+    finally:
+        engine.shutdown()
+
+
 def test_missing_rollover_mapping_fails_safe_without_active_context_mutation(
     tmp_path: Path,
     monkeypatch,
@@ -1448,6 +1539,61 @@ def test_publication_lineage_accepts_only_trailing_hermes_task_list_suffix(
             1,
         )
         assert engine._get_publication_store_id_map([changed]) == {}
+    finally:
+        engine.shutdown()
+
+
+def test_publication_task_suffix_does_not_cross_cross_source_gap(
+    tmp_path: Path,
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "todo-suffix-source-gap.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start(
+        "session:todo-suffix-source-gap",
+        conversation_id="conversation:todo-suffix-source-gap",
+        platform="desktop",
+        context_length=10_000,
+    )
+    prefix = {"role": "user", "content": "proven prefix"}
+    omitted = {"role": "assistant", "content": "omitted telegram row"}
+    task = {"role": "user", "content": "proven task request"}
+    prefix_id = engine._store.append(
+        engine._session_id,
+        prefix,
+        source="desktop",
+        conversation_id=engine._conversation_id,
+    )
+    omitted_id = engine._store.append(
+        engine._session_id,
+        omitted,
+        source="telegram",
+        conversation_id=engine._conversation_id,
+    )
+    task_id = engine._store.append(
+        engine._session_id,
+        task,
+        source="desktop",
+        conversation_id=engine._conversation_id,
+    )
+    active = [dict(prefix), dict(task)]
+    engine._remember_active_replay_messages(
+        active,
+        active,
+        [prefix_id, task_id],
+    )
+    active[1]["content"] += (
+        "\n\n[Your active task list was preserved across context compression]\n"
+        "- [>] v4-review. Verify source continuity (in_progress)"
+    )
+    try:
+        mapped = engine._get_publication_store_id_map(active)
+
+        assert mapped.get(id(active[0])) == prefix_id
+        assert id(active[1]) not in mapped
+        assert omitted_id not in mapped.values()
+        assert task_id not in mapped.values()
     finally:
         engine.shutdown()
 
