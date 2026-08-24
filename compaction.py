@@ -68,7 +68,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_cleanup_only = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -129,11 +129,22 @@ class CompactionMixin:
                 messages=replay_messages,
             )
             if cleanup_requested:
+                # The host reaches this hook only after its normal automatic
+                # threshold path declined to compact. Adopt deterministic
+                # replay cleanup (for example a newly externalized tool-result
+                # stub), but do not let that maintenance call piggyback a leaf
+                # summary hundreds of thousands of tokens before the configured
+                # threshold. At/over threshold the host calls compress()
+                # directly, without this preflight-only flag.
                 if (
                     not force_overflow_requested
-                    and self._compression_boundary_cooldown_active()
+                    and (
+                        self._compression_boundary_cooldown_active()
+                        or self.threshold_tokens <= 0
+                        or max(rough, replay_rough) < self.threshold_tokens
+                    )
                 ):
-                    self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                    self._preflight_cleanup_only = True
                 return self._mark_preflight_compression_requested()
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested()
@@ -435,18 +446,9 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
-        promoted_context = self._try_promote_ready_background(working_messages)
-        if promoted_context is not None:
-            self._last_compaction_duration_ms = (
-                time.perf_counter() - _compress_started
-            ) * 1000.0
-            return promoted_context
-        cleanup_only_due_to_boundary_cooldown = bool(
-            self._preflight_cleanup_only_due_to_boundary_cooldown
-            and not force_overflow
-        )
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
+        preflight_cleanup_only = bool(self._preflight_cleanup_only and not force_overflow)
+        self._preflight_cleanup_only = False
+        if preflight_cleanup_only:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
@@ -469,6 +471,12 @@ class CompactionMixin:
                 )
             )
             return sanitized_messages
+        promoted_context = self._try_promote_ready_background(working_messages)
+        if promoted_context is not None:
+            self._last_compaction_duration_ms = (
+                time.perf_counter() - _compress_started
+            ) * 1000.0
+            return promoted_context
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
