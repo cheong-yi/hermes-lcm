@@ -17,7 +17,7 @@ import pytest
 from hermes_lcm import tools as lcm_tools
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.engine import LCMEngine
+from hermes_lcm.engine import HostEventIdentityIntegrityError, LCMEngine
 import hermes_lcm.engine as lcm_engine_module
 import hermes_lcm.store as lcm_store_module
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
@@ -1058,17 +1058,549 @@ def test_ingest_keeps_scanning_after_existing_placeholder_prefix(tmp_path):
 def test_replayed_original_payload_reconciles_with_placeholder_row(tmp_path):
     engine = _engine(tmp_path)
     original_messages = [
-        {"role": "system", "content": "system anchor"},
-        {"role": "user", "content": "see image " + DATA_URI},
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000101",
+            },
+        },
+        {
+            "role": "user",
+            "content": "see image " + DATA_URI,
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000102",
+            },
+        },
     ]
-    engine._ingest_messages(original_messages)
+    original_snapshot = deepcopy(original_messages)
+    serialized_messages = json.loads(json.dumps(original_messages))
+
+    engine._ingest_messages(serialized_messages)
     assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    assert serialized_messages == original_snapshot
+    first_rows = [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ]
+    first_mappings = {
+        event_id: engine._store.read_metadata_json(
+            engine._host_event_mapping_key(event_id)
+        )
+        for event_id in (
+            "event:00000000-0000-4000-8000-000000000101",
+            "event:00000000-0000-4000-8000-000000000102",
+        )
+    }
+    assert all(mapping is not None for mapping in first_mappings.values())
+    assert [
+        first_mappings[event_id]["store_id"]
+        for event_id in (
+            "event:00000000-0000-4000-8000-000000000101",
+            "event:00000000-0000-4000-8000-000000000102",
+        )
+    ] == [row["store_id"] for row in first_rows]
+    first_user = first_rows[1]
+    assert first_user["content"].startswith("see image ")
+    assert "data:image" not in first_user["content"]
+    assert DATA_URI not in json.dumps(first_rows)
+    assert DATA_PAYLOAD not in json.dumps(first_rows)
+    first_refs = extract_ingest_externalized_refs(first_user["content"])
+    assert len(first_refs) == 1
+    assert _expand_ref(engine, first_refs[0])["content"] == DATA_URI
+    first_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
+    print(
+        json.dumps(
+            {
+                "i02_before_replay": {
+                    "rows": [
+                        {"store_id": row["store_id"], "role": row["role"]}
+                        for row in first_rows
+                    ],
+                    "mapping_store_ids": {
+                        event_id: mapping["store_id"]
+                        for event_id, mapping in first_mappings.items()
+                    },
+                    "refs": first_refs,
+                    "file_bytes": {
+                        name: len(payload) for name, payload in first_files.items()
+                    },
+                }
+            },
+            sort_keys=True,
+        )
+    )
+    engine.shutdown()
+
+    engine = _engine(tmp_path)
+    replay_messages = json.loads(json.dumps(original_messages))
+    assert replay_messages == original_snapshot
+    reordered_messages = [replay_messages[1], replay_messages[0]]
+    active = engine._ingest_messages(reordered_messages)
+    assert reordered_messages == [original_snapshot[1], original_snapshot[0]]
+
+    assert active == reordered_messages
+    assert reordered_messages[0]["display_metadata"]["host_event_id"].endswith("102")
+    assert reordered_messages[0]["content"] == original_snapshot[1]["content"]
+    assert reordered_messages[1]["display_metadata"]["host_event_id"].endswith("101")
+    assert reordered_messages[1]["content"] == original_snapshot[0]["content"]
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    second_rows = [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ]
+    second_mappings = {
+        event_id: engine._store.read_metadata_json(
+            engine._host_event_mapping_key(event_id)
+        )
+        for event_id in first_mappings
+    }
+    second_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
+    assert second_rows == first_rows
+    assert second_mappings == first_mappings
+    assert second_files == first_files
+    assert extract_ingest_externalized_refs(second_rows[1]["content"]) == first_refs
+    engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["different_ids", "absent_same_object", "absent_serialized_copy"],
+)
+def test_equal_original_payload_without_replay_authority_remains_distinct(
+    tmp_path,
+    case,
+):
+    first_messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            **(
+                {
+                    "display_metadata": {
+                        "host_event_id": (
+                            "event:00000000-0000-4000-8000-000000000101"
+                        ),
+                    }
+                }
+                if case == "different_ids"
+                else {}
+            ),
+        },
+        {
+            "role": "user",
+            "content": "see image " + DATA_URI,
+            **(
+                {
+                    "display_metadata": {
+                        "host_event_id": (
+                            "event:00000000-0000-4000-8000-000000000102"
+                        ),
+                    }
+                }
+                if case == "different_ids"
+                else {}
+            ),
+        },
+    ]
+    if case == "different_ids":
+        replay_messages = [
+            {
+                "role": "system",
+                "content": "system anchor",
+                "display_metadata": {
+                    "host_event_id": (
+                        "event:00000000-0000-4000-8000-000000000201"
+                    ),
+                },
+            },
+            {
+                "role": "user",
+                "content": "see image " + DATA_URI,
+                "display_metadata": {
+                    "host_event_id": (
+                        "event:00000000-0000-4000-8000-000000000202"
+                    ),
+                },
+            },
+        ]
+    elif case == "absent_same_object":
+        replay_messages = first_messages
+    else:
+        replay_messages = json.loads(json.dumps(first_messages))
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(first_messages)
+    first_rows = [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ]
+    first_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
     engine._store.close()
 
     engine = _engine(tmp_path)
-    engine._ingest_messages(original_messages)
+    engine._ingest_messages(replay_messages)
 
-    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    rows = [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ]
+    assert len(rows) == 4
+    assert rows[:2] == first_rows
+    assert [row["role"] for row in rows] == ["system", "user", "system", "user"]
+    user_refs = [
+        extract_ingest_externalized_refs(row["content"])
+        for row in rows
+        if row["role"] == "user"
+    ]
+    assert all(len(refs) == 1 for refs in user_refs)
+    assert all(
+        _expand_ref(engine, refs[0])["content"] == DATA_URI
+        for refs in user_refs
+    )
+    files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+    assert len(files) == 2
+    assert files != first_files
+
+    if case == "different_ids":
+        event_ids = [
+            "event:00000000-0000-4000-8000-000000000101",
+            "event:00000000-0000-4000-8000-000000000102",
+            "event:00000000-0000-4000-8000-000000000201",
+            "event:00000000-0000-4000-8000-000000000202",
+        ]
+        mappings = [
+            engine._store.read_metadata_json(engine._host_event_mapping_key(event_id))
+            for event_id in event_ids
+        ]
+        assert all(mapping is not None for mapping in mappings)
+        assert [mapping["store_id"] for mapping in mappings] == [
+            row["store_id"] for row in rows
+        ]
+    else:
+        assert all("display_metadata" not in message for message in first_messages)
+        assert all("display_metadata" not in message for message in replay_messages)
+
+    print(
+        json.dumps(
+            {
+                "equal_payload_case": case,
+                "rows": [row["store_id"] for row in rows],
+                "user_refs": [refs[0] for refs in user_refs],
+                "file_bytes": {name: len(payload) for name, payload in files.items()},
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def test_replayed_original_payload_changed_under_same_id_is_atomic_conflict(
+    tmp_path,
+):
+    baseline_messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000101",
+            },
+        },
+        {
+            "role": "user",
+            "content": "see image " + DATA_URI,
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000102",
+            },
+        },
+    ]
+    engine = _engine(tmp_path)
+    engine._ingest_messages(baseline_messages)
+    baseline_rows = [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ]
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000101",
+        "event:00000000-0000-4000-8000-000000000102",
+    ]
+    baseline_mappings = {
+        event_id: engine._store.read_metadata_json(
+            engine._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    }
+    assert all(mapping is not None for mapping in baseline_mappings.values())
+    baseline_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
+    conflict_messages = [
+        {
+            "role": "user",
+            "content": "new tail",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000103",
+            },
+        },
+        {
+            "role": "user",
+            "content": "see image " + DATA_URI + " changed",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000102",
+            },
+        },
+    ]
+    conflict_snapshot = deepcopy(conflict_messages)
+
+    with pytest.raises(HostEventIdentityIntegrityError):
+        engine._ingest_messages(conflict_messages)
+
+    assert conflict_messages == conflict_snapshot
+    assert [
+        dict(row)
+        for row in engine._store.get_session_messages(engine.current_session_id)
+    ] == baseline_rows
+    assert {
+        event_id: engine._store.read_metadata_json(
+            engine._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    } == baseline_mappings
+    assert engine._store.read_metadata_json(
+        engine._host_event_mapping_key(
+            "event:00000000-0000-4000-8000-000000000103"
+        )
+    ) is None
+    assert {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    } == baseline_files
+    print(
+        json.dumps(
+            {
+                "conflict": {
+                    "rows": [row["store_id"] for row in baseline_rows],
+                    "mapping_store_ids": {
+                        event_id: mapping["store_id"]
+                        for event_id, mapping in baseline_mappings.items()
+                    },
+                    "refs": extract_ingest_externalized_refs(
+                        baseline_rows[1]["content"]
+                    ),
+                    "file_bytes": {
+                        name: len(payload)
+                        for name, payload in baseline_files.items()
+                    },
+                }
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("policy", ["tighten", "relax"])
+def test_replayed_original_payload_uses_current_ignore_policy(tmp_path, policy):
+    class _SeeImagePattern:
+        pattern = "^see image "
+
+        def search(self, text, timeout=None):
+            return object() if str(text).startswith("see image ") else None
+
+    messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000101",
+            },
+        },
+        {
+            "role": "user",
+            "content": "see image " + DATA_URI,
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000102",
+            },
+        },
+    ]
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000101",
+        "event:00000000-0000-4000-8000-000000000102",
+    ]
+
+    first = _engine(tmp_path)
+    if policy == "relax":
+        first._compiled_ignore_message_patterns = [_SeeImagePattern()]
+    first_active = first._ingest_messages(messages)
+    first_rows = [
+        dict(row)
+        for row in first._store.get_session_messages(first.current_session_id)
+    ]
+    first_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
+    first_mappings = {
+        event_id: first._store.read_metadata_json(
+            first._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    }
+    assert first_mappings[event_ids[0]] is not None
+
+    if policy == "relax":
+        assert len(first_rows) == 1
+        assert first_active[0] == messages[0]
+        assert "message ignored" in first_active[1]["content"]
+        assert DATA_URI not in first_active[1]["content"]
+        assert first_mappings[event_ids[1]] is None
+        assert first_files == {}
+    else:
+        assert len(first_rows) == 2
+        assert first_mappings[event_ids[1]] is not None
+
+    first._store.close()
+    second = _engine(tmp_path)
+    if policy == "tighten":
+        second._compiled_ignore_message_patterns = [_SeeImagePattern()]
+    replay = json.loads(json.dumps(messages))
+    active = second._ingest_messages(replay)
+    rows = [
+        dict(row)
+        for row in second._store.get_session_messages(second.current_session_id)
+    ]
+    mappings = {
+        event_id: second._store.read_metadata_json(
+            second._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    }
+    files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+
+    if policy == "tighten":
+        assert len(rows) == 2
+        assert rows == first_rows
+        assert active[0] == replay[0]
+        assert "message ignored" in active[1]["content"]
+        assert DATA_URI not in active[1]["content"]
+        assert mappings == first_mappings
+        assert files == first_files
+    else:
+        assert len(rows) == 2
+        assert rows[0] == first_rows[0]
+        assert mappings[event_ids[0]] == first_mappings[event_ids[0]]
+        assert active == replay
+        assert mappings[event_ids[1]] is not None
+        assert len(files) == 1
+        assert extract_ingest_externalized_refs(rows[1]["content"])
+        assert _expand_ref(
+            second, extract_ingest_externalized_refs(rows[1]["content"])[0]
+        )["content"] == DATA_URI
+
+    print(
+        json.dumps(
+            {
+                "ignore_policy": policy,
+                "rows": [row["store_id"] for row in rows],
+                "mapping_store_ids": {
+                    event_id: mapping["store_id"]
+                    for event_id, mapping in mappings.items()
+                    if mapping is not None
+                },
+                "file_bytes": {name: len(payload) for name, payload in files.items()},
+                "active_user_ignored": "message ignored" in active[1]["content"],
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def test_replayed_original_payload_uses_current_redaction_policy(tmp_path):
+    secret = "sk-replayredaction1234567890abcdef"
+    original_messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000101",
+            },
+        },
+        {
+            "role": "user",
+            "content": f"api_key={secret} see image {DATA_URI}",
+            "display_metadata": {
+                "host_event_id": "event:00000000-0000-4000-8000-000000000102",
+            },
+        },
+    ]
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000101",
+        "event:00000000-0000-4000-8000-000000000102",
+    ]
+    first = _engine(tmp_path)
+    first._ingest_messages(original_messages)
+    first_rows = [
+        dict(row)
+        for row in first._store.get_session_messages(first.current_session_id)
+    ]
+    first_user = first_rows[1]
+    first_refs = extract_ingest_externalized_refs(first_user["content"])
+    assert len(first_refs) == 1
+    assert secret in first_user["content"]
+    assert _expand_ref(first, first_refs[0])["content"] == DATA_URI
+    first_mappings = {
+        event_id: first._store.read_metadata_json(
+            first._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    }
+    first_files = {
+        path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+    }
+    first._store.close()
+
+    second = _sensitive_engine(tmp_path)
+    replay = json.loads(json.dumps(original_messages))
+    active = second._ingest_messages(replay)
+
+    assert secret not in json.dumps(active)
+    assert "[LCM sensitive redaction:" in active[1]["content"]
+    rows = [
+        dict(row)
+        for row in second._store.get_session_messages(second.current_session_id)
+    ]
+    mappings = {
+        event_id: second._store.read_metadata_json(
+            second._host_event_mapping_key(event_id)
+        )
+        for event_id in event_ids
+    }
+    files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+    assert rows == first_rows
+    assert mappings == first_mappings
+    assert files == first_files
+    print(
+        json.dumps(
+            {
+                "redaction_policy": {
+                    "rows": [row["store_id"] for row in rows],
+                    "mapping_store_ids": {
+                        event_id: mapping["store_id"]
+                        for event_id, mapping in mappings.items()
+                    },
+                    "refs": first_refs,
+                    "file_bytes": {
+                        name: len(payload) for name, payload in files.items()
+                    },
+                    "active_redacted": "[LCM sensitive redaction:"
+                    in active[1]["content"],
+                }
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def test_replayed_original_tool_call_payload_reconciles_with_placeholder_row(tmp_path):
