@@ -30,7 +30,40 @@ _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
+class LCMCompressionCancelled(Exception):
+    """Raised when the host cancels a cooperative compression pass."""
+
+
 class CompactionMixin:
+    def _compression_cancelled(self) -> bool:
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if not callable(cancelled_check):
+            return False
+        try:
+            return bool(cancelled_check())
+        except Exception:
+            logger.debug("LCM compression cancellation check failed", exc_info=True)
+            return False
+
+    def _raise_if_compression_cancelled(self) -> None:
+        if self._compression_cancelled():
+            raise LCMCompressionCancelled()
+
+    def _finalize_cancelled_compression(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        ingest_cleanup_changed_active_context: bool = False,
+    ) -> List[Dict[str, Any]]:
+        self._last_compression_status = "noop"
+        self._last_compression_noop_reason = "compression cancelled by host"
+        if ingest_cleanup_changed_active_context:
+            self._ingest_cursor = len(messages)
+        return self._sanitize_active_context_messages(
+            messages,
+            insert_missing_tool_stubs=False,
+        )
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -396,6 +429,9 @@ class CompactionMixin:
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
 
+        if self._compression_cancelled():
+            return self._finalize_cancelled_compression(messages)
+
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             bypass_current_tokens = current_tokens
@@ -568,6 +604,16 @@ class CompactionMixin:
             noop_reason = str(exc)
 
         while leaf_passes < max_leaf_passes:
+            if self._compression_cancelled():
+                if leaf_compacted_this_turn:
+                    sweep_stop_reason = "compression_cancelled"
+                    break
+                return self._finalize_cancelled_compression(
+                    working_messages,
+                    ingest_cleanup_changed_active_context=(
+                        ingest_cleanup_changed_active_context
+                    ),
+                )
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
@@ -905,9 +951,20 @@ class CompactionMixin:
                 )
 
             try:
+                self._raise_if_compression_cancelled()
                 # Capture before extraction/summary work. The rescue loop calls
                 # the same callback before each smaller LLM attempt.
                 capture_publication_intent(summary_input_chunk or selected_raw_chunk)
+            except LCMCompressionCancelled:
+                if leaf_compacted_this_turn:
+                    sweep_stop_reason = "compression_cancelled"
+                    break
+                return self._finalize_cancelled_compression(
+                    working_messages,
+                    ingest_cleanup_changed_active_context=(
+                        ingest_cleanup_changed_active_context
+                    ),
+                )
             except PublicationCaptureError as exc:
                 record_publication_capture_failure(exc)
                 break
@@ -962,6 +1019,17 @@ class CompactionMixin:
                             summary_input_chunk,
                             **summary_kwargs,
                         )
+                        self._raise_if_compression_cancelled()
+                    except LCMCompressionCancelled:
+                        if leaf_compacted_this_turn:
+                            sweep_stop_reason = "compression_cancelled"
+                            break
+                        return self._finalize_cancelled_compression(
+                            working_messages,
+                            ingest_cleanup_changed_active_context=(
+                                ingest_cleanup_changed_active_context
+                            ),
+                        )
                     except PublicationCaptureError as exc:
                         record_publication_capture_failure(exc)
                         break
@@ -996,10 +1064,32 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            publication_result = self._publication.publish_leaf(
-                prepared_intent,
-                after_publish=self._prepared_compactions.supersede_for_foreground_in_transaction,
-            )
+
+            def _cancel_before_publication(_conn, _intent) -> None:
+                self._raise_if_compression_cancelled()
+
+            def _cancel_checked_after_publication(conn, intent, node_id) -> None:
+                self._prepared_compactions.supersede_for_foreground_in_transaction(
+                    conn, intent, node_id
+                )
+                self._raise_if_compression_cancelled()
+
+            try:
+                publication_result = self._publication.publish_leaf(
+                    prepared_intent,
+                    before_insert=_cancel_before_publication,
+                    after_publish=_cancel_checked_after_publication,
+                )
+            except LCMCompressionCancelled:
+                if leaf_compacted_this_turn:
+                    sweep_stop_reason = "compression_cancelled"
+                    break
+                return self._finalize_cancelled_compression(
+                    working_messages,
+                    ingest_cleanup_changed_active_context=(
+                        ingest_cleanup_changed_active_context
+                    ),
+                )
             self._last_compacted_store_id = max(
                 self._last_compacted_store_id,
                 publication_result.frontier_store_id,
@@ -1274,6 +1364,7 @@ class CompactionMixin:
                 "condensation_error",
                 "condensation_no_progress",
                 "no_same_depth_condensation_group",
+                "compression_cancelled",
             }
             self._last_threshold_full_sweep = {
                 "status": "partial" if final_stop_reason in partial_stop_reasons else "completed",

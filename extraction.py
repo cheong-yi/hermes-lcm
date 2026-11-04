@@ -9,7 +9,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .model_routing import apply_lcm_model_route
 
@@ -315,6 +315,7 @@ def extract_before_compaction(
     session_id: str = "",
     model: str = "",
     timeout: float | None = None,
+    cancelled_check: Callable[[], bool] | None = None,
 ) -> bool:
     """Extract decisions from messages about to be compacted and write to a daily file.
 
@@ -322,9 +323,13 @@ def extract_before_compaction(
     Never raises — failures are logged and swallowed.
     """
     try:
+        if callable(cancelled_check) and cancelled_check():
+            return False
         prompt = EXTRACTION_PROMPT.format(text=serialized_messages)
         result = _call_extraction_llm(prompt, model=model, timeout=timeout)
 
+        if callable(cancelled_check) and cancelled_check():
+            return False
         if not result or result.strip() == "NOTHING_TO_EXTRACT":
             logger.debug("Pre-compaction extraction: nothing to extract")
             return True
@@ -340,6 +345,8 @@ def extract_before_compaction(
             header += f" ({session_id})"
         header += "\n\n"
 
+        if callable(cancelled_check) and cancelled_check():
+            return False
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(header)
             f.write(result)

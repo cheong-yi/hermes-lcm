@@ -1604,10 +1604,173 @@ def test_replayed_original_payload_uses_current_redaction_policy(tmp_path):
 
 
 def test_replayed_original_tool_call_payload_reconciles_with_placeholder_row(tmp_path):
-    engine = _engine(tmp_path)
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000301",
+        "event:00000000-0000-4000-8000-000000000302",
+    ]
+    original_arguments = json.dumps({"image": DATA_URI}, indent=2)
     original_messages = [
-        {"role": "system", "content": "system anchor"},
         {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {"host_event_id": event_ids[0]},
+        },
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "display_metadata": {"host_event_id": event_ids[1]},
+            "tool_calls": [
+                {
+                    "id": "call_upload",
+                    "type": "function",
+                    "function": {
+                        "name": "upload_image",
+                        "arguments": original_arguments,
+                    },
+                }
+            ],
+        },
+    ]
+    original_snapshot = deepcopy(original_messages)
+    first = _engine(tmp_path)
+    second = None
+    try:
+        first_active = first._ingest_messages(original_messages)
+        assert first._store.count_session_load_messages(first.current_session_id) == 2
+        assert original_messages == original_snapshot
+        assert first_active == original_messages
+        assert (
+            first_active[1]["tool_calls"][0]["function"]["arguments"]
+            == original_arguments
+        )
+        assert DATA_URI in json.dumps(first_active[1]["tool_calls"])
+        first_rows = [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ]
+        assert [row["role"] for row in first_rows] == ["system", "assistant"]
+        first_mappings = {
+            event_id: first._store.read_metadata_json(
+                first._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        assert all(mapping is not None for mapping in first_mappings.values())
+        assert all(mapping["version"] == 1 for mapping in first_mappings.values())
+        assert all(
+            mapping["session_id"] == first.current_session_id
+            and mapping["event_id"] == event_id
+            and isinstance(mapping["payload_fingerprint"], str)
+            and mapping["payload_fingerprint"]
+            and isinstance(mapping["store_id"], int)
+            for event_id, mapping in first_mappings.items()
+        )
+        assert [
+            first_mappings[event_id]["store_id"] for event_id in event_ids
+        ] == [row["store_id"] for row in first_rows]
+        first_assistant = first_rows[1]
+        assert first_assistant["content"] == "calling upload"
+        assert DATA_URI not in json.dumps(first_rows)
+        assert DATA_PAYLOAD not in json.dumps(first_rows)
+        stored_tool_calls = json.loads(first_assistant["tool_calls"])
+        assert stored_tool_calls[0]["id"] == "call_upload"
+        assert stored_tool_calls[0]["type"] == "function"
+        assert stored_tool_calls[0]["function"]["name"] == "upload_image"
+        protected_arguments = stored_tool_calls[0]["function"]["arguments"]
+        assert protected_arguments.startswith('{\n  "image": "')
+        assert protected_arguments.endswith('"\n}')
+        assert DATA_URI not in protected_arguments
+        assert DATA_PAYLOAD not in protected_arguments
+        first_refs = extract_ingest_externalized_refs(protected_arguments)
+        assert len(first_refs) == 1
+        assert _expand_ref(first, first_refs[0])["content"] == DATA_URI
+        raw_message = json.loads(
+            lcm_tools.lcm_expand(
+                {"store_id": first_assistant["store_id"], "max_tokens": 100_000},
+                engine=first,
+            )
+        )
+        assert raw_message["externalized_refs"] == first_refs
+        assert (
+            raw_message["externalized_payloads"][0]["field_path"]
+            == "tool_calls[0].function.arguments"
+        )
+        assert "tool_calls" not in raw_message
+        first_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert len(first_files) == 1
+
+        first.shutdown()
+        first = None
+        second = _engine(tmp_path)
+        replay_messages = json.loads(json.dumps(original_messages))
+        assert replay_messages == original_snapshot
+        assert (
+            replay_messages[1]["tool_calls"][0]["function"]["arguments"]
+            == original_arguments
+        )
+        active = second._ingest_messages(replay_messages)
+        assert active == replay_messages
+        assert replay_messages == original_snapshot
+        assert (
+            active[1]["tool_calls"][0]["function"]["arguments"]
+            == original_arguments
+        )
+        assert second._store.count_session_load_messages(second.current_session_id) == 2
+        second_rows = [
+            dict(row)
+            for row in second._store.get_session_messages(second.current_session_id)
+        ]
+        second_mappings = {
+            event_id: second._store.read_metadata_json(
+                second._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        second_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert second_rows == first_rows
+        assert second_mappings == first_mappings
+        assert second_files == first_files
+
+        reordered_messages = [replay_messages[1], replay_messages[0]]
+        reordered_snapshot = deepcopy(reordered_messages)
+        reordered_active = second._ingest_messages(reordered_messages)
+        assert reordered_active == reordered_messages
+        assert reordered_messages == reordered_snapshot
+        assert second._store.count_session_load_messages(second.current_session_id) == 2
+        assert [
+            dict(row)
+            for row in second._store.get_session_messages(second.current_session_id)
+        ] == first_rows
+        assert {
+            event_id: second._store.read_metadata_json(
+                second._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        } == first_mappings
+        assert {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        } == first_files
+    finally:
+        for current in (first, second):
+            if current is not None:
+                current.shutdown()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["different_ids", "absent_same_object", "absent_serialized_copy"],
+)
+def test_equal_original_tool_call_payload_without_replay_authority_remains_distinct(
+    tmp_path,
+    case,
+):
+    def build_messages(event_ids=None):
+        system = {"role": "system", "content": "system anchor"}
+        assistant = {
             "role": "assistant",
             "content": "calling upload",
             "tool_calls": [
@@ -1620,16 +1783,485 @@ def test_replayed_original_tool_call_payload_reconciles_with_placeholder_row(tmp
                     },
                 }
             ],
+        }
+        if event_ids is not None:
+            system["display_metadata"] = {"host_event_id": event_ids[0]}
+            assistant["display_metadata"] = {"host_event_id": event_ids[1]}
+        return [system, assistant]
+
+    if case == "different_ids":
+        first_messages = build_messages(
+            [
+                "event:00000000-0000-4000-8000-000000000301",
+                "event:00000000-0000-4000-8000-000000000302",
+            ]
+        )
+        replay_messages = build_messages(
+            [
+                "event:00000000-0000-4000-8000-000000000401",
+                "event:00000000-0000-4000-8000-000000000402",
+            ]
+        )
+    else:
+        first_messages = build_messages()
+        replay_messages = (
+            first_messages
+            if case == "absent_same_object"
+            else json.loads(json.dumps(first_messages))
+        )
+    first_snapshot = deepcopy(first_messages)
+    replay_snapshot = deepcopy(replay_messages)
+    first = _engine(tmp_path)
+    second = None
+    try:
+        first_active = first._ingest_messages(first_messages)
+        assert first_messages == first_snapshot
+        assert first_active == first_messages
+        first_rows = [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ]
+        assert len(first_rows) == 2
+        first_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert len(first_files) == 1
+        first_mappings = {
+            message["display_metadata"]["host_event_id"]:
+            first._store.read_metadata_json(
+                first._host_event_mapping_key(
+                    message["display_metadata"]["host_event_id"]
+                )
+            )
+            for message in first_messages
+            if "display_metadata" in message
+        }
+        first.shutdown()
+        first = None
+        second = _engine(tmp_path)
+        active = second._ingest_messages(replay_messages)
+        assert replay_messages == replay_snapshot
+        assert active == replay_messages
+        rows = [
+            dict(row)
+            for row in second._store.get_session_messages(second.current_session_id)
+        ]
+        assert len(rows) == 4
+        assert rows[:2] == first_rows
+        assert [row["role"] for row in rows] == [
+            "system",
+            "assistant",
+            "system",
+            "assistant",
+        ]
+        assistant_rows = [row for row in rows if row["role"] == "assistant"]
+        assert len(assistant_rows) == 2
+        refs = []
+        for row in assistant_rows:
+            stored_tool_calls = json.loads(row["tool_calls"])
+            assert stored_tool_calls[0]["id"] == "call_upload"
+            assert stored_tool_calls[0]["type"] == "function"
+            assert stored_tool_calls[0]["function"]["name"] == "upload_image"
+            protected_arguments = stored_tool_calls[0]["function"]["arguments"]
+            assert DATA_URI not in protected_arguments
+            assert DATA_PAYLOAD not in protected_arguments
+            row_refs = extract_ingest_externalized_refs(protected_arguments)
+            assert len(row_refs) == 1
+            refs.extend(row_refs)
+            assert _expand_ref(second, row_refs[0])["content"] == DATA_URI
+        assert len(refs) == 2
+        files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+        assert len(files) == 2
+        assert files != first_files
+        if case == "different_ids":
+            event_ids = [
+                "event:00000000-0000-4000-8000-000000000301",
+                "event:00000000-0000-4000-8000-000000000302",
+                "event:00000000-0000-4000-8000-000000000401",
+                "event:00000000-0000-4000-8000-000000000402",
+            ]
+            mappings = [
+                second._store.read_metadata_json(
+                    second._host_event_mapping_key(event_id)
+                )
+                for event_id in event_ids
+            ]
+            assert all(mapping is not None for mapping in mappings)
+            assert [mapping["store_id"] for mapping in mappings] == [
+                row["store_id"] for row in rows
+            ]
+            assert all(
+                mapping["event_id"] == event_id
+                and mapping["session_id"] == second.current_session_id
+                and mapping["payload_fingerprint"]
+                for event_id, mapping in zip(event_ids, mappings)
+            )
+            assert dict(zip(event_ids[:2], mappings[:2])) == first_mappings
+        else:
+            assert all("display_metadata" not in message for message in first_messages)
+            assert all("display_metadata" not in message for message in replay_messages)
+    finally:
+        for current in (first, second):
+            if current is not None:
+                current.shutdown()
+
+
+@pytest.mark.parametrize("case", ["argument_value", "call_id", "function_name"])
+def test_replayed_original_tool_call_payload_changed_under_same_id_is_atomic_conflict(
+    tmp_path,
+    case,
+):
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000301",
+        "event:00000000-0000-4000-8000-000000000302",
+    ]
+    baseline_messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {"host_event_id": event_ids[0]},
+        },
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "display_metadata": {"host_event_id": event_ids[1]},
+            "tool_calls": [
+                {
+                    "id": "call_upload",
+                    "type": "function",
+                    "function": {
+                        "name": "upload_image",
+                        "arguments": json.dumps({"image": DATA_URI}, indent=2),
+                    },
+                }
+            ],
         },
     ]
-    engine._ingest_messages(original_messages)
-    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
-    engine._store.close()
+    baseline_snapshot = deepcopy(baseline_messages)
+    first = _engine(tmp_path)
+    try:
+        first._ingest_messages(baseline_messages)
+        assert baseline_messages == baseline_snapshot
+        baseline_rows = [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ]
+        assert len(baseline_rows) == 2
+        baseline_mappings = {
+            event_id: first._store.read_metadata_json(
+                first._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        assert all(mapping is not None for mapping in baseline_mappings.values())
+        baseline_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert len(baseline_files) == 1
+        changed_assistant = deepcopy(baseline_messages[1])
+        tool_call = changed_assistant["tool_calls"][0]
+        if case == "argument_value":
+            tool_call["function"]["arguments"] = json.dumps(
+                {"image": DATA_URI + " changed"},
+                indent=2,
+            )
+        elif case == "call_id":
+            tool_call["id"] = "call_upload_changed"
+        else:
+            tool_call["function"]["name"] = "upload_image_changed"
+        conflict_messages = [
+            {
+                "role": "user",
+                "content": "new tail",
+                "display_metadata": {
+                    "host_event_id": (
+                        "event:00000000-0000-4000-8000-000000000501"
+                    ),
+                },
+            },
+            changed_assistant,
+        ]
+        conflict_snapshot = deepcopy(conflict_messages)
+        with pytest.raises(HostEventIdentityIntegrityError):
+            first._ingest_messages(conflict_messages)
+        assert conflict_messages == conflict_snapshot
+        assert [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ] == baseline_rows
+        assert {
+            event_id: first._store.read_metadata_json(
+                first._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        } == baseline_mappings
+        assert first._store.read_metadata_json(
+            first._host_event_mapping_key(
+                "event:00000000-0000-4000-8000-000000000501"
+            )
+        ) is None
+        assert {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        } == baseline_files
+        assert first._store.count_session_load_messages(first.current_session_id) == 2
+    finally:
+        first.shutdown()
 
-    engine = _engine(tmp_path)
-    engine._ingest_messages(original_messages)
 
-    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+@pytest.mark.parametrize("policy", ["tighten", "relax"])
+def test_replayed_original_tool_call_payload_uses_current_ignore_policy(
+    tmp_path,
+    policy,
+):
+    class _CallingUploadPattern:
+        pattern = "^calling upload$"
+
+        def search(self, text, timeout=None):
+            return object() if str(text) == "calling upload" else None
+
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000301",
+        "event:00000000-0000-4000-8000-000000000302",
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {"host_event_id": event_ids[0]},
+        },
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "display_metadata": {"host_event_id": event_ids[1]},
+            "tool_calls": [
+                {
+                    "id": "call_upload",
+                    "type": "function",
+                    "function": {
+                        "name": "upload_image",
+                        "arguments": json.dumps({"image": DATA_URI}, indent=2),
+                    },
+                }
+            ],
+        },
+    ]
+    messages_snapshot = deepcopy(messages)
+    first = _engine(tmp_path)
+    second = None
+    try:
+        if policy == "relax":
+            first._compiled_ignore_message_patterns = [_CallingUploadPattern()]
+        first_active = first._ingest_messages(messages)
+        assert messages == messages_snapshot
+        first_rows = [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ]
+        first_mappings = {
+            event_id: first._store.read_metadata_json(
+                first._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        first_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert first_active[0]["content"] == "system anchor"
+        assert first_mappings[event_ids[0]] is not None
+        if policy == "relax":
+            assert len(first_rows) == 1
+            assert first_mappings[event_ids[1]] is None
+            assert first_files == {}
+            assert first_active[1]["content"].startswith(
+                "[LCM active replay placeholder: message ignored;"
+            )
+            assert "tool_calls" not in first_active[1]
+            assert DATA_URI not in json.dumps(first_active)
+            assert DATA_PAYLOAD not in json.dumps(first_active)
+        else:
+            assert len(first_rows) == 2
+            assert first_mappings[event_ids[1]] is not None
+            assert len(first_files) == 1
+            assert first_active[1]["tool_calls"][0]["function"]["arguments"] == (
+                messages[1]["tool_calls"][0]["function"]["arguments"]
+            )
+
+        first.shutdown()
+        first = None
+        second = _engine(tmp_path)
+        if policy == "tighten":
+            second._compiled_ignore_message_patterns = [_CallingUploadPattern()]
+        replay = json.loads(json.dumps(messages))
+        replay_snapshot = deepcopy(replay)
+        active = second._ingest_messages(replay)
+        assert replay == replay_snapshot
+        assert active[0] == replay[0]
+        assert active[0]["content"] == "system anchor"
+        rows = [
+            dict(row)
+            for row in second._store.get_session_messages(second.current_session_id)
+        ]
+        mappings = {
+            event_id: second._store.read_metadata_json(
+                second._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+        if policy == "tighten":
+            assert len(rows) == 2
+            assert rows == first_rows
+            assert mappings == first_mappings
+            assert files == first_files
+            assert active[1]["content"].startswith(
+                "[LCM active replay placeholder: message ignored;"
+            )
+            assert "tool_calls" not in active[1]
+            assert DATA_URI not in json.dumps(active)
+            assert DATA_PAYLOAD not in json.dumps(active)
+        else:
+            assert len(rows) == 2
+            assert rows[0] == first_rows[0]
+            assert mappings[event_ids[0]] == first_mappings[event_ids[0]]
+            assert mappings[event_ids[1]] is not None
+            assert active == replay
+            assert len(files) == 1
+            assistant_tool_calls = json.loads(rows[1]["tool_calls"])
+            protected_arguments = assistant_tool_calls[0]["function"]["arguments"]
+            refs = extract_ingest_externalized_refs(protected_arguments)
+            assert len(refs) == 1
+            assert _expand_ref(second, refs[0])["content"] == DATA_URI
+            repeated = json.loads(json.dumps(messages))
+            repeated_snapshot = deepcopy(repeated)
+            repeated_active = second._ingest_messages(repeated)
+            assert repeated == repeated_snapshot
+            assert repeated_active == repeated
+            assert len(second._store.get_session_messages(second.current_session_id)) == 2
+            assert [
+                dict(row)
+                for row in second._store.get_session_messages(second.current_session_id)
+            ] == rows
+            assert {
+                event_id: second._store.read_metadata_json(
+                    second._host_event_mapping_key(event_id)
+                )
+                for event_id in event_ids
+            } == mappings
+            assert {
+                path.name: path.read_bytes()
+                for path in _externalized_files(tmp_path)
+            } == files
+    finally:
+        for current in (first, second):
+            if current is not None:
+                current.shutdown()
+
+
+def test_replayed_original_tool_call_payload_uses_current_redaction_policy(
+    tmp_path,
+):
+    secret = "sk-toolreplay1234567890abcdef"
+    event_ids = [
+        "event:00000000-0000-4000-8000-000000000301",
+        "event:00000000-0000-4000-8000-000000000302",
+    ]
+    original_arguments = json.dumps(
+        {"image": DATA_URI, "api_key": secret},
+        indent=2,
+    )
+    original_messages = [
+        {
+            "role": "system",
+            "content": "system anchor",
+            "display_metadata": {"host_event_id": event_ids[0]},
+        },
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "display_metadata": {"host_event_id": event_ids[1]},
+            "tool_calls": [
+                {
+                    "id": "call_upload",
+                    "type": "function",
+                    "function": {
+                        "name": "upload_image",
+                        "arguments": original_arguments,
+                    },
+                }
+            ],
+        },
+    ]
+    original_snapshot = deepcopy(original_messages)
+    first = _engine(tmp_path)
+    second = None
+    try:
+        first_active = first._ingest_messages(original_messages)
+        assert first_active == original_messages
+        assert original_messages == original_snapshot
+        first_rows = [
+            dict(row)
+            for row in first._store.get_session_messages(first.current_session_id)
+        ]
+        assert len(first_rows) == 2
+        first_mappings = {
+            event_id: first._store.read_metadata_json(
+                first._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        assert all(mapping is not None for mapping in first_mappings.values())
+        first_assistant_tool_calls = json.loads(first_rows[1]["tool_calls"])
+        first_protected_arguments = first_assistant_tool_calls[0]["function"][
+            "arguments"
+        ]
+        assert secret in first_protected_arguments
+        assert DATA_URI not in first_protected_arguments
+        first_refs = extract_ingest_externalized_refs(first_protected_arguments)
+        assert len(first_refs) == 1
+        assert _expand_ref(first, first_refs[0])["content"] == DATA_URI
+        first_files = {
+            path.name: path.read_bytes() for path in _externalized_files(tmp_path)
+        }
+        assert len(first_files) == 1
+        first.shutdown()
+        first = None
+        second = _sensitive_engine(tmp_path)
+        replay = json.loads(json.dumps(original_messages))
+        assert replay == original_snapshot
+        assert (
+            replay[1]["tool_calls"][0]["function"]["arguments"]
+            == original_arguments
+        )
+        active = second._ingest_messages(replay)
+        assert replay == original_snapshot
+        active_tool_calls = active[1]["tool_calls"]
+        assert "[LCM sensitive redaction:" in json.dumps(active_tool_calls)
+        assert secret not in json.dumps(active)
+        assert secret not in json.dumps(active_tool_calls)
+        active_arguments = json.loads(
+            active_tool_calls[0]["function"]["arguments"]
+        )
+        assert "[LCM sensitive redaction:" in active_arguments["api_key"]
+        rows = [
+            dict(row)
+            for row in second._store.get_session_messages(second.current_session_id)
+        ]
+        mappings = {
+            event_id: second._store.read_metadata_json(
+                second._host_event_mapping_key(event_id)
+            )
+            for event_id in event_ids
+        }
+        files = {path.name: path.read_bytes() for path in _externalized_files(tmp_path)}
+        assert len(rows) == 2
+        assert rows == first_rows
+        assert mappings == first_mappings
+        assert files == first_files
+        assert second._store.count_session_load_messages(second.current_session_id) == 2
+    finally:
+        for current in (first, second):
+            if current is not None:
+                current.shutdown()
 
 
 def test_restart_replay_matches_escaped_structured_content_payload(tmp_path):

@@ -532,6 +532,14 @@ def register(ctx):
                 ) or engine
 
             try:
+                try:
+                    from agent.event_identity import ensure_host_event_identities
+                except ImportError:
+                    logger.debug(
+                        "LCM post_llm_call skipped: Hermes host event-identity API is unavailable"
+                    )
+                    return
+                ensure_host_event_identities(history)
                 # Session identity is authoritative for rebinding. Older hosts
                 # can deliver stale lane metadata alongside the correct active
                 # session id; rebinding a clone on conversation_id mismatch
@@ -542,9 +550,20 @@ def register(ctx):
                     platform=platform,
                     conversation_id=conversation_id,
                 )
+                bind_replay_rows = getattr(active_engine, "bind_replay_rows", None)
+                if callable(bind_replay_rows):
+                    bind_replay_rows(history)
                 active_engine.ingest(history)
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
+            finally:
+                clear_replay_authority = getattr(
+                    active_engine,
+                    "clear_replay_authority",
+                    None,
+                )
+                if callable(clear_replay_authority):
+                    clear_replay_authority()
 
         _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")

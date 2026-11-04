@@ -802,146 +802,25 @@ class ReconcileMixin:
         return stored_head[: len(incoming_identities)] == incoming_identities
 
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
-        """Infer the in-memory cursor for an existing session after process restart."""
+        """Return no cursor without explicit host identity evidence.
+
+        Host-event mappings are the only authoritative replay mechanism.  The
+        former content/scaffold/digest suffix matching could suppress a fresh
+        identity-less event that happened to resemble a durable row.
+        """
         if not self._session_id or not messages:
             return 0
-
-        try:
-            session_count = self._store.get_session_count(self._session_id)
-        except Exception as exc:  # pragma: no cover - defensive only
-            logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
-            return 0
-        if session_count <= 0:
-            placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
-            placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
-            if placeholder_budget and placeholder_ordinals:
-                consumed: dict[str, int] = {}
-                cursor = 0
-                for msg in messages:
-                    text = text_content_for_pattern_matching(msg.get("content")) or ""
-                    digest = self._active_replay_placeholder_digest(text)
-                    if not digest:
-                        break
-                    consumed[digest] = consumed.get(digest, 0) + 1
-                    ordinal = consumed[digest]
-                    remaining = int(placeholder_budget.get(digest, 0) or 0)
-                    if remaining <= 0 or ordinal not in placeholder_ordinals.get(digest, set()):
-                        break
-                    cursor += 1
-                if cursor > 0:
-                    self._record_ingest_reconciliation(
-                        action="advanced cursor",
-                        reason="replayed generated placeholders in empty session",
-                        cursor=cursor,
-                        incoming=len(messages),
-                        session_count=session_count,
-                        stored_tail_count=0,
-                        effective_incoming=cursor,
-                    )
-                    return cursor
-            return 0
-
-        tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
-        if not stored_rows:
-            return 0
-        stored_tail_rows = [
-            row
-            for row in stored_rows
-            if not self._matches_ignore_message_patterns(row, stored_row=True)
-        ]
-        stored_tail = [
-            self._message_replay_identity(row, stored_row=True)
-            for row in stored_tail_rows
-        ]
-        cursor = self._find_reconciled_cursor_for_store_tail(
-            messages,
-            stored_tail,
-            stored_tail_rows=stored_tail_rows,
-            allow_empty_prefix=True,
-            session_count=len(stored_tail),
-            raw_session_count=session_count,
-        )
-        if cursor is not None and cursor > 0:
-            reason = (
-                "skipped scaffold-only prefix"
-                if not self._effective_replay_identities(messages[:cursor])
-                else "replayed durable tail"
-            )
+        if self._active_host_replay_authority is None:
             self._record_ingest_reconciliation(
-                action="advanced cursor",
-                reason=reason,
-                cursor=cursor,
+                action="persisted batch",
+                reason="unbound identity-less input",
+                cursor=0,
                 incoming=len(messages),
-                session_count=session_count,
-                stored_tail_count=len(stored_tail),
-                effective_incoming=len(self._effective_replay_identities(messages)),
+                session_count=self._store.get_session_count(self._session_id),
+                stored_tail_count=0,
+                effective_incoming=len(messages),
             )
-            logger.debug(
-                "LCM reconciled ingest cursor after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d reason=%s",
-                self._session_id,
-                cursor,
-                len(messages),
-                len(stored_tail),
-                session_count,
-                reason,
-            )
-            return cursor
-
-        incoming_identities = self._effective_replay_identities(messages)
-        stored_head_rows = self._store.get_session_messages(
-            self._session_id,
-            limit=tail_limit,
-        )
-        stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
-        # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
-        # filters may suppress noisy rows for tail reconciliation, but filtered
-        # history alone must not create replay evidence for skipping a batch.
-        incoming_has_unproofed_raw_persisted_marker = any(
-            str(msg.get("role") or "") == "tool"
-            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-            and recover_hermes_persisted_output_with_file_stat(
-                normalize_content_value(msg.get("content")) or ""
-            )
-            is None
-            for msg in messages
-        )
-        if (
-            not incoming_has_unproofed_raw_persisted_marker
-            and self._is_suspicious_stale_no_overlap_snapshot(
-                incoming_identities,
-                stored_tail,
-                stored_head,
-            )
-        ):
-            self._record_ingest_reconciliation(
-                action="skipped batch",
-                reason="skipped stale no-overlap snapshot",
-                cursor=len(messages),
-                incoming=len(messages),
-                session_count=session_count,
-                stored_tail_count=len(stored_tail),
-                effective_incoming=len(incoming_identities),
-            )
-            logger.warning(
-                "LCM skipped stale no-overlap snapshot after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
-                self._session_id,
-                len(messages),
-                len(incoming_identities),
-                len(stored_tail),
-                session_count,
-            )
-            return len(messages)
-
-        self._record_ingest_reconciliation(
-            action="persisted batch",
-            reason="persisted ambiguous delta",
-            cursor=0,
-            incoming=len(messages),
-            session_count=session_count,
-            stored_tail_count=len(stored_tail),
-            effective_incoming=len(incoming_identities),
-        )
+            return 0
         return 0
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:

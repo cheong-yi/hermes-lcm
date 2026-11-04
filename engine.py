@@ -124,7 +124,7 @@ from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-from .compaction import CompactionMixin
+from .compaction import CompactionMixin, LCMCompressionCancelled
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -151,6 +151,23 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+
+from agent.event_identity import (
+    event_identity as _host_event_identity,
+    projection_source_ids as _host_projection_source_ids,
+)
+
+
+def _host_projection_sources(message: Dict[str, Any]) -> list[str] | None:
+    """Return validated projection provenance, including an empty marker."""
+    metadata = message.get("display_metadata")
+    if not isinstance(metadata, dict) or "source_event_ids" not in metadata:
+        return None
+    return _host_projection_source_ids(message)
+
+
+class HostEventIdentityIntegrityError(ValueError):
+    """A host event ID was reused with an incompatible immutable payload."""
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -574,6 +591,13 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        self._pending_host_replay_authority: tuple[str | None, ...] | None = None
+        self._active_host_replay_authority: tuple[str | None, ...] | None = None
+        self._bound_host_replay_session_id = ""
+        self._bound_host_replay_input_id: int | None = None
+        self._ingest_scope_depth = 0
+        self._active_host_event_store_ids: list[Optional[int]] = []
+        self._active_host_event_fingerprints: list[str | None] = []
         # Exact durable provenance aligned with the cached active replay.  The
         # values come only from MessageStore insert return values; they are not
         # inferred from message content.  This lets the current runtime publish
@@ -1591,6 +1615,8 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
+                if isinstance(e, HostEventIdentityIntegrityError):
+                    raise
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -1644,6 +1670,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         attempt_number = 0
 
         while attempt_chunk and attempt_number < max_attempts:
+            self._raise_if_compression_cancelled()
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
@@ -1686,7 +1713,10 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
                 )
+                self._raise_if_compression_cancelled()
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
+            except LCMCompressionCancelled:
+                raise
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
@@ -2564,7 +2594,173 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
         self._log_session_filter_diagnostics()
 
+    def clear_replay_authority(self) -> None:
+        """Clear host authority at the end of its public caller scope."""
+        self._pending_host_replay_authority = None
+        self._active_host_replay_authority = None
+        self._bound_host_replay_session_id = ""
+        self._bound_host_replay_input_id = None
+        self._active_host_event_store_ids = []
+        self._active_host_event_fingerprints = []
+
+    def _host_event_payload_fingerprint(self, message: Dict[str, Any]) -> str:
+        payload = (
+            str(message.get("role") or "unknown"),
+            normalize_content_value(message.get("content")) or "",
+            str(message.get("tool_call_id") or ""),
+            str(message.get("tool_name") or ""),
+            self._stable_tool_calls_identity(message.get("tool_calls")),
+        )
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def bind_replay_rows(self, messages: List[Dict[str, Any]]) -> None:
+        """Bind exact host input ownership until the public caller clears it."""
+        self._ingest_cursor_needs_reconcile = True
+        self.clear_replay_authority()
+        authority: list[str | None] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                authority.append(None)
+                continue
+            authority.append(_host_event_identity(message))
+        self._pending_host_replay_authority = tuple(authority)
+        self._bound_host_replay_session_id = self._session_id
+        self._bound_host_replay_input_id = id(messages)
+
+    def _host_event_mapping_key(self, event_id: str) -> str:
+        return "host_event:v1:" + json.dumps(
+            [self._session_id, event_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _resolve_host_event_store_id(
+        self,
+        event_id: str,
+        fingerprint: str,
+    ) -> int | None:
+        mapping = self._store.read_metadata_json(self._host_event_mapping_key(event_id))
+        if mapping is None:
+            return None
+        if not isinstance(mapping, dict):
+            raise HostEventIdentityIntegrityError(
+                f"invalid persisted host event mapping for {event_id!r}"
+            )
+        if (
+            mapping.get("version") != 1
+            or mapping.get("session_id") != self._session_id
+            or mapping.get("event_id") != event_id
+        ):
+            raise HostEventIdentityIntegrityError(
+                f"invalid persisted host event mapping for {event_id!r}"
+            )
+        if mapping.get("payload_fingerprint") != fingerprint:
+            raise HostEventIdentityIntegrityError(
+                f"host event ID {event_id!r} was reused with incompatible payload"
+            )
+        try:
+            store_id = int(mapping["store_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HostEventIdentityIntegrityError(
+                f"host event ID {event_id!r} has no valid durable mapping"
+            ) from exc
+        row = self._store.get(store_id)
+        if (
+            not row
+            or row.get("session_id") != self._session_id
+            or row.get("store_id") != store_id
+        ):
+            raise HostEventIdentityIntegrityError(
+                f"host event ID {event_id!r} points to missing durable event"
+            )
+        return store_id
+
+    def _persist_host_event_mappings(
+        self,
+        messages: List[Dict[str, Any]],
+        store_ids: List[Optional[int]],
+    ) -> None:
+        event_ids = self._active_host_replay_authority
+        if event_ids is None:
+            event_ids = tuple(
+                _host_event_identity(message)
+                if isinstance(message, dict)
+                else None
+                for message in messages
+            )
+        for index, event_id in enumerate(event_ids):
+            if not event_id or index >= len(store_ids):
+                continue
+            store_id = store_ids[index]
+            if store_id is None:
+                continue
+            fingerprint = self._host_event_payload_fingerprint(messages[index])
+            payload = {
+                "version": 1,
+                "session_id": self._session_id,
+                "event_id": event_id,
+                "payload_fingerprint": fingerprint,
+                "store_id": int(store_id),
+            }
+            self._store.write_metadata_json(
+                [self._host_event_mapping_key(event_id)],
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+
+    def _prepare_host_event_replay(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[list[str | None], list[str | None], list[Optional[int]], list[int]]:
+        """Validate IDs before mutation and return identity-aware replay state."""
+        event_ids: list[str | None] = []
+        fingerprints: list[str | None] = []
+        resolved_store_ids: list[Optional[int]] = [None] * len(messages)
+        first_indexes: list[int] = list(range(len(messages)))
+        first_by_id: dict[str, tuple[int, str, int | None]] = {}
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                event_ids.append(None)
+                fingerprints.append(None)
+                continue
+            projection_sources = _host_projection_sources(message)
+            event_id = (
+                None
+                if projection_sources is not None
+                else _host_event_identity(message)
+            )
+            event_ids.append(event_id)
+            if event_id is None:
+                fingerprints.append(None)
+                continue
+            fingerprint = self._host_event_payload_fingerprint(message)
+            fingerprints.append(fingerprint)
+            prior = first_by_id.get(event_id)
+            if prior is not None:
+                prior_index, prior_fingerprint, prior_store_id = prior
+                if prior_fingerprint != fingerprint:
+                    raise HostEventIdentityIntegrityError(
+                        f"host event ID {event_id!r} was reused with incompatible payload"
+                    )
+                first_indexes[index] = prior_index
+                resolved_store_ids[index] = prior_store_id
+                continue
+            store_id = self._resolve_host_event_store_id(event_id, fingerprint)
+            first_by_id[event_id] = (index, fingerprint, store_id)
+            resolved_store_ids[index] = store_id
+        return event_ids, fingerprints, resolved_store_ids, first_indexes
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        self.clear_replay_authority()
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
@@ -4559,6 +4755,42 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        previous_authority = self._active_host_replay_authority
+        previous_store_ids = self._active_host_event_store_ids
+        previous_fingerprints = self._active_host_event_fingerprints
+        outermost_scope = self._ingest_scope_depth == 0
+        if outermost_scope:
+            if (
+                self._pending_host_replay_authority is not None
+                and (
+                    self._bound_host_replay_session_id != self._session_id
+                    or self._bound_host_replay_input_id != id(messages)
+                )
+            ):
+                self.clear_replay_authority()
+            self._active_host_replay_authority = self._pending_host_replay_authority
+        else:
+            self._active_host_replay_authority = (
+                self._pending_host_replay_authority
+                if (
+                    self._bound_host_replay_session_id == self._session_id
+                    and self._bound_host_replay_input_id == id(messages)
+                )
+                else None
+            )
+        self._ingest_scope_depth += 1
+        try:
+            return self._ingest_messages_with_host_authority(messages)
+        finally:
+            self._ingest_scope_depth -= 1
+            self._active_host_replay_authority = previous_authority
+            self._active_host_event_store_ids = previous_store_ids
+            self._active_host_event_fingerprints = previous_fingerprints
+
+    def _ingest_messages_with_host_authority(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -4585,8 +4817,38 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
 
         ambiguous_reconciliation_warning_pending = False
         n = len(messages)
-        cursor = min(max(self._ingest_cursor, 0), n)
-        scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        if (
+            self._active_host_replay_authority is not None
+            and len(self._active_host_replay_authority) != n
+        ):
+            logger.warning(
+                "Ignoring mismatched Hermes replay-row authority: bound=%d incoming=%d",
+                len(self._active_host_replay_authority),
+                n,
+            )
+            self._active_host_replay_authority = None
+        (
+            host_event_ids,
+            host_event_fingerprints,
+            resolved_host_store_ids,
+            host_event_first_indexes,
+        ) = self._prepare_host_event_replay(messages)
+        self._active_host_event_store_ids = resolved_host_store_ids
+        self._active_host_event_fingerprints = host_event_fingerprints
+        explicit_identity_scope = (
+            self._active_host_replay_authority is not None
+            or any(event_id is not None for event_id in host_event_ids)
+            or any(
+                _host_projection_sources(message) is not None
+                for message in messages
+                if isinstance(message, dict)
+            )
+        )
+        # Content/scaffold/digest reconciliation is not identity evidence.  A
+        # host-owned ID is checked through the durable mapping above; all other
+        # inputs are fresh physical events for this ingest call.
+        cursor = 0
+        scan_start = 0
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
@@ -4621,64 +4883,31 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        generated_ids = self._generated_ignored_active_replay_placeholder_message_ids
+        for replay_message in replay_messages:
+            if id(replay_message) not in generated_ids:
+                continue
+            metadata = replay_message.get("display_metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["_hermes_generated_replay_v1"] = True
+            replay_message["display_metadata"] = metadata
+        pre_attempt_needs_reconcile = self._ingest_cursor_needs_reconcile
         if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
-                        )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
-                    )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
-            ambiguous_reconciliation_warning_pending = (
-                self._last_ingest_reconciliation.get("reason")
-                == "persisted ambiguous delta"
-            )
-        cursor = min(max(self._ingest_cursor, 0), n)
+        # Positional cursors are not identity evidence: an identity-less row
+        # at the same position as an earlier ingest is still a new event.
+        # Explicit host IDs are resolved above and provide the only replay
+        # skip authority.
+        cursor = 0
         active_replay_store_ids: list[Optional[int]] = [None] * n
-        if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
-            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
-            if (
-                cached_source_identities is not None
-                and cached_active_replay_messages is not None
-                and len(cached_source_identities) >= cursor
-                and len(cached_active_replay_messages) >= cursor
-            ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
-                ]
-                if current_prefix_identities == cached_source_identities[:cursor]:
-                    cached_store_ids = getattr(
-                        self, "_last_active_replay_store_ids", []
-                    )
-                    if len(cached_store_ids) >= cursor:
-                        active_replay_store_ids[:cursor] = cached_store_ids[:cursor]
-                    replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
-                        )
-                        + replay_messages[cursor:]
-                    )
+        if explicit_identity_scope:
+            active_replay_store_ids = list(resolved_host_store_ids)
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
         )
 
         new_messages = replay_messages[cursor:] if cursor < n else []
-        original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
@@ -4697,20 +4926,24 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             )
 
         active_replay_messages = replay_messages
-        compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
+        compression_boundary_ingest_pending = False
+        # Digest overlap is not physical-event evidence. Generated rows are
+        # skipped only by their explicit generated/projection metadata.
         empty_session_placeholder_budget: dict[str, int] = {}
         empty_session_placeholder_ordinals: dict[str, set[int]] = {}
-        if not compression_boundary_ingest_pending and self._session_id:
-            try:
-                if self._store.get_session_count(self._session_id) == 0:
-                    empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
-                    empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
-            except Exception:
-                empty_session_placeholder_budget = {}
-                empty_session_placeholder_ordinals = {}
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
             (cursor + offset, replay_msg)
             for offset, replay_msg in enumerate(new_messages)
+            if (
+                _host_projection_sources(messages[cursor + offset]) is None
+                and not (
+                    host_event_ids[cursor + offset] is not None
+                    and (
+                        resolved_host_store_ids[cursor + offset] is not None
+                        or host_event_first_indexes[cursor + offset] != cursor + offset
+                    )
+                )
+            )
         ]
         if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
@@ -4734,26 +4967,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     for msg in new_messages
                 )
             )
-            if compression_boundary_ingest_pending:
-                boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                stored_counts = self._compression_boundary_stored_placeholder_digest_counts
-                if boundary_budget and stored_counts:
-                    incoming_counts: dict[str, int] = {}
-                    relevant_digests = set(boundary_budget) | set(stored_counts)
-                    for msg in new_messages:
-                        text = text_content_for_pattern_matching(msg.get("content")) or ""
-                        digest = self._active_replay_placeholder_digest(text)
-                        if digest in relevant_digests:
-                            incoming_counts[digest] = incoming_counts.get(digest, 0) + 1
-                    adjusted_budget: dict[str, int] = {}
-                    for digest, count in boundary_budget.items():
-                        parsed_count = max(0, int(count or 0))
-                        incoming_count = max(0, int(incoming_counts.get(digest, 0) or 0))
-                        stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
-                        remaining = min(parsed_count, max(0, incoming_count - stored_count))
-                        if remaining > 0:
-                            adjusted_budget[digest] = remaining
-                    self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
             empty_session_all_placeholder_replay_batch = (
                 bool(empty_session_placeholder_ordinals)
                 and len(new_messages) > 1
@@ -4765,8 +4978,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     for msg in new_messages
                 )
             )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                absolute_idx = cursor + offset
+            for absolute_idx, replay_msg in messages_to_store_with_index:
+                original_msg = messages[absolute_idx]
+                original_projection_sources = _host_projection_sources(original_msg)
+                if original_projection_sources is not None:
+                    continue
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
@@ -4776,10 +4992,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 volatile_digest = self._active_replay_placeholder_digest(replay_text)
                 generated_volatile_placeholder = volatile_placeholder and (
                     original_text != replay_text
-                    or (
-                        volatile_digest is not None
-                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
-                    )
                 )
                 active_replay_placeholder = self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
                 active_replay_placeholder_digest = self._active_replay_placeholder_digest(replay_text)
@@ -4817,6 +5029,11 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                             empty_session_placeholder_budget.pop(active_replay_placeholder_digest, None)
                         else:
                             empty_session_placeholder_budget[active_replay_placeholder_digest] = remaining - 1
+                generated_message_ids = getattr(
+                    self,
+                    "_generated_ignored_active_replay_placeholder_message_ids",
+                    set(),
+                )
                 if (
                     compression_boundary_ingest_pending
                     and active_replay_placeholder
@@ -4828,11 +5045,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     current_placeholder_ordinal = boundary_placeholder_seen[active_replay_placeholder_digest]
                     boundary_budget = self._compression_boundary_active_placeholder_digest_budget
                     boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
-                    generated_message_ids = getattr(
-                        self,
-                        "_generated_ignored_active_replay_placeholder_message_ids",
-                        set(),
-                    )
                     has_generated_provenance = (
                         id(replay_msg) in generated_message_ids
                         or id(original_msg) in generated_message_ids
@@ -4859,10 +5071,18 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                                 boundary_budget.pop(active_replay_placeholder_digest, None)
                             else:
                                 boundary_budget[active_replay_placeholder_digest] = remaining - 1
+                replay_metadata = replay_msg.get("display_metadata")
                 replayed_active_placeholder = active_replay_placeholder and (
-                    self._is_cached_active_replay_message_at_index(absolute_idx, replay_msg)
+                    id(replay_msg) in generated_message_ids
+                    or id(original_msg) in generated_message_ids
                     or compression_carried_active_placeholder
                     or metadata_replayed_active_placeholder
+                    or (
+                        original_projection_sources is not None
+                        and isinstance(replay_metadata, dict)
+                        and replay_metadata.get("_hermes_generated_replay_v1")
+                        is True
+                    )
                 )
                 if (
                     ignored_original_messages[absolute_idx]
@@ -4966,13 +5186,27 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        inserted_store_ids = self._store._append_protected_batch(
-            self._session_id,
-            protected_messages,
-            estimates,
-            source=self._session_platform,
-            conversation_id=self._conversation_id,
-        )
+        try:
+            with self._store.write_transaction():
+                inserted_store_ids = self._store._append_protected_batch(
+                    self._session_id,
+                    protected_messages,
+                    estimates,
+                    source=self._session_platform,
+                    conversation_id=self._conversation_id,
+                )
+                for (absolute_idx, _message), store_id in zip(
+                    messages_to_store_with_index,
+                    inserted_store_ids,
+                ):
+                    active_replay_store_ids[absolute_idx] = int(store_id)
+                for index, first_index in enumerate(host_event_first_indexes):
+                    if first_index != index:
+                        active_replay_store_ids[index] = active_replay_store_ids[first_index]
+                self._persist_host_event_mappings(messages, active_replay_store_ids)
+        except BaseException:
+            self._ingest_cursor_needs_reconcile = pre_attempt_needs_reconcile
+            raise
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -4996,11 +5230,6 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                 max(inserted_store_ids) if inserted_store_ids else "none",
                 durable_rows,
             )
-        for (absolute_idx, _message), store_id in zip(
-            messages_to_store_with_index,
-            inserted_store_ids,
-        ):
-            active_replay_store_ids[absolute_idx] = int(store_id)
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -5481,6 +5710,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     if timeout_seconds is not None
                     else self._config.summary_timeout_ms / 1000
                 ),
+                cancelled_check=self._compression_cancelled,
             )
         except Exception as e:
             logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
@@ -5491,6 +5721,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         snapshots: tuple[SourceSnapshot, ...],
         model: str,
         timeout_seconds: float,
+        cancelled_check: Callable[[], bool] | None = None,
     ) -> None:
         """Derive one bounded batch on a daemon worker outside raw writes."""
         started = time.perf_counter()
@@ -5508,10 +5739,14 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             )
             for snapshot in snapshots:
                 try:
+                    if callable(cancelled_check) and cancelled_check():
+                        break
                     if writer.has_current_receipt(snapshot):
                         completed += 1
                         continue
                     extraction = extractor(snapshot)
+                    if callable(cancelled_check) and cancelled_check():
+                        break
                     writer.publish_source(
                         snapshot,
                         extraction.assertions,
@@ -5602,9 +5837,16 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             self._assertion_extraction_batches_scheduled += 1
             self._assertion_extraction_sources_scheduled += len(snapshots)
         self._assertion_extraction_idle.clear()
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
         worker = threading.Thread(
             target=self._run_assertion_extraction_batch,
-            args=(str(self._store.db_path), tuple(snapshots), model, timeout_seconds),
+            args=(
+                str(self._store.db_path),
+                tuple(snapshots),
+                model,
+                timeout_seconds,
+                cancelled_check if callable(cancelled_check) else None,
+            ),
             name="lcm-assertion-extraction",
             daemon=True,
         )
@@ -6129,6 +6371,8 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
+            if self._compression_cancelled():
+                return
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
@@ -6147,10 +6391,13 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
 
             # Take the first fanin nodes and condense
             to_condense = uncondensed[:fanin]
-            source_tokens, summary_tokens, level = self._condense_summary_nodes(
-                to_condense,
-                focus_topic=focus_topic,
-            )
+            try:
+                source_tokens, summary_tokens, level = self._condense_summary_nodes(
+                    to_condense,
+                    focus_topic=focus_topic,
+                )
+            except LCMCompressionCancelled:
+                return
             condensed_any = True
 
             logger.info(
@@ -6173,6 +6420,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
         deadline: Optional[float] = None,
     ) -> tuple[int, int, int]:
         """Persist one same-depth condensation and return source/output tokens and level."""
+        self._raise_if_compression_cancelled()
         if not nodes:
             raise ValueError("condensation requires at least one summary node")
         depth = nodes[0].depth
@@ -6202,6 +6450,7 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
         )
+        self._raise_if_compression_cancelled()
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]
         )
@@ -6285,6 +6534,8 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except LCMCompressionCancelled:
+                return passes, "compression_cancelled"
             except Exception as exc:
                 logger.warning(
                     "LCM threshold full sweep condensation stopped after %d pass(es): %s",
@@ -6674,7 +6925,14 @@ class LCMEngine(CompactionMixin, BackgroundCompactionMixin, ResetStateMixin, Rec
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                result.append({
+                    "role": summary_role,
+                    "content": combined,
+                    "display_metadata": {
+                        "_hermes_generated_replay_v1": True,
+                        "source_event_ids": [],
+                    },
+                })
 
         # Proactive memory injection (SPEC F, default-off). One bounded block is
         # placed adjacent to the summary prefix — a stable position below the

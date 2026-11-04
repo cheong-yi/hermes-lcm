@@ -7,6 +7,7 @@ publication inputs in v7 tables; canonical visibility remains owned by
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -951,6 +952,7 @@ class _ScheduledJob:
     engine_ref: weakref.ReferenceType[Any]
     messages: list[dict[str, Any]]
     conversation_id: str
+    session_id: str
     engine_id: int
     cancel_event: threading.Event
 
@@ -978,12 +980,14 @@ class BackgroundCompactionScheduler:
 
     def submit(self, engine: Any, messages: list[dict[str, Any]]) -> bool:
         conversation_id = str(getattr(engine, "_conversation_id", "") or "")
-        if not conversation_id or not messages:
+        session_id = str(getattr(engine, "_session_id", "") or "")
+        if not conversation_id or not session_id or not messages:
             return False
         job = _ScheduledJob(
             engine_ref=weakref.ref(engine),
-            messages=[dict(message) for message in messages],
+            messages=copy.deepcopy(messages),
             conversation_id=conversation_id,
+            session_id=session_id,
             engine_id=id(engine),
             cancel_event=threading.Event(),
         )
@@ -1031,10 +1035,17 @@ class BackgroundCompactionScheduler:
         engine = job.engine_ref()
         if engine is None:
             return
+        if (
+            str(getattr(engine, "_session_id", "") or "") != job.session_id
+            or str(getattr(engine, "_conversation_id", "") or "") != job.conversation_id
+        ):
+            return
         engine.prepare_background_compaction_once(
             job.messages,
             _scheduled=True,
             _cancel_event=job.cancel_event,
+            _expected_session_id=job.session_id,
+            _expected_conversation_id=job.conversation_id,
         )
 
     def _job_done(self, conversation_id: str, future: Future[Any]) -> None:
@@ -1272,14 +1283,32 @@ class BackgroundCompactionMixin:
         leave_state: str = "",
         _scheduled: bool = False,
         _cancel_event: threading.Event | None = None,
+        _expected_session_id: str | None = None,
+        _expected_conversation_id: str | None = None,
     ) -> PreparedBatch | None:
         if not bool(self._config.async_background_compaction_enabled):
             return None
         if not self._session_id or not self._conversation_id or self._bypasses_lcm_context_management():
             return None
+        if (
+            _expected_session_id is not None
+            and str(self._session_id) != str(_expected_session_id)
+        ) or (
+            _expected_conversation_id is not None
+            and str(self._conversation_id) != str(_expected_conversation_id)
+        ):
+            return None
         lifecycle_lock = self._background_compaction_storage_lock
         with lifecycle_lock:
             if _cancel_event is not None and _cancel_event.is_set():
+                return None
+            if (
+                _expected_session_id is not None
+                and str(self._session_id) != str(_expected_session_id)
+            ) or (
+                _expected_conversation_id is not None
+                and str(self._conversation_id) != str(_expected_conversation_id)
+            ):
                 return None
             candidate = self._background_leaf_candidate(messages)
             if candidate is None:
